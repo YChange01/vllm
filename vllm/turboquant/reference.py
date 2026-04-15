@@ -29,9 +29,16 @@ def store_kv_reference(
     block_size: int,
 ) -> None:
     """Quantize ``new_k`` into ``cache_k`` (uint8 idx) and copy ``new_v`` into
-    ``cache_v``, following ``slot_mapping``."""
-    num_tokens = new_k.shape[0]
-    idx = codebook.quantize_to_idx(new_k)  # (num_tokens, num_kv_heads, head_dim) uint8
+    ``cache_v``, following ``slot_mapping``.
+
+    Matches the Triton kernel: each K vector is L2-normalized to
+    ``||k|| = sqrt(head_size)`` before rotation + bucketization so the
+    Lloyd-Max codebook (designed for unit-variance inputs) stays valid.
+    """
+    num_tokens, _, head_size = new_k.shape
+    k_norm = new_k.norm(dim=-1, keepdim=True).clamp(min=1e-6)
+    k_normed = new_k / k_norm * (head_size ** 0.5)
+    idx = codebook.quantize_to_idx(k_normed)
 
     for i in range(num_tokens):
         slot = int(slot_mapping[i].item())
