@@ -34,8 +34,9 @@ def _quantize_and_store_kernel(
     new_k_ptr,           # (num_tokens, num_heads_kv, head_size) fp16/bf16
     new_v_ptr,           # (num_tokens, num_heads_kv, head_size) fp16/bf16
     cache_k_ptr,         # (num_blocks, block_size, num_heads_kv, head_size) uint8
-    cache_v_ptr,         # (num_blocks, block_size, num_heads_kv, head_size) fp16/bf16
+    cache_v_ptr,         # (num_blocks, block_size, num_heads_kv, head_size) int8   <-- Step 1
     cache_k_norm_ptr,    # (num_blocks, block_size, num_heads_kv) fp32
+    cache_v_scale_ptr,   # (num_blocks, block_size, num_heads_kv) fp32              <-- Step 1
     slot_mapping_ptr,    # (num_tokens,) int64
     hadamard_ptr,        # (head_size, head_size) fp16/bf16
     signs_ptr,           # (head_size,) fp16/bf16
@@ -46,7 +47,14 @@ def _quantize_and_store_kernel(
     K_CB: tl.constexpr,
     BLOCK_D: tl.constexpr,
 ):
-    """One program = one (token, kv_head) pair."""
+    """One program = one (token, kv_head) pair.
+
+    Step 1 adds V quantization on the store path: for each (token, kv_head)
+    we compute scale = max(|v|) / 127 and store the per-element int8 value
+    plus the scale. Dequant in the attend kernel is `int8 * scale`. Per-head
+    symmetric int8 is a first pass -- cheap, no rotation, no codebook, good
+    enough to prove the pipeline and cut V memory roughly in half.
+    """
     tok = tl.program_id(0)
     head = tl.program_id(1)
 
@@ -62,25 +70,22 @@ def _quantize_and_store_kernel(
 
     kv_off = (tok * num_heads_kv + head) * head_size + d_idx
     k_vec = tl.load(new_k_ptr + kv_off, mask=mask_d, other=0.0).to(tl.float32)
-    v_vec = tl.load(new_v_ptr + kv_off, mask=mask_d, other=0.0)
+    v_vec = tl.load(new_v_ptr + kv_off, mask=mask_d, other=0.0).to(tl.float32)
 
-    # Compute and save L2 norm BEFORE normalization.
+    # --- K quantization (unchanged from before Step 1) ---
     k_norm_sq = tl.sum(k_vec * k_vec)
     k_norm = tl.sqrt(tl.maximum(k_norm_sq, 1e-12))
 
-    # Store norm to separate buffer: cache_k_norm[block, slot, head].
-    norm_off = block_idx * block_size * num_heads_kv + off_in_block * num_heads_kv + head
-    tl.store(cache_k_norm_ptr + norm_off, k_norm)
+    # Per-(slot, head) offset for scalar metadata buffers (k_norm, v_scale).
+    meta_off = block_idx * block_size * num_heads_kv + off_in_block * num_heads_kv + head
+    tl.store(cache_k_norm_ptr + meta_off, k_norm)
 
-    # Normalize to ||k|| = sqrt(head_size) for codebook compatibility.
     k_scale = tl.sqrt(float(head_size)) / k_norm
     k_normed = k_vec * k_scale
 
-    # Apply signs: sk = diag(s) * k.
     signs = tl.load(signs_ptr + d_idx, mask=mask_d, other=1.0).to(tl.float32)
     sk = k_normed * signs
 
-    # Rotate: rotated = H @ sk using a full (d, d) tile.
     row_idx = d_idx[:, None]
     col_idx = d_idx[None, :]
     H_mask = (row_idx < head_size) & (col_idx < head_size)
@@ -88,16 +93,10 @@ def _quantize_and_store_kernel(
     H_tile = tl.load(hadamard_ptr + H_off, mask=H_mask, other=0.0).to(tl.float32)
     rotated = tl.sum(H_tile * sk[None, :], axis=1)
 
-    # Bucketize -> 0..K_CB-1.
     idx = tl.zeros((BLOCK_D,), dtype=tl.int32)
     for k in tl.static_range(K_CB - 1):
         b = tl.load(boundaries_ptr + k).to(tl.float32)
         idx += (rotated > b).to(tl.int32)
-
-    # cache_k is uint8, so idx (in [0, K_CB-1]) fits directly for K_CB <= 256.
-    # Do NOT mask with 0x0F: that would truncate the top 4 bits whenever
-    # TURBOQUANT_BITS > 4, aliasing every 8-bit index onto the first 16
-    # codebook entries (the extreme-negative tail of the Lloyd-Max table).
     idx_u8 = idx.to(tl.uint8)
 
     cache_off = (
@@ -107,15 +106,25 @@ def _quantize_and_store_kernel(
         + d_idx
     )
     tl.store(cache_k_ptr + cache_off, idx_u8, mask=mask_d)
-    tl.store(cache_v_ptr + cache_off, v_vec, mask=mask_d)
+
+    # --- V quantization (Step 1) ---
+    # Per-(token, head) symmetric int8: scale = max|v| / 127, stored as fp32.
+    v_abs = tl.where(mask_d, tl.abs(v_vec), 0.0)
+    v_max = tl.max(v_abs, axis=0)
+    # Guard against a fully-zero vector: we would divide by 0.
+    v_scale = tl.maximum(v_max / 127.0, 1e-12)
+    v_int = (v_vec / v_scale).to(tl.int8)
+    tl.store(cache_v_scale_ptr + meta_off, v_scale)
+    tl.store(cache_v_ptr + cache_off, v_int, mask=mask_d)
 
 
 @triton.jit
 def _dequant_and_attend_kernel(
     q_ptr,                  # (num_query_tokens, num_heads_q, head_size) fp16/bf16
     cache_k_ptr,            # (num_blocks, block_size, num_heads_kv, head_size) uint8
-    cache_v_ptr,            # (num_blocks, block_size, num_heads_kv, head_size) fp16/bf16
+    cache_v_ptr,            # (num_blocks, block_size, num_heads_kv, head_size) int8
     cache_k_norm_ptr,       # (num_blocks, block_size, num_heads_kv) fp32
+    cache_v_scale_ptr,      # (num_blocks, block_size, num_heads_kv) fp32 (Step 1)
     block_table_ptr,        # (num_seqs, block_table_stride) int32
     seq_id_per_query_ptr,   # (num_query_tokens,) int32 : which seq each q belongs to
     kv_end_per_query_ptr,   # (num_query_tokens,) int32 : causal kv upper bound for each q
@@ -216,9 +225,12 @@ def _dequant_and_attend_kernel(
 
                     qk = tl.sum(q * k_vec) * scale
 
-                    v_vec = tl.load(
-                        cache_v_ptr + base + d_idx, mask=mask_d, other=0.0
+                    # V dequant (Step 1): int8 per-(slot, head) * per-(slot, head) fp32 scale.
+                    v_int8 = tl.load(
+                        cache_v_ptr + base + d_idx, mask=mask_d, other=0
                     ).to(tl.float32)
+                    v_scale = tl.load(cache_v_scale_ptr + norm_off)
+                    v_vec = v_int8 * v_scale
 
                     m_new = tl.maximum(m_i, qk)
                     alpha = tl.exp(m_i - m_new)
@@ -238,11 +250,18 @@ def turboquant_store_kv(
     cache_k: torch.Tensor,
     cache_v: torch.Tensor,
     cache_k_norm: torch.Tensor,
+    cache_v_scale: torch.Tensor,
     slot_mapping: torch.Tensor,
     codebook: GaussianCodebook,
     block_size: int,
 ) -> None:
-    """Quantize ``new_k``, store idx + norm into paged K cache, copy V."""
+    """Quantize ``new_k`` (Lloyd-Max + Hadamard) and ``new_v`` (per-(slot,head)
+    symmetric int8) into the paged K/V caches.
+
+    Step 1 extends this to also produce V scales. ``cache_v`` is now an int8
+    tensor (same shape as cache_k) and ``cache_v_scale`` is a per-(slot,head)
+    fp32 scale tensor parallel to ``cache_k_norm``.
+    """
     num_tokens, num_heads_kv, head_size = new_k.shape
     K_CB = int(codebook.codebook.shape[0])
 
@@ -259,6 +278,7 @@ def turboquant_store_kv(
         cache_k,
         cache_v,
         cache_k_norm,
+        cache_v_scale,
         slot_mapping,
         codebook.H,
         codebook.signs,
@@ -279,6 +299,7 @@ def turboquant_paged_attention(
     cache_k: torch.Tensor,
     cache_v: torch.Tensor,
     cache_k_norm: torch.Tensor,
+    cache_v_scale: torch.Tensor,
     block_table: torch.Tensor,
     seq_lens: torch.Tensor,
     query_start_loc: torch.Tensor,
@@ -407,6 +428,7 @@ def turboquant_paged_attention(
         cache_k,
         cache_v,
         cache_k_norm,
+        cache_v_scale,
         block_table,
         seq_id_per_query,
         kv_end_per_query,
@@ -455,7 +477,8 @@ def turboquant_paged_attention(
                     k_unit = k_unrot * signs_ref
                     k_norm_h = float(cache_k_norm[phys, toff, h].item())
                     k_ref[pos, h] = k_unit * (k_norm_h * inv_sqrt_d)
-                    v_ref[pos, h] = cache_v[phys, toff, h].float()
+                    v_scale_h = float(cache_v_scale[phys, toff, h].item())
+                    v_ref[pos, h] = cache_v[phys, toff, h].float() * v_scale_h
 
             # Pure-PyTorch causal attention
             gqa = num_heads_q // num_heads_kv

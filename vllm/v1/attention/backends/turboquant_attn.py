@@ -204,6 +204,10 @@ class TurboQuantAttentionImpl(AttentionImpl):
         self._codebook: GaussianCodebook | None = None
         self._k_norms: torch.Tensor | None = None
         self._k_idx: torch.Tensor | None = None
+        # Step 1: V is no longer stored in kv_cache[1]; it is quantised to
+        # int8 into _v_idx with a per-(slot,head) fp32 scale in _v_scales.
+        self._v_idx: torch.Tensor | None = None
+        self._v_scales: torch.Tensor | None = None
 
     def _ensure_codebook(
         self, dtype: torch.dtype, device: torch.device
@@ -219,12 +223,14 @@ class TurboQuantAttentionImpl(AttentionImpl):
         return self._codebook
 
     def _ensure_buffers(self, kv_cache: torch.Tensor):
-        """Lazily allocate K idx + per-key norm in NHD layout.
+        """Lazily allocate per-layer K and V buffers in NHD layout.
 
-        We still need a separate uint8 tensor for K indices because the
-        K slab in kv_cache has fp16/bf16 dtype and reinterpreting it
-        via view(uint8) creates a copy. V is read directly from
-        kv_cache[1] (NHD layout enforced by set_kv_cache_layout above).
+        Before Step 1 V rode in kv_cache[1] (bf16). Now V is quantised to
+        int8 with a per-(slot, head) fp32 scale, stored in two new buffers
+        owned by this Impl instance. kv_cache[1] is currently still
+        allocated by vLLM's cache manager but goes unused -- reclaiming it
+        requires changing get_kv_cache_shape to a 1-slab shape, which is
+        a follow-up cleanup.
         """
         if self._k_idx is None:
             num_blocks = kv_cache.shape[1]
@@ -232,6 +238,8 @@ class TurboQuantAttentionImpl(AttentionImpl):
             device = kv_cache.device
             k_idx_bytes = num_blocks * block_size * self.num_kv_heads * self.head_size
             k_norms_bytes = num_blocks * block_size * self.num_kv_heads * 4
+            v_idx_bytes = k_idx_bytes  # same shape, int8
+            v_scale_bytes = k_norms_bytes  # same shape, fp32
             try:
                 self._k_idx = torch.zeros(
                     num_blocks, block_size, self.num_kv_heads, self.head_size,
@@ -241,22 +249,31 @@ class TurboQuantAttentionImpl(AttentionImpl):
                     num_blocks, block_size, self.num_kv_heads,
                     dtype=torch.float32, device=device,
                 )
+                self._v_idx = torch.zeros(
+                    num_blocks, block_size, self.num_kv_heads, self.head_size,
+                    dtype=torch.int8, device=device,
+                )
+                self._v_scales = torch.zeros(
+                    num_blocks, block_size, self.num_kv_heads,
+                    dtype=torch.float32, device=device,
+                )
             except torch.cuda.OutOfMemoryError as e:
-                # Extra context: this backend allocates a SEPARATE uint8 _k_idx
-                # buffer per layer on top of vLLM's native bf16 KV slab, so the
-                # effective KV memory is ~1.5x. If you hit this, lower
-                # --max-model-len or --gpu-memory-utilization, or free up the
-                # GPU first (stray EngineCore from a previous run is a common
-                # cause). Per-layer budget here:
+                # After Step 1 we allocate FOUR buffers per layer on top of
+                # vLLM's native bf16 KV slab (of which the V half is now
+                # unused). The short-term mitigation is lower
+                # --max-model-len / --gpu-memory-utilization, or free up
+                # the GPU. Proper fix: shrink get_kv_cache_shape.
                 raise torch.cuda.OutOfMemoryError(
-                    f"TurboQuant failed to allocate _k_idx "
-                    f"({k_idx_bytes / 2**20:.1f} MiB uint8) + _k_norms "
-                    f"({k_norms_bytes / 2**20:.1f} MiB fp32) on top of "
+                    f"TurboQuant failed to allocate per-layer buffers: "
+                    f"_k_idx {k_idx_bytes / 2**20:.1f} MiB + "
+                    f"_k_norms {k_norms_bytes / 2**20:.1f} MiB + "
+                    f"_v_idx {v_idx_bytes / 2**20:.1f} MiB + "
+                    f"_v_scales {v_scale_bytes / 2**20:.1f} MiB on top of "
                     f"vLLM's existing KV cache. num_blocks={num_blocks}, "
                     f"block_size={block_size}, num_kv_heads={self.num_kv_heads}, "
                     f"head_size={self.head_size}. Original error: {e}"
                 ) from e
-        return self._k_idx, self._k_norms
+        return self._k_idx, self._k_norms, self._v_idx, self._v_scales
 
     def do_kv_cache_update(
         self,
@@ -276,15 +293,15 @@ class TurboQuantAttentionImpl(AttentionImpl):
         v = value.view(num_tokens, self.num_kv_heads, self.head_size)
 
         codebook = self._ensure_codebook(key.dtype, key.device)
-        k_idx, k_norms = self._ensure_buffers(kv_cache)
-        cache_v = kv_cache[1]
+        k_idx, k_norms, v_idx, v_scales = self._ensure_buffers(kv_cache)
 
         turboquant_store_kv(
             new_k=k,
             new_v=v,
             cache_k=k_idx,
-            cache_v=cache_v,
+            cache_v=v_idx,
             cache_k_norm=k_norms,
+            cache_v_scale=v_scales,
             slot_mapping=slot_mapping,
             codebook=codebook,
             block_size=kv_cache.shape[2],
@@ -324,14 +341,14 @@ class TurboQuantAttentionImpl(AttentionImpl):
         q = query.view(num_tokens, self.num_heads, self.head_size)
 
         codebook = self._ensure_codebook(query.dtype, query.device)
-        k_idx, k_norms = self._ensure_buffers(kv_cache)
-        cache_v = kv_cache[1]
+        k_idx, k_norms, v_idx, v_scales = self._ensure_buffers(kv_cache)
 
         attn_out = turboquant_paged_attention(
             q=q,
             cache_k=k_idx,
-            cache_v=cache_v,
+            cache_v=v_idx,
             cache_k_norm=k_norms,
+            cache_v_scale=v_scales,
             block_table=attn_metadata.block_table,
             seq_lens=attn_metadata.seq_lens,
             query_start_loc=attn_metadata.query_start_loc,

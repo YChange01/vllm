@@ -33,13 +33,15 @@ from vllm.turboquant.triton_kernels import (
 )
 
 
-def dequant_k_reference(
+def dequant_kv_reference(
     cache_k: torch.Tensor,
     cache_k_norm: torch.Tensor,
+    cache_v: torch.Tensor,
+    cache_v_scale: torch.Tensor,
     codebook: GaussianCodebook,
     block_table: torch.Tensor,
     seq_len: int,
-) -> torch.Tensor:
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Dequantise the K cache for sequence 0 up to seq_len, using the SAME
     formula the Triton attend kernel does. Returns k of shape
     (seq_len, num_kv_heads, head_size), dtype fp32."""
@@ -52,6 +54,7 @@ def dequant_k_reference(
 
     k_full = torch.zeros(seq_len, num_kv_heads, head_size,
                          dtype=torch.float32, device=cache_k.device)
+    v_full = torch.zeros_like(k_full)
     for p in range(seq_len):
         block_i = p // block_size
         tok_in_block = p % block_size
@@ -63,7 +66,9 @@ def dequant_k_reference(
             k_unit = k_unrot * signs
             k_norm_head = float(cache_k_norm[phys_block, tok_in_block, h].item())
             k_full[p, h] = k_unit * (k_norm_head * inv_sqrt_d)
-    return k_full
+            v_scale_head = float(cache_v_scale[phys_block, tok_in_block, h].item())
+            v_full[p, h] = cache_v[phys_block, tok_in_block, h].float() * v_scale_head
+    return k_full, v_full
 
 
 def reference_attention(
@@ -117,9 +122,11 @@ def run_one_case(
     cache_k = torch.zeros(num_blocks, block_size, num_heads_kv, head_size,
                           dtype=torch.uint8, device=device)
     cache_v = torch.zeros(num_blocks, block_size, num_heads_kv, head_size,
-                          dtype=dtype, device=device)
+                          dtype=torch.int8, device=device)  # Step 1: int8 V
     cache_k_norm = torch.zeros(num_blocks, block_size, num_heads_kv,
                                dtype=torch.float32, device=device)
+    cache_v_scale = torch.zeros(num_blocks, block_size, num_heads_kv,
+                                dtype=torch.float32, device=device)
 
     # Put this seq's tokens starting at block 1 slot 0 (skip block 0 to
     # mimic vLLM behaviour where block 0 is often reserved / warmup).
@@ -148,6 +155,7 @@ def run_one_case(
         cache_k=cache_k,
         cache_v=cache_v,
         cache_k_norm=cache_k_norm,
+        cache_v_scale=cache_v_scale,
         slot_mapping=slot_mapping,
         codebook=codebook,
         block_size=block_size,
@@ -160,6 +168,7 @@ def run_one_case(
         cache_k=cache_k,
         cache_v=cache_v,
         cache_k_norm=cache_k_norm,
+        cache_v_scale=cache_v_scale,
         block_table=block_table,
         seq_lens=seq_lens,
         query_start_loc=query_start_loc,
@@ -168,22 +177,16 @@ def run_one_case(
     )
     torch.cuda.synchronize()
 
-    # --- 3) Reference attention using the SAME dequantised K -------------
-    k_dq = dequant_k_reference(
+    # --- 3) Reference attention using the SAME dequantised K/V -----------
+    k_dq, v_dq = dequant_kv_reference(
         cache_k=cache_k,
         cache_k_norm=cache_k_norm,
+        cache_v=cache_v,
+        cache_v_scale=cache_v_scale,
         codebook=codebook,
         block_table=block_table,
         seq_len=num_tokens,
-    )  # (num_tokens, num_heads_kv, d) fp32
-
-    # V is stored verbatim (no quantisation), pull it back the same way.
-    v_dq = torch.zeros_like(k_dq)
-    for p in range(num_tokens):
-        block_i = p // block_size
-        tok_in_block = p % block_size
-        phys_block = int(block_table[0, block_i].item())
-        v_dq[p] = cache_v[phys_block, tok_in_block].float()
+    )  # (num_tokens, num_heads_kv, d) fp32 each
 
     kv_end_per_query = torch.arange(1, num_tokens + 1, dtype=torch.int32, device=device)
     ref_out = reference_attention(q.float(), k_dq, v_dq, kv_end_per_query)
