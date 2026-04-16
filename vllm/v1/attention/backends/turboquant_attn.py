@@ -332,14 +332,18 @@ class TurboQuantAttentionImpl(AttentionImpl):
         if self._layer_seed not in _DEBUG_SEEN_STORE:
             _DEBUG_SEEN_STORE.add(self._layer_seed)
             try:
-                sm = slot_mapping.detach().cpu().tolist()
+                sm_full = slot_mapping.detach().cpu()
+                sm_head = sm_full[:16].tolist()
+                sm_nvalid = int((sm_full >= 0).sum().item())
                 k0 = k.detach().float().cpu()[:2, 0, :4].tolist()
                 v0 = v.detach().float().cpu()[:2, 0, :4].tolist()
                 _dbg(
                     f"[store L{self._layer_seed}] num_tokens={num_tokens} "
-                    f"key.shape={tuple(key.shape)} kv_cache.shape={tuple(kv_cache.shape)} "
-                    f"slot_mapping={sm} bypass={TURBOQUANT_BYPASS} "
-                    f"forward_includes_kv_cache_update={TurboQuantAttentionBackend.forward_includes_kv_cache_update} "
+                    f"key.shape={tuple(key.shape)} "
+                    f"kv_cache.shape={tuple(kv_cache.shape)} "
+                    f"slot_mapping.len={sm_full.numel()} nvalid={sm_nvalid} "
+                    f"slot_mapping[:16]={sm_head} "
+                    f"bypass={TURBOQUANT_BYPASS} "
                     f"k[:2,0,:4]={k0} v[:2,0,:4]={v0}"
                 )
             except Exception as e:
@@ -404,17 +408,24 @@ class TurboQuantAttentionImpl(AttentionImpl):
             try:
                 qsl = attn_metadata.query_start_loc.detach().cpu().tolist()
                 sl = attn_metadata.seq_lens.detach().cpu().tolist()
-                bt = attn_metadata.block_table[: len(sl), :4].detach().cpu().tolist()
-                sm = attn_metadata.slot_mapping.detach().cpu().tolist()
+                bt_head = (
+                    attn_metadata.block_table[: max(1, len(sl)), :4]
+                    .detach().cpu().tolist()
+                )
+                sm_full = attn_metadata.slot_mapping.detach().cpu()
+                sm_head = sm_full[:16].tolist()
+                sm_nvalid = int((sm_full >= 0).sum().item())
                 q0 = q.detach().float().cpu()[:1, 0, :4].tolist()
                 out_shape = tuple(output.shape)
                 _dbg(
                     f"[fwd   L{self._layer_seed}] num_tokens={num_tokens} "
                     f"q.shape={tuple(q.shape)} out.shape={out_shape} "
-                    f"scale={self.scale:.6f} sqrt(1/d)={1.0/self.head_size**0.5:.6f} "
-                    f"qsl={qsl} seq_lens={sl} block_table[:4]={bt} "
-                    f"slot_mapping={sm} bypass={TURBOQUANT_BYPASS} "
-                    f"q[0,0,:4]={q0}"
+                    f"scale={self.scale:.6f} "
+                    f"sqrt(1/d)={1.0/self.head_size**0.5:.6f} "
+                    f"qsl={qsl} seq_lens={sl} block_table[:4]={bt_head} "
+                    f"slot_mapping.len={sm_full.numel()} nvalid={sm_nvalid} "
+                    f"slot_mapping[:16]={sm_head} "
+                    f"bypass={TURBOQUANT_BYPASS} q[0,0,:4]={q0}"
                 )
             except Exception as e:
                 _dbg(f"[fwd L{self._layer_seed}] dbg err: {e}")

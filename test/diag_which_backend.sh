@@ -63,35 +63,31 @@ kill -TERM -"$CURRENT_PGID" 2>/dev/null || true
 wait "$CURRENT_PGID" 2>/dev/null || true
 CURRENT_PGID=""
 
-echo ""
-echo "==================================================================="
-echo "[which] file size: $(wc -l < "$LOG") lines, $(wc -c < "$LOG") bytes"
-echo "[which] grep 1: TURBOQUANT_DBG"
-echo "==================================================================="
-grep -na "TURBOQUANT_DBG" "$LOG" | head -20
-n1=$(grep -c "TURBOQUANT_DBG" "$LOG" || true)
-echo "[which] TURBOQUANT_DBG count: $n1"
+# Output tailored to stay short. Each grep capped at 200 chars * 10 lines.
+_short() { cut -c1-200 | head -"${1:-10}"; }
 
 echo ""
 echo "==================================================================="
-echo "[which] grep 2: anything mentioning 'backend' or 'attn' or 'ttn':"
+echo "[which] log lines: $(wc -l < "$LOG")  bytes: $(wc -c < "$LOG")"
 echo "==================================================================="
-grep -na -iE "backend|attn|ttention" "$LOG" | head -40
 
 echo ""
-echo "==================================================================="
-echo "[which] grep 3: anything mentioning 'Turbo' or 'Quant' (case-insens):"
-echo "==================================================================="
-grep -na -i "turbo\|quant" "$LOG" | head -20
+echo "-- TURBOQUANT_DBG lines --"
+grep -na "TURBOQUANT_DBG" "$LOG" | _short 10
+echo "count: $(grep -c "TURBOQUANT_DBG" "$LOG" || true)"
 
 echo ""
-echo "==================================================================="
-echo "[which] ERRORs / WARNINGs:"
-echo "==================================================================="
-grep -na -iE "error|warn|fail|traceback|fallback" "$LOG" | head -40
+echo "-- backend / attention selection --"
+grep -na -iE "attention backend|selected attn|using.*backend|attn backend|init attention" "$LOG" | _short 10
 
 echo ""
-echo "==================================================================="
-echo "[which] LOG SAVED AT: $LOG"
-echo "[which] upload it entirely if any section above is ambiguous."
-echo "==================================================================="
+echo "-- Turbo/Quant mentions --"
+grep -na -i "turbo\|quant" "$LOG" | _short 10
+
+echo ""
+echo "-- Errors / Warnings / Fallbacks --"
+grep -na -iE "error|warn|fail|traceback|fallback|notimplemented" "$LOG" | _short 20
+
+echo ""
+echo "-- Log path (upload if sections above are inconclusive) --"
+echo "$LOG"
