@@ -198,6 +198,7 @@ class TurboQuantAttentionImpl(AttentionImpl):
         self._codebook: GaussianCodebook | None = None
         self._k_norms: torch.Tensor | None = None
         self._k_idx: torch.Tensor | None = None
+        self._v_cache: torch.Tensor | None = None
 
     def _ensure_codebook(
         self, dtype: torch.dtype, device: torch.device
@@ -213,25 +214,32 @@ class TurboQuantAttentionImpl(AttentionImpl):
         return self._codebook
 
     def _ensure_buffers(self, kv_cache: torch.Tensor):
-        """Lazily allocate K idx cache and per-key norm buffer.
+        """Lazily allocate K idx, V, and per-key norm buffers.
 
-        We use a separate uint8 tensor for K indices instead of
-        reinterpreting the fp16/bf16 K slab via view(uint8), because
-        the dtype-changed view + slice + .contiguous() creates a COPY
-        and writes to the store kernel would be lost.
+        We use separate tensors with a known NTH layout
+        (num_blocks, block_size, num_kv_heads, head_size) instead of
+        vLLM's kv_cache slab, because:
+        1. The K slab would need a dtype reinterpret that causes copies.
+        2. vLLM may use HND layout (num_blocks, num_heads, block_size,
+           head_size) which doesn't match our kernel's offset math.
         """
         if self._k_idx is None:
             num_blocks = kv_cache.shape[1]
             block_size = kv_cache.shape[2]
+            device = kv_cache.device
             self._k_idx = torch.zeros(
                 num_blocks, block_size, self.num_kv_heads, self.head_size,
-                dtype=torch.uint8, device=kv_cache.device,
+                dtype=torch.uint8, device=device,
+            )
+            self._v_cache = torch.zeros(
+                num_blocks, block_size, self.num_kv_heads, self.head_size,
+                dtype=kv_cache.dtype, device=device,
             )
             self._k_norms = torch.zeros(
                 num_blocks, block_size, self.num_kv_heads,
-                dtype=torch.float32, device=kv_cache.device,
+                dtype=torch.float32, device=device,
             )
-        return self._k_idx, self._k_norms
+        return self._k_idx, self._v_cache, self._k_norms
 
     def do_kv_cache_update(
         self,
@@ -251,14 +259,13 @@ class TurboQuantAttentionImpl(AttentionImpl):
         v = value.view(num_tokens, self.num_kv_heads, self.head_size)
 
         codebook = self._ensure_codebook(key.dtype, key.device)
-        cache_v = kv_cache[1]
-        k_idx, k_norms = self._ensure_buffers(kv_cache)
+        k_idx, v_cache, k_norms = self._ensure_buffers(kv_cache)
 
         turboquant_store_kv(
             new_k=k,
             new_v=v,
             cache_k=k_idx,
-            cache_v=cache_v,
+            cache_v=v_cache,
             cache_k_norm=k_norms,
             slot_mapping=slot_mapping,
             codebook=codebook,
@@ -292,13 +299,12 @@ class TurboQuantAttentionImpl(AttentionImpl):
         q = query.view(num_tokens, self.num_heads, self.head_size)
 
         codebook = self._ensure_codebook(query.dtype, query.device)
-        cache_v = kv_cache[1]
-        k_idx, k_norms = self._ensure_buffers(kv_cache)
+        k_idx, v_cache, k_norms = self._ensure_buffers(kv_cache)
 
         attn_out = turboquant_paged_attention(
             q=q,
             cache_k=k_idx,
-            cache_v=cache_v,
+            cache_v=v_cache,
             cache_k_norm=k_norms,
             block_table=attn_metadata.block_table,
             seq_lens=attn_metadata.seq_lens,
