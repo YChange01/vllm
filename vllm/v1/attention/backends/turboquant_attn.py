@@ -14,6 +14,7 @@ Enable with::
 Status: MVP / skeleton. Needs validation on B200 (see TURBOQUANT.md).
 """
 
+import os
 from dataclasses import dataclass
 from typing import ClassVar
 
@@ -45,8 +46,7 @@ logger = init_logger(__name__)
 
 
 # Default codebook parameters. Configurable via env var.
-import os as _os
-TURBOQUANT_BITS = int(_os.environ.get("TURBOQUANT_BITS", "8"))
+TURBOQUANT_BITS = int(os.environ.get("TURBOQUANT_BITS", "8"))
 
 
 @dataclass
