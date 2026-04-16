@@ -211,16 +211,33 @@ def run_one_case(
     kv_end_per_query = torch.arange(1, num_tokens + 1, dtype=torch.int32, device=device)
     ref_out = reference_attention(q.float(), k_dq, v_dq, kv_end_per_query)
 
+    # --- 3b) FP ground-truth attention on the ORIGINAL unquantized K/V ----
+    # This is what Step 2 should actually move. The ref_out above uses the
+    # same quantized+dequantized K/V as the Triton kernel, so it measures
+    # kernel arithmetic fidelity (~0.14% bf16 floor) but NOT quantization
+    # quality. Comparing attn_out against this fp_ref_out shows the true
+    # end-to-end quantization error that the residual is supposed to shrink.
+    fp_ref_out = reference_attention(
+        q.float(), k.float(), v.float(), kv_end_per_query,
+    )
+
     # --- 4) Compare -------------------------------------------------------
-    diff = (attn_out.float() - ref_out).abs()
+    # kernel vs quant-reference (measures Triton arithmetic fidelity)
+    kern_diff = (attn_out.float() - ref_out).abs()
+    # kernel vs FP ground truth (measures total quantization error)
+    quant_diff = (attn_out.float() - fp_ref_out).abs()
     return {
         "num_tokens": num_tokens,
         "bits": bits,
-        "out_max_abs_err": float(diff.max().item()),
-        "out_mean_abs_err": float(diff.mean().item()),
-        "ref_out_std": float(ref_out.std().item()),
+        "kern_rel_err": float(
+            (kern_diff.mean() / ref_out.abs().mean().clamp(min=1e-6)).item()
+        ),
+        "quant_rel_err": float(
+            (quant_diff.mean() / fp_ref_out.abs().mean().clamp(min=1e-6)).item()
+        ),
+        "quant_max_err": float(quant_diff.max().item()),
+        "fp_ref_std": float(fp_ref_out.std().item()),
         "attn_out_std": float(attn_out.float().std().item()),
-        "rel_err": float((diff.mean() / ref_out.abs().mean().clamp(min=1e-6)).item()),
     }
 
 
@@ -233,15 +250,21 @@ def main():
 
     cases = [args.num_tokens] if args.num_tokens else [1, 4, 16, 32, 61, 128]
 
-    print(f"{'num_tokens':>12} {'max_err':>10} {'mean_err':>10} "
-          f"{'rel_err':>10} {'ref_std':>10} {'attn_std':>10}")
+    # Two error columns:
+    #   kern_rel_err  : Triton kernel vs PyTorch on SAME quantized K/V
+    #                   (measures kernel arithmetic, should be ~0.14% bf16 floor)
+    #   quant_rel_err : Triton kernel vs PyTorch on UNQUANTIZED K/V
+    #                   (measures total quantization error — this is the one
+    #                   Step 2's residual is supposed to shrink)
+    print(f"{'num_tokens':>12} {'kern_rel':>12} {'quant_rel':>12} "
+          f"{'quant_max':>12} {'fp_std':>10} {'attn_std':>10}")
     for n in cases:
         r = run_one_case(num_tokens=n, bits=args.bits)
         print(f"{r['num_tokens']:>12} "
-              f"{r['out_max_abs_err']:>10.4f} "
-              f"{r['out_mean_abs_err']:>10.4f} "
-              f"{r['rel_err']:>10.4%} "
-              f"{r['ref_out_std']:>10.4f} "
+              f"{r['kern_rel_err']:>12.4%} "
+              f"{r['quant_rel_err']:>12.4%} "
+              f"{r['quant_max_err']:>12.4f} "
+              f"{r['fp_ref_std']:>10.4f} "
               f"{r['attn_out_std']:>10.4f}")
 
 
