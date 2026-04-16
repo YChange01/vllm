@@ -285,5 +285,5 @@ class TurboQuantAttentionImpl(AttentionImpl):
             codebook=codebook,
             scale=self.scale,
         )
-        output.copy_(attn_out.view(num_tokens, -1))
+        output.copy_(attn_out.reshape_as(output))
         return output
