@@ -444,6 +444,7 @@ def turboquant_paged_attention(
     """
     import os
     _tq_debug = int(os.environ.get("TQ_DEBUG", "0"))
+    _tq_disable_qjl = int(os.environ.get("TQ_DISABLE_QJL", "0"))
 
     num_query_tokens, num_heads_q, head_size = q.shape
     _, block_size, num_heads_kv, _ = cache_k.shape
@@ -452,6 +453,15 @@ def turboquant_paged_attention(
     inv_d = 1.0 / float(head_size)
     import math as _math
     qjl_coef = _math.sqrt(_math.pi / 2.0) / float(head_size)
+
+    # --- Diagnostic probe: disable QJL contribution ---------------------
+    # When TQ_DISABLE_QJL=1 we zero out r_norm so the qjl_coef * r_norm *
+    # qjl_dot term collapses to 0. The kernel then computes pure Q_mse in
+    # rotated space with whatever bits-1 codebook is in place. Pair this
+    # with TURBOQUANT_BITS=9 to recover an 8-bit main codebook for a
+    # direct comparison against the legacy real-space Algorithm 1 kernel.
+    if _tq_disable_qjl:
+        cache_k_rnorm = torch.zeros_like(cache_k_rnorm)
 
     assert query_start_loc.shape[0] == num_seqs + 1, (
         f"query_start_loc length {query_start_loc.shape[0]} != num_seqs+1 "
