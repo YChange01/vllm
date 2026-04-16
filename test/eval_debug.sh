@@ -61,6 +61,7 @@ echo "[debug] filtered : $DBG_LOG"
 CUDA_VISIBLE_DEVICES="$GPU" \
 TQ_DEBUG=1 \
 TQ_VERIFY=1 \
+TQ_KSTATS=1 \
 TURBOQUANT_BITS="$BITS" \
 setsid vllm serve "$MODEL" \
     --port "$PORT" \
@@ -93,7 +94,7 @@ python3 "$ROOT_DIR/test/eval_niah.py" \
 # ---- extract TQ_ATTN debug lines ----------------------------------------
 echo ""
 echo "=========================== TQ_ATTN debug =========================="
-grep -E '\[TQ_ATTN|\[TQ_VERIFY' "$SERVE_LOG" > "$DBG_LOG" || true
+grep -E '\[TQ_ATTN|\[TQ_VERIFY|\[TQ_KSTATS' "$SERVE_LOG" > "$DBG_LOG" || true
 if [ -s "$DBG_LOG" ]; then
     head -n 80 "$DBG_LOG"
 else

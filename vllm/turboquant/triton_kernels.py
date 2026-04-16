@@ -281,6 +281,78 @@ def _dequant_and_attend_kernel(
     tl.store(out_ptr + out_off, out_vec.to(OUT_DTYPE), mask=mask_d)
 
 
+_TQ_KSTATS_COUNTER = [0]
+
+
+def _tq_kstats_dump(
+    new_k: torch.Tensor,
+    codebook: GaussianCodebook,
+) -> None:
+    """Print per-dim outlier statistics for the incoming K tensor.
+
+    Emits three per-dim signals, averaged over (token, kv_head):
+      1. raw_max    -- max(|K|) per dim: identifies outlier channels in the
+                       original (pre-rotation, pre-norm) K.
+      2. rot_max    -- max(|H @ (k_normed * signs)|) per dim: if Hadamard
+                       equalizes as the paper assumes, this should be flat.
+      3. resid_abs  -- |rotated - codebook[idx]| per element: if one dim
+                       dominates, the per-head mean(|r|) scale is bogus.
+
+    The ``outlier_ratio`` is top1_dim_max / mean_dim_max. For healthy
+    N(0, 1) data (what the smoke test uses) it should be ~3x. For a real
+    LLM K tensor with an outlier channel it is typically 10x-100x. A high
+    ratio AFTER rotation is the smoking gun for Step 2's failure mode.
+    """
+    with torch.no_grad():
+        k_f = new_k.detach().float()                        # (T, H, D)
+        head_size = k_f.shape[-1]
+        signs = codebook.signs.float()
+        H = codebook.H.float()
+        cb = codebook.codebook.float()
+        boundaries = codebook.boundaries.float()
+
+        # 1) raw K per-dim outliers
+        raw_abs = k_f.abs()
+        raw_dim_max = raw_abs.amax(dim=(0, 1))              # (D,)
+        raw_dim_mean = raw_abs.mean(dim=(0, 1))             # (D,)
+        raw_top = float(raw_dim_max.max().item())
+        raw_avg = float(raw_dim_max.mean().item())
+
+        # 2) rotated K per-dim outliers (matches what store kernel sees)
+        k_norm = k_f.norm(dim=-1, keepdim=True).clamp(min=1e-6)
+        k_scaled = k_f * ((head_size ** 0.5) / k_norm)
+        rot = (k_scaled * signs) @ H.T                      # (T, H, D)
+        rot_abs = rot.abs()
+        rot_dim_max = rot_abs.amax(dim=(0, 1))
+        rot_top = float(rot_dim_max.max().item())
+        rot_avg = float(rot_dim_max.mean().item())
+
+        # 3) residual distribution after Lloyd-Max quant
+        idx = torch.bucketize(rot.contiguous(), boundaries)
+        rk_dq = cb[idx]
+        resid = (rot - rk_dq).abs()
+        r_max = float(resid.max().item())
+        r_mean = float(resid.mean().item())
+        r_p99 = float(resid.reshape(-1).quantile(0.99).item())
+
+        # top 3 outlier dims by raw max -- useful for locating channels
+        top_dims = raw_dim_max.topk(3).indices.tolist()
+        top_vals = raw_dim_max.topk(3).values.tolist()
+
+        print(
+            f"[TQ_KSTATS #{_TQ_KSTATS_COUNTER[0]}] "
+            f"T={k_f.shape[0]} H={k_f.shape[1]} D={head_size} | "
+            f"raw: top_max={raw_top:.3f} avg_max={raw_avg:.3f} "
+            f"ratio={raw_top / max(raw_avg, 1e-6):.1f}x "
+            f"top3_dims={top_dims} top3_vals={[f'{v:.2f}' for v in top_vals]} | "
+            f"rot: top_max={rot_top:.3f} avg_max={rot_avg:.3f} "
+            f"ratio={rot_top / max(rot_avg, 1e-6):.1f}x | "
+            f"resid: max={r_max:.4f} mean={r_mean:.4f} p99={r_p99:.4f} "
+            f"max/mean={r_max / max(r_mean, 1e-6):.1f}x",
+            flush=True,
+        )
+
+
 def turboquant_store_kv(
     new_k: torch.Tensor,
     new_v: torch.Tensor,
@@ -305,6 +377,11 @@ def turboquant_store_kv(
     first-moment error of the MSE codebook, which is what biased inner
     products on long contexts (see NIAH gap).
     """
+    import os
+    if int(os.environ.get("TQ_KSTATS", "0")) and _TQ_KSTATS_COUNTER[0] < 8:
+        _TQ_KSTATS_COUNTER[0] += 1
+        _tq_kstats_dump(new_k, codebook)
+
     num_tokens, num_heads_kv, head_size = new_k.shape
     K_CB = int(codebook.codebook.shape[0])
 
