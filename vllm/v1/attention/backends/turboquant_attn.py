@@ -53,6 +53,11 @@ logger = init_logger(__name__)
 
 TURBOQUANT_ALGO = os.environ.get("TURBOQUANT_ALGO", "prod").lower()
 TURBOQUANT_BITS = int(os.environ.get("TURBOQUANT_BITS", "8"))
+# Diagnostic bypass: skip quantization entirely and run FP attention over
+# the original bf16 K/V stored in a parallel buffer. If output is still
+# broken with BYPASS=1, the bug is NOT in the quant kernel but in how the
+# backend plugs into vLLM (output tensor, slot semantics, etc).
+TURBOQUANT_BYPASS = os.environ.get("TURBOQUANT_BYPASS", "0") == "1"
 
 if TURBOQUANT_ALGO not in ("mse", "prod"):
     raise ValueError(
@@ -202,6 +207,9 @@ class TurboQuantAttentionImpl(AttentionImpl):
         # prod-only buffers
         self._k_qjl_sign: torch.Tensor | None = None
         self._k_rnorm: torch.Tensor | None = None
+        # BYPASS mode only.
+        self._k_fp: torch.Tensor | None = None
+        self._v_fp: torch.Tensor | None = None
 
     # -------------------------------------------------------------------
     # Lazy state / buffer allocation
@@ -219,7 +227,7 @@ class TurboQuantAttentionImpl(AttentionImpl):
         return self._state
 
     def _ensure_buffers(self, kv_cache: torch.Tensor):
-        if self._k_idx is not None:
+        if self._k_idx is not None or self._k_fp is not None:
             return  # already allocated
 
         num_blocks = kv_cache.shape[1]
@@ -228,6 +236,14 @@ class TurboQuantAttentionImpl(AttentionImpl):
 
         shape_dim = (num_blocks, block_size, self.num_kv_heads, self.head_size)
         shape_meta = (num_blocks, block_size, self.num_kv_heads)
+
+        if TURBOQUANT_BYPASS:
+            # Parallel FP bf16 buffer. Isolates vLLM integration from quant.
+            self._k_fp = torch.zeros(shape_dim, dtype=kv_cache.dtype,
+                                     device=device)
+            self._v_fp = torch.zeros(shape_dim, dtype=kv_cache.dtype,
+                                     device=device)
+            return
 
         self._k_idx = torch.zeros(shape_dim, dtype=torch.uint8, device=device)
         self._k_norm = torch.zeros(shape_meta, dtype=torch.float32, device=device)
@@ -260,9 +276,20 @@ class TurboQuantAttentionImpl(AttentionImpl):
         k = key.view(num_tokens, self.num_kv_heads, self.head_size)
         v = value.view(num_tokens, self.num_kv_heads, self.head_size)
 
-        state = self._ensure_state(key.dtype, key.device)
         self._ensure_buffers(kv_cache)
 
+        if TURBOQUANT_BYPASS:
+            block_size = kv_cache.shape[2]
+            valid = slot_mapping >= 0
+            slots = slot_mapping[valid].to(torch.int64)
+            if slots.numel() > 0:
+                b_idx = slots // block_size
+                off = slots % block_size
+                self._k_fp[b_idx, off] = k[valid]
+                self._v_fp[b_idx, off] = v[valid]
+            return
+
+        state = self._ensure_state(key.dtype, key.device)
         turboquant_store_kv(
             new_k=k,
             new_v=v,
@@ -305,21 +332,95 @@ class TurboQuantAttentionImpl(AttentionImpl):
         num_tokens = query.shape[0]
         q = query.view(num_tokens, self.num_heads, self.head_size)
 
-        state = self._ensure_state(query.dtype, query.device)
         self._ensure_buffers(kv_cache)
 
-        attn_out = turboquant_paged_attention(
-            q=q,
-            cache_k_idx=self._k_idx,
-            cache_k_norm=self._k_norm,
-            cache_v_idx=self._v_idx,
-            cache_v_scale=self._v_scale,
-            block_table=attn_metadata.block_table,
-            seq_lens=attn_metadata.seq_lens,
-            query_start_loc=attn_metadata.query_start_loc,
-            state=state,
-            cache_k_qjl_sign=self._k_qjl_sign,
-            cache_k_rnorm=self._k_rnorm,
-        )
+        if TURBOQUANT_BYPASS:
+            attn_out = _fp_paged_attention(
+                q=q,
+                k_fp=self._k_fp,
+                v_fp=self._v_fp,
+                block_table=attn_metadata.block_table,
+                seq_lens=attn_metadata.seq_lens,
+                query_start_loc=attn_metadata.query_start_loc,
+                scale=self.scale,
+                num_heads_q=self.num_heads,
+                num_heads_kv=self.num_kv_heads,
+            )
+        else:
+            state = self._ensure_state(query.dtype, query.device)
+            attn_out = turboquant_paged_attention(
+                q=q,
+                cache_k_idx=self._k_idx,
+                cache_k_norm=self._k_norm,
+                cache_v_idx=self._v_idx,
+                cache_v_scale=self._v_scale,
+                block_table=attn_metadata.block_table,
+                seq_lens=attn_metadata.seq_lens,
+                query_start_loc=attn_metadata.query_start_loc,
+                state=state,
+                cache_k_qjl_sign=self._k_qjl_sign,
+                cache_k_rnorm=self._k_rnorm,
+            )
         output.copy_(attn_out.reshape_as(output))
         return output
+
+
+def _fp_paged_attention(
+    q: torch.Tensor,                  # (T_q, H_q, d) bf16/fp16
+    k_fp: torch.Tensor,               # (num_blocks, bs, H_kv, d)
+    v_fp: torch.Tensor,               # (num_blocks, bs, H_kv, d)
+    block_table: torch.Tensor,        # (num_seqs, max_blocks)
+    seq_lens: torch.Tensor,           # (num_seqs,)
+    query_start_loc: torch.Tensor,    # (num_seqs + 1,)
+    scale: float,
+    num_heads_q: int,
+    num_heads_kv: int,
+) -> torch.Tensor:
+    """BYPASS-only: vectorized FP attention over paged bf16 K/V.
+
+    Recomputes the same per-query metadata the Triton path uses, then does
+    full softmax(q @ k^T * scale) @ v with no quantization. If this produces
+    coherent output on Llama, the vLLM backend plumbing is correct and any
+    `://24` under the real path must come from the quant kernel.
+    """
+    T_q, H_q, d = q.shape
+    num_blocks, block_size, H_kv, _ = k_fp.shape
+    num_seqs = int(seq_lens.shape[0])
+    dev = q.device
+    gqa = H_q // H_kv
+
+    qsl = query_start_loc.to(device=dev, dtype=torch.int64)
+    query_lens = qsl[1:] - qsl[:-1]
+    seq_ids = torch.arange(num_seqs, dtype=torch.int64, device=dev)
+    seq_id_per_q = torch.repeat_interleave(seq_ids, query_lens)
+    q_pos = (
+        torch.arange(T_q, dtype=torch.int64, device=dev)
+        - qsl[:-1][seq_id_per_q]
+    )
+    prefix_len = seq_lens.to(device=dev, dtype=torch.int64) - query_lens
+    kv_end_per_q = prefix_len[seq_id_per_q] + q_pos + 1
+
+    out = torch.empty_like(q)
+    # Simple python loop (this is diagnostic code; perf irrelevant).
+    for qi in range(T_q):
+        seq = int(seq_id_per_q[qi].item())
+        end = int(kv_end_per_q[qi].item())
+        # Gather contiguous K, V for seq[0 : end] via block_table.
+        num_blocks_q = (end + block_size - 1) // block_size
+        k_list = []
+        v_list = []
+        taken = 0
+        for bi in range(num_blocks_q):
+            phys = int(block_table[seq, bi].item())
+            use = min(block_size, end - taken)
+            k_list.append(k_fp[phys, :use])
+            v_list.append(v_fp[phys, :use])
+            taken += use
+        k_seq = torch.cat(k_list, dim=0)  # (end, H_kv, d)
+        v_seq = torch.cat(v_list, dim=0)
+        for h in range(H_q):
+            kh = h // gqa
+            scores = (q[qi, h].float() @ k_seq[:, kh].float().T) * scale
+            w = torch.softmax(scores, dim=-1)
+            out[qi, h] = (w @ v_seq[:, kh].float()).to(q.dtype)
+    return out
