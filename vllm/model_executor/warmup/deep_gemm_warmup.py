@@ -361,6 +361,11 @@ def _count_warmup_iterations(model: torch.nn.Module, max_tokens: int) -> int:
 
 @instrument(span_name="DeepGemm warmup")
 def deep_gemm_warmup(model: torch.nn.Module, max_tokens: int):
+    try:
+        from vllm.utils.deep_gemm import get_mk_alignment_for_contiguous_layout
+        get_mk_alignment_for_contiguous_layout()
+    except (ImportError, RuntimeError):
+        return
     total = _count_warmup_iterations(model, max_tokens)
     if total == 0:
         return
