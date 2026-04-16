@@ -6,7 +6,7 @@
 
 MODEL="${1:-/mnt/nvme3n1/g00872988/models/Qwen3-0.6B}"
 PORT="${2:-8009}"
-GPU="${3:-}"
+GPU="${3:-1}"
 
 if [ -n "$GPU" ]; then
     export CUDA_VISIBLE_DEVICES="$GPU"
