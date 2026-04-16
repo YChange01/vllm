@@ -195,6 +195,7 @@ class TurboQuantAttentionImpl(AttentionImpl):
         TurboQuantAttentionImpl._layer_counter += 1
 
         self._codebook: GaussianCodebook | None = None
+        self._k_norms: torch.Tensor | None = None
 
     def _ensure_codebook(
         self, dtype: torch.dtype, device: torch.device
@@ -217,6 +218,17 @@ class TurboQuantAttentionImpl(AttentionImpl):
         cache_v = kv_cache[1]
         return cache_k_idx, cache_v
 
+    def _ensure_k_norms(self, kv_cache: torch.Tensor) -> torch.Tensor:
+        """Lazily allocate per-key norm buffer: (num_blocks, block_size, num_kv_heads) fp32."""
+        if self._k_norms is None:
+            num_blocks = kv_cache.shape[1]
+            block_size = kv_cache.shape[2]
+            self._k_norms = torch.zeros(
+                num_blocks, block_size, self.num_kv_heads,
+                dtype=torch.float32, device=kv_cache.device,
+            )
+        return self._k_norms
+
     def do_kv_cache_update(
         self,
         layer: AttentionLayer,
@@ -236,12 +248,14 @@ class TurboQuantAttentionImpl(AttentionImpl):
 
         codebook = self._ensure_codebook(key.dtype, key.device)
         cache_k_idx, cache_v = self._get_cache_views(kv_cache)
+        k_norms = self._ensure_k_norms(kv_cache)
 
         turboquant_store_kv(
             new_k=k,
             new_v=v,
             cache_k=cache_k_idx,
             cache_v=cache_v,
+            cache_k_norm=k_norms,
             slot_mapping=slot_mapping,
             codebook=codebook,
             block_size=kv_cache.shape[2],
@@ -275,11 +289,13 @@ class TurboQuantAttentionImpl(AttentionImpl):
 
         codebook = self._ensure_codebook(query.dtype, query.device)
         cache_k_idx, cache_v = self._get_cache_views(kv_cache)
+        k_norms = self._ensure_k_norms(kv_cache)
 
         attn_out = turboquant_paged_attention(
             q=q,
             cache_k=cache_k_idx,
             cache_v=cache_v,
+            cache_k_norm=k_norms,
             block_table=attn_metadata.block_table,
             seq_lens=attn_metadata.seq_lens,
             codebook=codebook,

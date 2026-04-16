@@ -3,27 +3,15 @@
 """Triton kernels for TurboQuant quantized paged attention.
 
 Two kernels:
-  1. ``_quantize_and_store_kernel``: rotates + quantizes + stores a new K slot,
-     and copies V unchanged.
-  2. ``_dequant_and_attend_kernel``: per-(seq, q_head) flash-style attention on
-     paged quantized K and fp16/bf16 V.
+  1. ``_quantize_and_store_kernel``: L2-normalizes K, rotates, quantizes,
+     stores uint8 idx + fp32 norm per key.
+  2. ``_dequant_and_attend_kernel``: loads idx + norm, dequantizes with
+     norm restoration, runs flash-style attention.
 
-Design notes:
-  - Hadamard multiplication uses a ``(d, d)`` tile and ``tl.sum`` broadcast,
-    so no scalar indexing into tiles (which Triton forbids).
-  - Codebook lookup uses pointer arithmetic (``tl.load(cb_ptr + idx)``)
-    instead of ``tl.gather`` (not available in all Triton versions).
-  - Per-row L2 normalization: each new K vector is normalized to
-    ``||k|| = sqrt(d)`` BEFORE quantization. Dequantization multiplies by the
-    same scalar ``sqrt(d) / d = 1 / sqrt(d)``. This keeps the Lloyd-Max
-    codebook valid without storing a per-key scale.
-  - Online softmax uses ``m_init = -1e30`` rather than ``-inf`` so the first
-    iteration's ``exp(m_init - m_new)`` evaluates to (approximately) zero
-    without producing NaN.
-
-The MVP stores one uint8 per coordinate (low nibble carries the 4-bit idx).
-A follow-up can pack two nibbles per byte to realize the full 4x memory
-saving.
+Per-key norm preservation:
+  Store saves ``||k||`` as a separate fp32 scalar per (block, slot, head).
+  Attend loads it and scales the dequantized unit-vector by ``||k|| / sqrt(d)``
+  to recover the original magnitude. This is critical for attention logits.
 """
 
 from __future__ import annotations
@@ -47,10 +35,11 @@ def _quantize_and_store_kernel(
     new_v_ptr,           # (num_tokens, num_heads_kv, head_size) fp16/bf16
     cache_k_ptr,         # (num_blocks, block_size, num_heads_kv, head_size) uint8
     cache_v_ptr,         # (num_blocks, block_size, num_heads_kv, head_size) fp16/bf16
+    cache_k_norm_ptr,    # (num_blocks, block_size, num_heads_kv) fp32
     slot_mapping_ptr,    # (num_tokens,) int64
-    hadamard_ptr,        # (head_size, head_size) fp16/bf16 (symmetric, normalized)
-    signs_ptr,           # (head_size,) fp16/bf16 (+/- 1)
-    boundaries_ptr,      # (K_CB - 1,) fp32 codebook decision boundaries
+    hadamard_ptr,        # (head_size, head_size) fp16/bf16
+    signs_ptr,           # (head_size,) fp16/bf16
+    boundaries_ptr,      # (K_CB - 1,) fp32
     num_heads_kv: tl.constexpr,
     head_size: tl.constexpr,
     block_size: tl.constexpr,
@@ -71,26 +60,27 @@ def _quantize_and_store_kernel(
     d_idx = tl.arange(0, BLOCK_D)
     mask_d = d_idx < head_size
 
-    # Load k and v for this (token, head).
     kv_off = (tok * num_heads_kv + head) * head_size + d_idx
     k_vec = tl.load(new_k_ptr + kv_off, mask=mask_d, other=0.0).to(tl.float32)
     v_vec = tl.load(new_v_ptr + kv_off, mask=mask_d, other=0.0)
 
-    # Per-row L2 normalize k to ||k|| = sqrt(head_size). Dequant multiplies by
-    # inv_sqrt_d, so the final reconstructed scale matches the input direction
-    # up to a shared constant absorbed by softmax (attention is scale-invariant
-    # when all K share the same scaling).
+    # Compute and save L2 norm BEFORE normalization.
     k_norm_sq = tl.sum(k_vec * k_vec)
-    k_inv_norm = 1.0 / tl.sqrt(tl.maximum(k_norm_sq, 1e-12))
-    # Target norm: sqrt(head_size), so scale by sqrt(d) / ||k||.
-    k_scale = k_inv_norm * tl.sqrt(float(head_size))
+    k_norm = tl.sqrt(tl.maximum(k_norm_sq, 1e-12))
+
+    # Store norm to separate buffer: cache_k_norm[block, slot, head].
+    norm_off = block_idx * block_size * num_heads_kv + off_in_block * num_heads_kv + head
+    tl.store(cache_k_norm_ptr + norm_off, k_norm)
+
+    # Normalize to ||k|| = sqrt(head_size) for codebook compatibility.
+    k_scale = tl.sqrt(float(head_size)) / k_norm
     k_normed = k_vec * k_scale
 
     # Apply signs: sk = diag(s) * k.
     signs = tl.load(signs_ptr + d_idx, mask=mask_d, other=1.0).to(tl.float32)
     sk = k_normed * signs
 
-    # Rotate: rotated[i] = sum_j sk[j] * H[i, j] using a full (d, d) tile.
+    # Rotate: rotated = H @ sk using a full (d, d) tile.
     row_idx = d_idx[:, None]
     col_idx = d_idx[None, :]
     H_mask = (row_idx < head_size) & (col_idx < head_size)
@@ -98,7 +88,7 @@ def _quantize_and_store_kernel(
     H_tile = tl.load(hadamard_ptr + H_off, mask=H_mask, other=0.0).to(tl.float32)
     rotated = tl.sum(H_tile * sk[None, :], axis=1)
 
-    # Bucketize against codebook boundaries -> 0..K_CB-1.
+    # Bucketize -> 0..K_CB-1.
     idx = tl.zeros((BLOCK_D,), dtype=tl.int32)
     for k in tl.static_range(K_CB - 1):
         b = tl.load(boundaries_ptr + k).to(tl.float32)
@@ -121,6 +111,7 @@ def _dequant_and_attend_kernel(
     q_ptr,                # (num_seqs, num_heads_q, head_size) fp16/bf16
     cache_k_ptr,          # (num_blocks, block_size, num_heads_kv, head_size) uint8
     cache_v_ptr,          # (num_blocks, block_size, num_heads_kv, head_size) fp16/bf16
+    cache_k_norm_ptr,     # (num_blocks, block_size, num_heads_kv) fp32
     block_table_ptr,      # (num_seqs, max_blocks_per_seq) int32
     seq_lens_ptr,         # (num_seqs,) int32
     codebook_ptr,         # (K_CB,) fp32
@@ -128,7 +119,8 @@ def _dequant_and_attend_kernel(
     signs_ptr,            # (head_size,) fp16/bf16
     out_ptr,              # (num_seqs, num_heads_q, head_size) fp16/bf16
     scale,                # fp32 scalar, 1 / sqrt(head_size)
-    OUT_DTYPE: tl.constexpr,  # tl.float16 or tl.bfloat16
+    inv_sqrt_d,           # fp32 scalar, 1 / sqrt(head_size) for norm restoration
+    OUT_DTYPE: tl.constexpr,
     num_heads_q: tl.constexpr,
     num_heads_kv: tl.constexpr,
     head_size: tl.constexpr,
@@ -161,7 +153,6 @@ def _dequant_and_attend_kernel(
     H_off = row_idx * head_size + col_idx
     H_tile = tl.load(hadamard_ptr + H_off, mask=H_mask, other=0.0).to(tl.float32)
 
-    # Running flash-style softmax accumulators.
     m_i = tl.full((), _NEG_LARGE, dtype=tl.float32)
     l_i = tl.zeros((), dtype=tl.float32)
     acc = tl.zeros((BLOCK_D,), dtype=tl.float32)
@@ -183,11 +174,18 @@ def _dequant_and_attend_kernel(
                     k_idx_u8 = tl.load(
                         cache_k_ptr + base + d_idx, mask=mask_d, other=0
                     ).to(tl.int32)
-                    # Codebook lookup via pointer arithmetic (no tl.gather).
                     rk = tl.load(codebook_ptr + k_idx_u8).to(tl.float32)
-                    # Inverse rotation: k = signs * (H @ rk).
                     k_unrot = tl.sum(H_tile * rk[None, :], axis=1)
-                    k_vec = k_unrot * signs
+                    k_unit = k_unrot * signs
+
+                    # Restore original norm: k = k_unit * (k_norm / sqrt(d)).
+                    norm_off = (
+                        phys_block * block_size * num_heads_kv
+                        + tok_in_block * num_heads_kv
+                        + kvh_idx
+                    )
+                    k_norm = tl.load(cache_k_norm_ptr + norm_off)
+                    k_vec = k_unit * (k_norm * inv_sqrt_d)
 
                     qk = tl.sum(q * k_vec) * scale
 
@@ -212,20 +210,15 @@ def turboquant_store_kv(
     new_v: torch.Tensor,
     cache_k: torch.Tensor,
     cache_v: torch.Tensor,
+    cache_k_norm: torch.Tensor,
     slot_mapping: torch.Tensor,
     codebook: GaussianCodebook,
     block_size: int,
 ) -> None:
-    """Quantize ``new_k`` and store it into the paged K cache as uint8 idx,
-    and copy ``new_v`` into the paged V cache.
-
-    MVP: one uint8 per coordinate (the low nibble carries the 4-bit idx). A
-    follow-up should pack two nibbles per byte for the full 4x saving.
-    """
+    """Quantize ``new_k``, store idx + norm into paged K cache, copy V."""
     num_tokens, num_heads_kv, head_size = new_k.shape
     K_CB = int(codebook.codebook.shape[0])
 
-    # Prepare fp32 boundaries tensor if not already fp32.
     boundaries = codebook.boundaries
     if boundaries.dtype != torch.float32:
         boundaries = boundaries.to(torch.float32)
@@ -238,6 +231,7 @@ def turboquant_store_kv(
         new_v,
         cache_k,
         cache_v,
+        cache_k_norm,
         slot_mapping,
         codebook.H,
         codebook.signs,
@@ -254,6 +248,7 @@ def turboquant_paged_attention(
     q: torch.Tensor,
     cache_k: torch.Tensor,
     cache_v: torch.Tensor,
+    cache_k_norm: torch.Tensor,
     block_table: torch.Tensor,
     seq_lens: torch.Tensor,
     codebook: GaussianCodebook,
@@ -261,12 +256,10 @@ def turboquant_paged_attention(
 ) -> torch.Tensor:
     num_seqs, num_heads_q, head_size = q.shape
     _, block_size, num_heads_kv, _ = cache_k.shape
-    max_blocks_per_seq = block_table.shape[1]
     if scale is None:
         scale = 1.0 / (head_size ** 0.5)
+    inv_sqrt_d = 1.0 / (head_size ** 0.5)
 
-    # The codebook is used via pointer arithmetic; cast to fp32 for numerical
-    # consistency with the normalized store path.
     codebook_f32 = codebook.codebook
     if codebook_f32.dtype != torch.float32:
         codebook_f32 = codebook_f32.to(torch.float32)
@@ -277,10 +270,6 @@ def turboquant_paged_attention(
     BLOCK_BS = block_size
     OUT_DTYPE = tl.bfloat16 if q.dtype == torch.bfloat16 else tl.float16
 
-    # Use actual max blocks from seq_lens, not the pre-allocated block_table
-    # width (which can be huge, e.g. 2560 for max_seq_len=40960). Using the
-    # allocation size as tl.static_range bound causes Triton to unroll 40K+
-    # iterations and hang during compilation.
     actual_max_seq = int(seq_lens.max().item())
     actual_max_blocks = (actual_max_seq + block_size - 1) // block_size
 
@@ -288,6 +277,7 @@ def turboquant_paged_attention(
         q,
         cache_k,
         cache_v,
+        cache_k_norm,
         block_table,
         seq_lens,
         codebook_f32,
@@ -295,6 +285,7 @@ def turboquant_paged_attention(
         codebook.signs,
         out,
         scale,
+        inv_sqrt_d,
         OUT_DTYPE=OUT_DTYPE,
         num_heads_q=num_heads_q,
         num_heads_kv=num_heads_kv,
