@@ -71,8 +71,12 @@ _DEBUG_CANDIDATE_PATHS = [
     "/mnt/nvme3n1/g00872988/turboquant/turboquant_debug.log",
     "./turboquant_debug.log",
 ]
-_DEBUG_SEEN_STORE: set[int] = set()
-_DEBUG_SEEN_FWD: set[int] = set()
+# Counter of how many times each layer's store/fwd has been logged.
+# We log at most _DEBUG_MAX_PER_LAYER calls per layer (so prefill + a
+# couple of decodes appear, but not thousands).
+_DEBUG_STORE_COUNT: dict[int, int] = {}
+_DEBUG_FWD_COUNT: dict[int, int] = {}
+_DEBUG_MAX_PER_LAYER = 3
 
 
 def _dbg_write(msg: str) -> None:
@@ -329,8 +333,10 @@ class TurboQuantAttentionImpl(AttentionImpl):
 
         self._ensure_buffers(kv_cache)
 
-        if self._layer_seed not in _DEBUG_SEEN_STORE:
-            _DEBUG_SEEN_STORE.add(self._layer_seed)
+        _cnt = _DEBUG_STORE_COUNT.get(self._layer_seed, 0)
+        # Always log real calls (skip the num_tokens=8192 profile warmup).
+        if _cnt < _DEBUG_MAX_PER_LAYER and num_tokens != 8192:
+            _DEBUG_STORE_COUNT[self._layer_seed] = _cnt + 1
             try:
                 sm_full = slot_mapping.detach().cpu()
                 sm_head = sm_full[:16].tolist()
@@ -403,8 +409,9 @@ class TurboQuantAttentionImpl(AttentionImpl):
 
         self._ensure_buffers(kv_cache)
 
-        if self._layer_seed not in _DEBUG_SEEN_FWD:
-            _DEBUG_SEEN_FWD.add(self._layer_seed)
+        _cnt_f = _DEBUG_FWD_COUNT.get(self._layer_seed, 0)
+        if _cnt_f < _DEBUG_MAX_PER_LAYER and num_tokens != 8192:
+            _DEBUG_FWD_COUNT[self._layer_seed] = _cnt_f + 1
             try:
                 qsl = attn_metadata.query_start_loc.detach().cpu().tolist()
                 sl = attn_metadata.seq_lens.detach().cpu().tolist()
@@ -458,6 +465,19 @@ class TurboQuantAttentionImpl(AttentionImpl):
                 cache_k_rnorm=self._k_rnorm,
             )
         output.copy_(attn_out.reshape_as(output))
+        if _cnt_f < _DEBUG_MAX_PER_LAYER and num_tokens != 8192:
+            try:
+                a0 = attn_out.detach().float().cpu().reshape(-1)[:4].tolist()
+                o0 = output.detach().float().cpu().reshape(-1)[:4].tolist()
+                o_mean = float(output.detach().float().abs().mean().item())
+                a_mean = float(attn_out.detach().float().abs().mean().item())
+                _dbg(
+                    f"[out   L{self._layer_seed}] call={_cnt_f} "
+                    f"attn_out[:4]={a0} output[:4]={o0} "
+                    f"|attn|.mean={a_mean:.4f} |out|.mean={o_mean:.4f}"
+                )
+            except Exception as e:
+                _dbg(f"[out L{self._layer_seed}] dbg err: {e}")
         return output
 
 
