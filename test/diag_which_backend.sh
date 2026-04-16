@@ -65,13 +65,33 @@ CURRENT_PGID=""
 
 echo ""
 echo "==================================================================="
-echo "[which] grepping backend / TURBOQUANT_DBG mentions in $LOG:"
+echo "[which] file size: $(wc -l < "$LOG") lines, $(wc -c < "$LOG") bytes"
+echo "[which] grep 1: TURBOQUANT_DBG"
 echo "==================================================================="
-grep -a -nE "TURBOQUANT_DBG|[Aa]ttention backend|[Ss]elected.*ttn|Using.*ackend|Fallback|backend=|FLASH_ATTN|TurboQuant" "$LOG" \
-    | head -40 || echo "(no matches)"
+grep -na "TURBOQUANT_DBG" "$LOG" | head -20
+n1=$(grep -c "TURBOQUANT_DBG" "$LOG" || true)
+echo "[which] TURBOQUANT_DBG count: $n1"
 
 echo ""
 echo "==================================================================="
-echo "[which] last 40 lines of log (context for any error):"
+echo "[which] grep 2: anything mentioning 'backend' or 'attn' or 'ttn':"
 echo "==================================================================="
-tail -40 "$LOG"
+grep -na -iE "backend|attn|ttention" "$LOG" | head -40
+
+echo ""
+echo "==================================================================="
+echo "[which] grep 3: anything mentioning 'Turbo' or 'Quant' (case-insens):"
+echo "==================================================================="
+grep -na -i "turbo\|quant" "$LOG" | head -20
+
+echo ""
+echo "==================================================================="
+echo "[which] ERRORs / WARNINGs:"
+echo "==================================================================="
+grep -na -iE "error|warn|fail|traceback|fallback" "$LOG" | head -40
+
+echo ""
+echo "==================================================================="
+echo "[which] LOG SAVED AT: $LOG"
+echo "[which] upload it entirely if any section above is ambiguous."
+echo "==================================================================="
