@@ -29,8 +29,13 @@ git log --oneline -3
 echo ""
 
 # Clear any previous debug log so we only see this run's output.
-rm -f "$DEBUG_LOG"
-echo "[run-bypass] cleared $DEBUG_LOG"
+for p in "$DEBUG_LOG" \
+         /tmp/turboquant_debug.log \
+         /mnt/nvme3n1/g00872988/turboquant/turboquant_debug.log \
+         "$ROOT_DIR/turboquant_debug.log"; do
+    rm -f "$p" 2>/dev/null || true
+done
+echo "[run-bypass] cleared all candidate debug log paths"
 
 # Run BYPASS with debug logging on.
 echo "[run-bypass] launching diag_bypass.sh with TURBOQUANT_DEBUG=1 ..."
@@ -42,10 +47,24 @@ TURBOQUANT_DEBUG_LOG="$DEBUG_LOG" \
 
 echo ""
 echo "==================================================================="
-echo "[run-bypass] first 60 lines of $DEBUG_LOG"
+echo "[run-bypass] candidate debug log paths:"
+for p in "$DEBUG_LOG" \
+         /tmp/turboquant_debug.log \
+         /mnt/nvme3n1/g00872988/turboquant/turboquant_debug.log \
+         "$ROOT_DIR/turboquant_debug.log"; do
+    if [ -s "$p" ]; then
+        echo ""
+        echo "--- $p ($(wc -l < "$p") lines) ---"
+        head -60 "$p"
+    fi
+done
+echo ""
 echo "==================================================================="
-if [ -s "$DEBUG_LOG" ]; then
-    head -60 "$DEBUG_LOG"
+echo "[run-bypass] grep 'TURBOQUANT_DBG' from bypass server log"
+echo "==================================================================="
+BP_LOG="$ROOT_DIR/diag_bypass_tq.log"
+if [ -f "$BP_LOG" ]; then
+    grep -a "TURBOQUANT_DBG\|TurboQuant" "$BP_LOG" | head -40 || echo "(no match in $BP_LOG)"
 else
-    echo "(debug log is empty — the backend did not hit the instrumented path)"
+    echo "(server log $BP_LOG does not exist)"
 fi

@@ -63,28 +63,47 @@ TURBOQUANT_BYPASS = os.environ.get("TURBOQUANT_BYPASS", "0") == "1"
 # gate -- vllm serve spawns subprocesses and env vars don't propagate
 # reliably, so we instrument unconditionally and use a file instead of
 # stdout (which gets swallowed by vllm's logger).
-TURBOQUANT_DEBUG_LOG = os.environ.get(
-    "TURBOQUANT_DEBUG_LOG", "/tmp/turboquant_debug.log"
-)
+import sys as _sys
+
+_DEBUG_CANDIDATE_PATHS = [
+    os.environ.get("TURBOQUANT_DEBUG_LOG", ""),
+    "/tmp/turboquant_debug.log",
+    "/mnt/nvme3n1/g00872988/turboquant/turboquant_debug.log",
+    "./turboquant_debug.log",
+]
 _DEBUG_SEEN_STORE: set[int] = set()
 _DEBUG_SEEN_FWD: set[int] = set()
-# Append a module-load marker. Do NOT truncate -- multiple processes
-# import this module (driver + workers) and truncating would wipe each
-# other. run_bypass_debug.sh clears the file before starting the server.
-try:
-    with open(TURBOQUANT_DEBUG_LOG, "a") as _f:
-        _f.write(f"# module load pid={os.getpid()} algo={TURBOQUANT_ALGO} "
-                 f"bits={TURBOQUANT_BITS} bypass={TURBOQUANT_BYPASS}\n")
-except Exception:
-    pass
+
+
+def _dbg_write(msg: str) -> None:
+    """Write to the first path that succeeds; also echo to stderr so vllm's
+    logger captures it even if no filesystem path is writable."""
+    line = msg + "\n"
+    _sys.stderr.write("[TURBOQUANT_DBG] " + line)
+    try:
+        _sys.stderr.flush()
+    except Exception:
+        pass
+    for p in _DEBUG_CANDIDATE_PATHS:
+        if not p:
+            continue
+        try:
+            with open(p, "a") as f:
+                f.write(line)
+            return
+        except Exception:
+            continue
 
 
 def _dbg(msg: str) -> None:
-    try:
-        with open(TURBOQUANT_DEBUG_LOG, "a") as f:
-            f.write(msg + "\n")
-    except Exception:
-        pass
+    _dbg_write(msg)
+
+
+# Module-load marker so we can confirm the module was imported and by which pid.
+_dbg_write(
+    f"# module load pid={os.getpid()} algo={TURBOQUANT_ALGO} "
+    f"bits={TURBOQUANT_BITS} bypass={TURBOQUANT_BYPASS}"
+)
 
 if TURBOQUANT_ALGO not in ("mse", "prod"):
     raise ValueError(
