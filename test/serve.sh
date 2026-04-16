@@ -18,15 +18,10 @@ echo "gpu:   ${CUDA_VISIBLE_DEVICES:-all}"
 echo ""
 
 MAX_LEN="${4:-4096}"
-# Limit KV cache blocks so that our side buffers (_k_idx + _v_cache +
-# _k_norms per layer) still fit in the remaining GPU memory.
-# 1024 blocks × 16 tokens/block = 16K cache tokens, plenty for testing.
-NUM_BLOCKS="${5:-1024}"
 
 vllm serve "$MODEL" \
     --port "$PORT" \
     --enforce-eager \
     --attention-backend TURBOQUANT \
     --max-model-len "$MAX_LEN" \
-    --gpu-memory-utilization 0.5 \
-    --num-gpu-blocks-override "$NUM_BLOCKS"
+    --gpu-memory-utilization 0.7
