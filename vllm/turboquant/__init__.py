@@ -1,29 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""TurboQuant: real 4-bit K cache quantization for vLLM.
+"""TurboQuant KV cache quantization (paper arXiv:2504.19874).
 
-Pipeline:
-  1. Apply a fixed Hadamard rotation Pi to make each coordinate of K roughly
-     N(0, 1).
-  2. Quantize each coordinate with a Lloyd-Max codebook (K = 2^bits entries).
-  3. Pack 4-bit indices into uint8 inside the paged KV cache (4x smaller).
-  4. A Triton kernel fuses dequantize + attention on the GPU.
+Algorithms
+----------
+- ``Q_mse`` (Algorithm 1): b-bit Lloyd-Max on Hadamard-rotated K.
+- ``Q_prod`` (Algorithm 2): (b-1)-bit Q_mse + 1-bit QJL on residual.
 
-V is kept in standard fp16 / bf16 paged layout (softmax smooths V errors).
+V is stored as per-(slot, head) symmetric int8.
 
-MVP scope: mse mode, 4-bit, fp16 inference, GQA supported, V not quantized,
-no FP8, no sliding window, no ALiBi.
+Selection is via environment variables read by the attention backend:
+``TURBOQUANT_ALGO`` ∈ {mse, prod}, ``TURBOQUANT_BITS`` ∈ {2, 3, ...}.
 """
-from vllm.turboquant.codebook import (
-    GaussianCodebook,
-    RandomRotation,
-    build_codebook,
-    build_rotation,
-)
 
-__all__ = [
-    "GaussianCodebook",
-    "RandomRotation",
-    "build_codebook",
-    "build_rotation",
-]
+from vllm.turboquant.codebook import QuantState
+
+__all__ = ["QuantState"]

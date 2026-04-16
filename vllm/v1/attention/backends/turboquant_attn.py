@@ -1,18 +1,22 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""TurboQuant attention backend with 4-bit quantized K cache.
+"""TurboQuant attention backend (paper arXiv:2504.19874).
 
-This backend stores K cache entries as 4-bit indices into a learned Lloyd-Max
-codebook after a fixed Hadamard rotation. V cache is kept in standard fp16 /
-bf16 paged layout. A Triton kernel fuses dequantize + attend; a pure-PyTorch
-reference lives in ``vllm/turboquant/reference.py`` for correctness checks.
+Environment variables
+---------------------
+TURBOQUANT_ALGO : "mse" | "prod"  (default "prod")
+    "mse"  -> Algorithm 1: b-bit Lloyd-Max on Hadamard-rotated K.
+    "prod" -> Algorithm 2: (b-1)-bit Lloyd-Max + 1-bit QJL residual.
+TURBOQUANT_BITS : int  (default 8)
+    Total bit budget per coordinate. For ``prod`` the main codebook has
+    2^(bits-1) entries (1 bit reserved for QJL).
 
 Enable with::
 
     VLLM_ATTENTION_BACKEND=TURBOQUANT vllm serve ...
-
-Status: MVP / skeleton. Needs validation on B200 (see TURBOQUANT.md).
 """
+
+from __future__ import annotations
 
 import os
 from dataclasses import dataclass
@@ -23,7 +27,11 @@ import torch
 from vllm.config import VllmConfig
 from vllm.config.cache import CacheDType
 from vllm.logger import init_logger
-from vllm.turboquant.codebook import GaussianCodebook
+from vllm.turboquant.codebook import QuantState
+from vllm.turboquant.triton_kernels import (
+    turboquant_paged_attention,
+    turboquant_store_kv,
+)
 from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionCGSupport,
@@ -37,16 +45,19 @@ from vllm.v1.attention.backend import (
 from vllm.v1.attention.backends.utils import set_kv_cache_layout
 from vllm.v1.kv_cache_interface import AttentionSpec
 
-# Force NHD layout so our Triton kernel's offset math matches vLLM's
-# kv_cache allocation. Other backends (FlashInfer) may set this to HND,
-# which would produce garbage attention output for us.
+# Force NHD so cache offset math matches the paged allocation.
 set_kv_cache_layout("NHD")
 
 logger = init_logger(__name__)
 
 
-# Default codebook parameters. Configurable via env var.
+TURBOQUANT_ALGO = os.environ.get("TURBOQUANT_ALGO", "prod").lower()
 TURBOQUANT_BITS = int(os.environ.get("TURBOQUANT_BITS", "8"))
+
+if TURBOQUANT_ALGO not in ("mse", "prod"):
+    raise ValueError(
+        f"TURBOQUANT_ALGO must be 'mse' or 'prod', got {TURBOQUANT_ALGO!r}"
+    )
 
 
 @dataclass
@@ -73,15 +84,7 @@ class TurboQuantAttentionMetadataBuilder(
         device: torch.device,
     ):
         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
-
         self.block_size = kv_cache_spec.block_size
-
-        model_config = vllm_config.model_config
-        self.num_heads_q = model_config.get_num_attention_heads(
-            vllm_config.parallel_config
-        )
-        self.num_heads_kv = model_config.get_num_kv_heads(vllm_config.parallel_config)
-        self.headdim = model_config.get_head_size()
 
     def build(
         self,
@@ -110,9 +113,7 @@ class TurboQuantAttentionBackend(AttentionBackend):
 
     @classmethod
     def supports_block_size(cls, block_size: int | None) -> bool:
-        if block_size is None:
-            return True
-        return block_size % 16 == 0
+        return block_size is None or block_size % 16 == 0
 
     forward_includes_kv_cache_update: bool = True
 
@@ -140,9 +141,9 @@ class TurboQuantAttentionBackend(AttentionBackend):
         head_size: int,
         cache_dtype_str: str = "auto",
     ) -> tuple[int, ...]:
-        # NOTE(turboquant): we currently request a fp16/bf16-sized block so K idx
-        # bytes fit inside the same allocation. That wastes ~50% compared to a
-        # dedicated int8 shape; a follow-up should split K/V allocations.
+        # TurboQuant owns its per-layer buffers. vLLM's native 2-slab
+        # allocation still happens but stays unused; shrinking this to a
+        # 1-slab shape is a follow-up cleanup.
         return (2, num_blocks, block_size, num_kv_heads, head_size)
 
     @staticmethod
@@ -153,12 +154,10 @@ class TurboQuantAttentionBackend(AttentionBackend):
 class TurboQuantAttentionImpl(AttentionImpl):
     """Per-layer TurboQuant attention.
 
-    Each instance owns its own ``GaussianCodebook`` so that different layers
-    use different random rotations. The seed is derived from an instance
-    counter to stay deterministic without relying on layer-name introspection.
+    Each instance owns its own ``QuantState`` so every attention layer has
+    a distinct Hadamard rotation and QJL matrix.
     """
 
-    # Monotonic counter so each layer gets a distinct rotation seed.
     _layer_counter: ClassVar[int] = 0
 
     def __init__(
@@ -175,24 +174,17 @@ class TurboQuantAttentionImpl(AttentionImpl):
         kv_sharing_target_layer_name: str | None = None,
     ) -> None:
         if alibi_slopes is not None:
-            raise NotImplementedError("TurboQuant does not support ALiBi yet.")
+            raise NotImplementedError("TurboQuant: ALiBi unsupported.")
         if sliding_window is not None:
-            raise NotImplementedError(
-                "TurboQuant does not support sliding window yet."
-            )
+            raise NotImplementedError("TurboQuant: sliding window unsupported.")
         if logits_soft_cap is not None:
-            raise NotImplementedError(
-                "TurboQuant does not support logits_soft_cap yet."
-            )
+            raise NotImplementedError("TurboQuant: logits_soft_cap unsupported.")
 
         self.num_heads = num_heads
         self.head_size = head_size
         self.scale = float(scale)
         self.num_kv_heads = num_kv_heads if num_kv_heads is not None else num_heads
-        self.alibi_slopes = alibi_slopes
-        self.sliding_window = sliding_window
         self.kv_cache_dtype = kv_cache_dtype
-        self.logits_soft_cap = logits_soft_cap
         self.attn_type = attn_type
         self.kv_sharing_target_layer_name = kv_sharing_target_layer_name
 
@@ -201,105 +193,58 @@ class TurboQuantAttentionImpl(AttentionImpl):
         self._layer_seed = TurboQuantAttentionImpl._layer_counter
         TurboQuantAttentionImpl._layer_counter += 1
 
-        self._codebook: GaussianCodebook | None = None
-        self._k_norms: torch.Tensor | None = None
+        self._state: QuantState | None = None
+        # Paged-cache buffers (lazily allocated in _ensure_buffers).
         self._k_idx: torch.Tensor | None = None
-        # Step 1: V is no longer stored in kv_cache[1]; it is quantised to
-        # int8 into _v_idx with a per-(slot,head) fp32 scale in _v_scales.
+        self._k_norm: torch.Tensor | None = None
         self._v_idx: torch.Tensor | None = None
-        self._v_scales: torch.Tensor | None = None
-        # Algorithm 2 residual buffers (paper §2.2).
-        # _k_qjl_sign  : int8 ±1 per (slot, head, dim) -- sign(S @ r_unit)
-        # _k_rnorm     : fp32 per (slot, head)         -- ||residual||
-        # At attend time we reconstruct rotated ≈ codebook[idx] +
-        # r_norm * sqrt(pi/2)/d * S^T @ qjl_sign. QJL yields an unbiased
-        # 1-bit inner-product estimator (Lemma 4).
+        self._v_scale: torch.Tensor | None = None
+        # prod-only buffers
         self._k_qjl_sign: torch.Tensor | None = None
         self._k_rnorm: torch.Tensor | None = None
 
-    def _ensure_codebook(
-        self, dtype: torch.dtype, device: torch.device
-    ) -> GaussianCodebook:
-        if self._codebook is None:
-            self._codebook = GaussianCodebook(
-                head_dim=self.head_size,
+    # -------------------------------------------------------------------
+    # Lazy state / buffer allocation
+    # -------------------------------------------------------------------
+    def _ensure_state(self, dtype: torch.dtype, device: torch.device) -> QuantState:
+        if self._state is None:
+            self._state = QuantState(
+                algo=TURBOQUANT_ALGO,
                 bits=TURBOQUANT_BITS,
+                head_dim=self.head_size,
                 seed=self._layer_seed,
                 dtype=dtype,
                 device=device,
             )
-        return self._codebook
+        return self._state
 
     def _ensure_buffers(self, kv_cache: torch.Tensor):
-        """Lazily allocate per-layer K and V buffers in NHD layout.
+        if self._k_idx is not None:
+            return  # already allocated
 
-        Six buffers are allocated lazily on first forward, on the same
-        device as vLLM's KV slab.  Sizes (for d=128, block_size=16, and N
-        logical blocks):
-          _k_idx            : uint8, N*16*kv_h*d   -- (b-1)-bit MSE index
-          _k_norms          : fp32,  N*16*kv_h     -- ||k||
-          _v_idx            : int8,  N*16*kv_h*d   -- symmetric int8 V
-          _v_scales         : fp32,  N*16*kv_h     -- V max|v|/127
-          _k_qjl_sign       : int8,  N*16*kv_h*d   -- sign(S @ r_unit)
-          _k_rnorm          : fp32,  N*16*kv_h     -- ||residual||
+        num_blocks = kv_cache.shape[1]
+        block_size = kv_cache.shape[2]
+        device = kv_cache.device
 
-        vLLM also allocates a bf16 KV slab (kv_cache[0] + kv_cache[1]);
-        the V half is currently unused.  Shrinking get_kv_cache_shape to a
-        1-slab layout is a follow-up cleanup.
-        """
-        if self._k_idx is None:
-            num_blocks = kv_cache.shape[1]
-            block_size = kv_cache.shape[2]
-            device = kv_cache.device
-            per_dim_bytes = num_blocks * block_size * self.num_kv_heads * self.head_size
-            per_meta_bytes = num_blocks * block_size * self.num_kv_heads * 4
-            try:
-                self._k_idx = torch.zeros(
-                    num_blocks, block_size, self.num_kv_heads, self.head_size,
-                    dtype=torch.uint8, device=device,
-                )
-                self._k_norms = torch.zeros(
-                    num_blocks, block_size, self.num_kv_heads,
-                    dtype=torch.float32, device=device,
-                )
-                self._v_idx = torch.zeros(
-                    num_blocks, block_size, self.num_kv_heads, self.head_size,
-                    dtype=torch.int8, device=device,
-                )
-                self._v_scales = torch.zeros(
-                    num_blocks, block_size, self.num_kv_heads,
-                    dtype=torch.float32, device=device,
-                )
-                self._k_qjl_sign = torch.zeros(
-                    num_blocks, block_size, self.num_kv_heads, self.head_size,
-                    dtype=torch.int8, device=device,
-                )
-                self._k_rnorm = torch.zeros(
-                    num_blocks, block_size, self.num_kv_heads,
-                    dtype=torch.float32, device=device,
-                )
-            except torch.cuda.OutOfMemoryError as e:
-                raise torch.cuda.OutOfMemoryError(
-                    f"TurboQuant failed to allocate per-layer buffers: "
-                    f"_k_idx {per_dim_bytes / 2**20:.1f} MiB + "
-                    f"_k_norms {per_meta_bytes / 2**20:.1f} MiB + "
-                    f"_v_idx {per_dim_bytes / 2**20:.1f} MiB + "
-                    f"_v_scales {per_meta_bytes / 2**20:.1f} MiB + "
-                    f"_k_qjl_sign {per_dim_bytes / 2**20:.1f} MiB + "
-                    f"_k_rnorm {per_meta_bytes / 2**20:.1f} MiB on top of "
-                    f"vLLM's existing KV cache. num_blocks={num_blocks}, "
-                    f"block_size={block_size}, num_kv_heads={self.num_kv_heads}, "
-                    f"head_size={self.head_size}. Original error: {e}"
-                ) from e
-        return (
-            self._k_idx,
-            self._k_norms,
-            self._v_idx,
-            self._v_scales,
-            self._k_qjl_sign,
-            self._k_rnorm,
-        )
+        shape_dim = (num_blocks, block_size, self.num_kv_heads, self.head_size)
+        shape_meta = (num_blocks, block_size, self.num_kv_heads)
 
+        self._k_idx = torch.zeros(shape_dim, dtype=torch.uint8, device=device)
+        self._k_norm = torch.zeros(shape_meta, dtype=torch.float32, device=device)
+        self._v_idx = torch.zeros(shape_dim, dtype=torch.int8, device=device)
+        self._v_scale = torch.zeros(shape_meta, dtype=torch.float32, device=device)
+
+        if TURBOQUANT_ALGO == "prod":
+            self._k_qjl_sign = torch.zeros(
+                shape_dim, dtype=torch.int8, device=device
+            )
+            self._k_rnorm = torch.zeros(
+                shape_meta, dtype=torch.float32, device=device
+            )
+
+    # -------------------------------------------------------------------
+    # vLLM hooks
+    # -------------------------------------------------------------------
     def do_kv_cache_update(
         self,
         layer: AttentionLayer,
@@ -308,8 +253,6 @@ class TurboQuantAttentionImpl(AttentionImpl):
         kv_cache: torch.Tensor,
         slot_mapping: torch.Tensor,
     ) -> None:
-        from vllm.turboquant.triton_kernels import turboquant_store_kv
-
         if self.attn_type in (AttentionType.ENCODER_ONLY, AttentionType.ENCODER):
             return
 
@@ -317,28 +260,21 @@ class TurboQuantAttentionImpl(AttentionImpl):
         k = key.view(num_tokens, self.num_kv_heads, self.head_size)
         v = value.view(num_tokens, self.num_kv_heads, self.head_size)
 
-        codebook = self._ensure_codebook(key.dtype, key.device)
-        (
-            k_idx,
-            k_norms,
-            v_idx,
-            v_scales,
-            k_qjl_sign,
-            k_rnorm,
-        ) = self._ensure_buffers(kv_cache)
+        state = self._ensure_state(key.dtype, key.device)
+        self._ensure_buffers(kv_cache)
 
         turboquant_store_kv(
             new_k=k,
             new_v=v,
-            cache_k=k_idx,
-            cache_v=v_idx,
-            cache_k_norm=k_norms,
-            cache_v_scale=v_scales,
-            cache_k_qjl_sign=k_qjl_sign,
-            cache_k_rnorm=k_rnorm,
+            cache_k_idx=self._k_idx,
+            cache_k_norm=self._k_norm,
+            cache_v_idx=self._v_idx,
+            cache_v_scale=self._v_scale,
             slot_mapping=slot_mapping,
-            codebook=codebook,
+            state=state,
             block_size=kv_cache.shape[2],
+            cache_k_qjl_sign=self._k_qjl_sign,
+            cache_k_rnorm=self._k_rnorm,
         )
 
     def forward(
@@ -355,48 +291,35 @@ class TurboQuantAttentionImpl(AttentionImpl):
     ) -> torch.Tensor:
         if output_scale is not None or output_block_scale is not None:
             raise NotImplementedError(
-                "TurboQuant does not support fused output quantization."
+                "TurboQuant: fused output quantization unsupported."
             )
-
         if attn_metadata is None:
             output.zero_()
             return output
 
-        # With forward_includes_kv_cache_update=True, vLLM skips the separate
-        # do_kv_cache_update() call. We must store K/V here ourselves.
         if key is not None and value is not None:
             self.do_kv_cache_update(
                 layer, key, value, kv_cache, attn_metadata.slot_mapping
             )
 
-        from vllm.turboquant.triton_kernels import turboquant_paged_attention
-
         num_tokens = query.shape[0]
         q = query.view(num_tokens, self.num_heads, self.head_size)
 
-        codebook = self._ensure_codebook(query.dtype, query.device)
-        (
-            k_idx,
-            k_norms,
-            v_idx,
-            v_scales,
-            k_qjl_sign,
-            k_rnorm,
-        ) = self._ensure_buffers(kv_cache)
+        state = self._ensure_state(query.dtype, query.device)
+        self._ensure_buffers(kv_cache)
 
         attn_out = turboquant_paged_attention(
             q=q,
-            cache_k=k_idx,
-            cache_v=v_idx,
-            cache_k_norm=k_norms,
-            cache_v_scale=v_scales,
-            cache_k_qjl_sign=k_qjl_sign,
-            cache_k_rnorm=k_rnorm,
+            cache_k_idx=self._k_idx,
+            cache_k_norm=self._k_norm,
+            cache_v_idx=self._v_idx,
+            cache_v_scale=self._v_scale,
             block_table=attn_metadata.block_table,
             seq_lens=attn_metadata.seq_lens,
             query_start_loc=attn_metadata.query_start_loc,
-            codebook=codebook,
-            scale=self.scale,
+            state=state,
+            cache_k_qjl_sign=self._k_qjl_sign,
+            cache_k_rnorm=self._k_rnorm,
         )
         output.copy_(attn_out.reshape_as(output))
         return output

@@ -1,21 +1,38 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Triton kernels for TurboQuant quantized paged attention.
+"""Triton kernels for TurboQuant Algorithm 1 (Q_mse) and Algorithm 2 (Q_prod).
 
-Two kernels:
-  1. ``_quantize_and_store_kernel``: L2-normalizes K, rotates, quantizes,
-     stores uint8 idx + fp32 norm per key.
-  2. ``_dequant_and_attend_kernel``: loads idx + norm, dequantizes with
-     norm restoration, runs flash-style attention.
+Paper: Zandieh et al., arXiv:2504.19874.
 
-Per-key norm preservation:
-  Store saves ``||k||`` as a separate fp32 scalar per (block, slot, head).
-  Attend loads it and scales the dequantized unit-vector by ``||k|| / sqrt(d)``
-  to recover the original magnitude. This is critical for attention logits.
+Storage layout per (slot, head)
+-------------------------------
+Common to both algorithms:
+    cache_k_idx    : uint8  (head_dim,)       -- MSE bucket index
+    cache_k_norm   : fp32   ()                -- ||k||
+    cache_v_idx    : int8   (head_dim,)       -- symmetric int8 V
+    cache_v_scale  : fp32   ()                -- max(|v|) / 127
+
+Only for Q_prod:
+    cache_k_qjl_sign : int8 (head_dim,)       -- sign(S @ r_unit)
+    cache_k_rnorm    : fp32 ()                -- ||r||
+
+Attention (both algorithms work in rotated space)
+-------------------------------------------------
+Because Pi = H * diag(signs) is orthogonal:
+
+    <q, k> / sqrt(d)
+      = <H * diag(signs) * q, H * diag(signs) * k> / sqrt(d)
+      = <q_rot, k_rot> / sqrt(d)
+
+For a K vector stored as ``rotated = H * diag(signs) * (k * sqrt(d)/||k||)``
+this reduces to (k_norm/d) * <q_rot, rotated>. Q_prod replaces ``rotated``
+with ``codebook[idx] + r_norm * sqrt(pi/2)/d * S^T @ qjl_sign`` which is
+an unbiased inner-product reconstruction (paper Lemma 4).
 """
 
 from __future__ import annotations
 
+import math
 from typing import TYPE_CHECKING
 
 import torch
@@ -23,54 +40,39 @@ import torch
 from vllm.triton_utils import tl, triton
 
 if TYPE_CHECKING:
-    from vllm.turboquant.codebook import GaussianCodebook
+    from vllm.turboquant.codebook import QuantState
 
 
 _NEG_LARGE = tl.constexpr(-1.0e30)
 
 
+# =========================================================================
+# Store kernel: quantize K (mse or prod) and V (symmetric int8)
+# =========================================================================
 @triton.jit
-def _quantize_and_store_kernel(
-    new_k_ptr,                  # (num_tokens, num_heads_kv, head_size) fp16/bf16
-    new_v_ptr,                  # (num_tokens, num_heads_kv, head_size) fp16/bf16
-    cache_k_ptr,                # (num_blocks, block_size, num_heads_kv, head_size) uint8
-    cache_v_ptr,                # (num_blocks, block_size, num_heads_kv, head_size) int8
-    cache_k_norm_ptr,           # (num_blocks, block_size, num_heads_kv) fp32
-    cache_v_scale_ptr,          # (num_blocks, block_size, num_heads_kv) fp32
-    cache_k_qjl_sign_ptr,       # (num_blocks, block_size, num_heads_kv, head_size) int8  <-- Algo 2 Stage 2
-    cache_k_rnorm_ptr,          # (num_blocks, block_size, num_heads_kv) fp32             <-- Algo 2 Stage 2
-    slot_mapping_ptr,           # (num_tokens,) int64
-    codebook_ptr,               # (K_CB,) fp32, MSE codebook with 2^(bits-1) entries
-    hadamard_ptr,               # (head_size, head_size) fp16/bf16, main rotation
-    qjl_matrix_ptr,             # (head_size, head_size) fp16/bf16, QJL iid-Gaussian S
-    signs_ptr,                  # (head_size,) fp16/bf16
-    boundaries_ptr,             # (K_CB - 1,) fp32
+def _store_kernel(
+    new_k_ptr,                      # (T, H_kv, d) fp16/bf16
+    new_v_ptr,                      # (T, H_kv, d) fp16/bf16
+    cache_k_idx_ptr,                # (num_blocks, bs, H_kv, d) uint8
+    cache_k_norm_ptr,               # (num_blocks, bs, H_kv) fp32
+    cache_v_idx_ptr,                # (num_blocks, bs, H_kv, d) int8
+    cache_v_scale_ptr,              # (num_blocks, bs, H_kv) fp32
+    cache_k_qjl_sign_ptr,           # int8 (prod only; unused if USE_QJL=False)
+    cache_k_rnorm_ptr,              # fp32 (prod only)
+    slot_mapping_ptr,               # (T,) int64
+    codebook_ptr,                   # (K_CB,) fp32
+    boundaries_ptr,                 # (K_CB - 1,) fp32
+    hadamard_ptr,                   # (d, d) fp16/bf16
+    signs_ptr,                      # (d,) fp16/bf16
+    qjl_matrix_ptr,                 # (d, d) fp16/bf16 (prod only)
     num_heads_kv: tl.constexpr,
     head_size: tl.constexpr,
     block_size: tl.constexpr,
     K_CB: tl.constexpr,
     BLOCK_D: tl.constexpr,
+    USE_QJL: tl.constexpr,
 ):
-    """One program = one (token, kv_head) pair.
-
-    Implements the TurboQuant Algorithm 2 store path (paper §1.3, §2.2):
-
-      Stage 0 (norm)   : k_norm = ||k||, k_normed = k * sqrt(d) / k_norm
-      Stage 1 (rotate) : rotated = H @ (signs * k_normed)   -- paper Pi
-      Stage 2 (MSE)    : idx = bucketize(rotated, boundaries)  using
-                         a (b-1)-bit Lloyd-Max codebook
-      Stage 3 (resid)  : r = rotated - codebook[idx]
-                         r_norm = ||r||, r_unit = r / r_norm
-      Stage 4 (QJL)    : qjl_sign = sign(S @ r_unit),  S iid N(0,1)
-                         [paper Definition 1]
-
-    At attend time the reconstruction is
-        rotated_approx = codebook[idx] + r_norm * sqrt(pi/2)/d * S^T @ qjl_sign
-    which gives an unbiased inner-product estimator (Lemma 4).
-
-    V uses per-(slot, head) symmetric int8 (scale = max(|v|)/127); that path
-    is untouched by the paper and kept from the earlier commit.
-    """
+    """One program = one (token, kv_head) pair."""
     tok = tl.program_id(0)
     head = tl.program_id(1)
 
@@ -84,92 +86,96 @@ def _quantize_and_store_kernel(
     d_idx = tl.arange(0, BLOCK_D)
     mask_d = d_idx < head_size
 
-    kv_off = (tok * num_heads_kv + head) * head_size + d_idx
-    k_vec = tl.load(new_k_ptr + kv_off, mask=mask_d, other=0.0).to(tl.float32)
-    v_vec = tl.load(new_v_ptr + kv_off, mask=mask_d, other=0.0).to(tl.float32)
-
-    # --- K norm + rotation --------------------------------------------------
-    k_norm_sq = tl.sum(k_vec * k_vec)
-    k_norm = tl.sqrt(tl.maximum(k_norm_sq, 1e-12))
-
-    meta_off = block_idx * block_size * num_heads_kv + off_in_block * num_heads_kv + head
-    tl.store(cache_k_norm_ptr + meta_off, k_norm)
-
-    k_scale = tl.sqrt(float(head_size)) / k_norm
-    k_normed = k_vec * k_scale
-
-    signs = tl.load(signs_ptr + d_idx, mask=mask_d, other=1.0).to(tl.float32)
-    sk = k_normed * signs
-
-    row_idx = d_idx[:, None]
-    col_idx = d_idx[None, :]
-    mat_mask = (row_idx < head_size) & (col_idx < head_size)
-    mat_off = row_idx * head_size + col_idx
-    H_tile = tl.load(hadamard_ptr + mat_off, mask=mat_mask, other=0.0).to(tl.float32)
-    rotated = tl.sum(H_tile * sk[None, :], axis=1)
-
-    # --- MSE quantization (Algorithm 2 Stage 2, b-1 bits) -------------------
-    idx = tl.zeros((BLOCK_D,), dtype=tl.int32)
-    for k in tl.static_range(K_CB - 1):
-        b = tl.load(boundaries_ptr + k).to(tl.float32)
-        idx += (rotated > b).to(tl.int32)
-    idx_u8 = idx.to(tl.uint8)
-
+    # Per-dim and scalar-meta offsets into the paged cache.
     cache_off = (
         block_idx * block_size * num_heads_kv * head_size
         + off_in_block * num_heads_kv * head_size
         + head * head_size
         + d_idx
     )
-    tl.store(cache_k_ptr + cache_off, idx_u8, mask=mask_d)
+    meta_off = (
+        block_idx * block_size * num_heads_kv
+        + off_in_block * num_heads_kv
+        + head
+    )
 
-    # --- QJL on residual (Algorithm 2 Stage 4) ------------------------------
-    # Dequant the freshly-picked index, form residual in rotated space, split
-    # magnitude (r_norm) from direction (r_unit), then QJL-quantize the unit
-    # vector. The r_norm scalar stays in fp32 since QJL reconstruction is
-    # unbiased only on the unit sphere.
-    rk_dq = tl.load(codebook_ptr + idx).to(tl.float32)
-    residual = rotated - rk_dq
-    r_masked = tl.where(mask_d, residual, 0.0)
-    r_norm_sq = tl.sum(r_masked * r_masked)
-    r_norm = tl.sqrt(tl.maximum(r_norm_sq, 1e-12))
-    r_unit = r_masked / r_norm
+    # Load K, V and rotation primitives.
+    kv_off = (tok * num_heads_kv + head) * head_size + d_idx
+    k_vec = tl.load(new_k_ptr + kv_off, mask=mask_d, other=0.0).to(tl.float32)
+    v_vec = tl.load(new_v_ptr + kv_off, mask=mask_d, other=0.0).to(tl.float32)
 
-    S_tile = tl.load(qjl_matrix_ptr + mat_off, mask=mat_mask, other=0.0).to(tl.float32)
-    qjl_raw = tl.sum(S_tile * r_unit[None, :], axis=1)
-    qjl_sign = tl.where(qjl_raw >= 0.0, 1.0, -1.0)
+    signs = tl.load(signs_ptr + d_idx, mask=mask_d, other=1.0).to(tl.float32)
+    row = d_idx[:, None]
+    col = d_idx[None, :]
+    mat_mask = (row < head_size) & (col < head_size)
+    H_tile = tl.load(
+        hadamard_ptr + row * head_size + col, mask=mat_mask, other=0.0
+    ).to(tl.float32)
 
-    tl.store(cache_k_rnorm_ptr + meta_off, r_norm)
-    tl.store(cache_k_qjl_sign_ptr + cache_off, qjl_sign.to(tl.int8), mask=mask_d)
+    # --- K: norm + rotation ---
+    k_norm = tl.sqrt(tl.maximum(tl.sum(k_vec * k_vec), 1e-12))
+    tl.store(cache_k_norm_ptr + meta_off, k_norm)
+    k_normed = k_vec * (tl.sqrt(float(head_size)) / k_norm)
+    rotated = tl.sum(H_tile * (k_normed * signs)[None, :], axis=1)
 
-    # --- V quantization (Step 1, unchanged) ---------------------------------
+    # --- K: Lloyd-Max MSE quantization ---
+    idx = tl.zeros((BLOCK_D,), dtype=tl.int32)
+    for i in tl.static_range(K_CB - 1):
+        b = tl.load(boundaries_ptr + i).to(tl.float32)
+        idx += (rotated > b).to(tl.int32)
+    tl.store(cache_k_idx_ptr + cache_off, idx.to(tl.uint8), mask=mask_d)
+
+    # --- K: QJL residual (Algorithm 2 only) ---
+    if USE_QJL:
+        rk_dq = tl.load(codebook_ptr + idx).to(tl.float32)
+        r = tl.where(mask_d, rotated - rk_dq, 0.0)
+        r_norm = tl.sqrt(tl.maximum(tl.sum(r * r), 1e-12))
+        r_unit = r / r_norm
+        S_tile = tl.load(
+            qjl_matrix_ptr + row * head_size + col, mask=mat_mask, other=0.0
+        ).to(tl.float32)
+        qjl_raw = tl.sum(S_tile * r_unit[None, :], axis=1)
+        qjl_sign = tl.where(qjl_raw >= 0.0, 1.0, -1.0)
+        tl.store(cache_k_rnorm_ptr + meta_off, r_norm)
+        tl.store(
+            cache_k_qjl_sign_ptr + cache_off,
+            qjl_sign.to(tl.int8),
+            mask=mask_d,
+        )
+
+    # --- V: symmetric int8 ---
     v_abs = tl.where(mask_d, tl.abs(v_vec), 0.0)
-    v_max = tl.max(v_abs, axis=0)
-    v_scale = tl.maximum(v_max / 127.0, 1e-12)
-    v_int = (v_vec / v_scale).to(tl.int8)
+    v_scale = tl.maximum(tl.max(v_abs, axis=0) / 127.0, 1e-12)
     tl.store(cache_v_scale_ptr + meta_off, v_scale)
-    tl.store(cache_v_ptr + cache_off, v_int, mask=mask_d)
+    tl.store(
+        cache_v_idx_ptr + cache_off,
+        (v_vec / v_scale).to(tl.int8),
+        mask=mask_d,
+    )
 
 
+# =========================================================================
+# Attend kernel: rotated-space logit + flash-style accumulation
+# =========================================================================
 @triton.jit
-def _dequant_and_attend_kernel(
-    q_rotated_ptr,              # (num_query_tokens, num_heads_q, head_size) fp16/bf16 -- H @ (signs * q)
-    Sq_ptr,                     # (num_query_tokens, num_heads_q, head_size) fp16/bf16 -- S @ q_rotated
-    cache_k_ptr,                # (num_blocks, block_size, num_heads_kv, head_size) uint8
-    cache_v_ptr,                # (num_blocks, block_size, num_heads_kv, head_size) int8
-    cache_k_norm_ptr,           # (num_blocks, block_size, num_heads_kv) fp32
-    cache_v_scale_ptr,          # (num_blocks, block_size, num_heads_kv) fp32
-    cache_k_qjl_sign_ptr,       # (num_blocks, block_size, num_heads_kv, head_size) int8
-    cache_k_rnorm_ptr,          # (num_blocks, block_size, num_heads_kv) fp32
-    block_table_ptr,            # (num_seqs, block_table_stride) int32
-    seq_id_per_query_ptr,       # (num_query_tokens,) int32
-    kv_end_per_query_ptr,       # (num_query_tokens,) int32
-    codebook_ptr,               # (K_CB,) fp32
-    out_ptr,                    # (num_query_tokens, num_heads_q, head_size) fp16/bf16
-    inv_d,                      # fp32 scalar, 1/head_size
-    qjl_coef,                   # fp32 scalar, sqrt(pi/2)/head_size
-    max_blocks_per_seq,         # runtime int
-    block_table_stride,         # runtime int
+def _attend_kernel(
+    q_rotated_ptr,                  # (T_q, H_q, d) fp16/bf16 -- H @ (signs * q)
+    Sq_ptr,                         # (T_q, H_q, d) fp16/bf16 -- S @ q_rotated (prod only)
+    cache_k_idx_ptr,                # (num_blocks, bs, H_kv, d) uint8
+    cache_k_norm_ptr,               # (num_blocks, bs, H_kv) fp32
+    cache_v_idx_ptr,                # (num_blocks, bs, H_kv, d) int8
+    cache_v_scale_ptr,              # (num_blocks, bs, H_kv) fp32
+    cache_k_qjl_sign_ptr,           # int8 (prod only)
+    cache_k_rnorm_ptr,              # fp32 (prod only)
+    block_table_ptr,                # (num_seqs, block_table_stride) int32
+    seq_id_per_query_ptr,           # (T_q,) int32
+    kv_end_per_query_ptr,           # (T_q,) int32
+    codebook_ptr,                   # (K_CB,) fp32
+    out_ptr,                        # (T_q, H_q, d) fp16/bf16
+    inv_d,                          # fp32 1/d
+    qjl_coef,                       # fp32 sqrt(pi/2)/d (prod only)
+    max_blocks_per_seq,             # runtime int loop bound
+    block_table_stride,             # runtime int row stride
     OUT_DTYPE: tl.constexpr,
     num_heads_q: tl.constexpr,
     num_heads_kv: tl.constexpr,
@@ -177,31 +183,10 @@ def _dequant_and_attend_kernel(
     block_size: tl.constexpr,
     BLOCK_D: tl.constexpr,
     BLOCK_BS: tl.constexpr,
+    USE_QJL: tl.constexpr,
 ):
-    """One program = one (query_token, q_head).
-
-    Pure-rotated-space attend, following TurboQuant Algorithm 2.
-
-    Pre-rotated inputs (prepared by the Python wrapper once per query head):
-        q_rotated = H @ (signs * q)           -- same rotation as Pi on K
-        Sq        = S @ q_rotated             -- the iid-Gaussian QJL rotation
-
-    Because the rotation is orthogonal, inner products are preserved:
-        <q, k> / sqrt(d)  =  <q_rotated, k_rotated> * k_norm / d
-    where k_rotated is the pre-quantization rotated vector stored per key.
-    We reconstruct it as
-        k_rotated  ≈  codebook[idx] + r_norm * sqrt(pi/2)/d * S^T @ qjl_sign
-    and split the inner product into two cheap dot products:
-        <q_rotated, codebook[idx]>                          (BLOCK_D muls)
-        <Sq, qjl_sign>  (qjl_sign is ±1, signed sum)        (BLOCK_D add/sub)
-
-    This avoids the d×d un-rotation Hadamard multiply we used to do per KV
-    token in the earlier kernel, so the QJL addition is actually faster
-    than the original Algorithm-1 implementation.
-
-    Varlen semantics (seq_id_per_query / kv_end_per_query / block_table_stride)
-    are unchanged from the previous revision.
-    """
+    """One program = one (query_token, q_head). Varlen + causal via
+    ``seq_id_per_query`` and ``kv_end_per_query``."""
     q_idx = tl.program_id(0)
     qh_idx = tl.program_id(1)
 
@@ -210,25 +195,25 @@ def _dequant_and_attend_kernel(
 
     seq_idx = tl.load(seq_id_per_query_ptr + q_idx)
     kv_end = tl.load(kv_end_per_query_ptr + q_idx)
-    num_blocks = (kv_end + block_size - 1) // block_size
+    num_blocks_q = (kv_end + block_size - 1) // block_size
 
     d_idx = tl.arange(0, BLOCK_D)
     mask_d = d_idx < head_size
 
     q_off = (q_idx * num_heads_q + qh_idx) * head_size + d_idx
     q_rot = tl.load(q_rotated_ptr + q_off, mask=mask_d, other=0.0).to(tl.float32)
-    sq = tl.load(Sq_ptr + q_off, mask=mask_d, other=0.0).to(tl.float32)
+    if USE_QJL:
+        sq = tl.load(Sq_ptr + q_off, mask=mask_d, other=0.0).to(tl.float32)
 
     m_i = tl.full((), _NEG_LARGE, dtype=tl.float32)
     l_i = tl.zeros((), dtype=tl.float32)
     acc = tl.zeros((BLOCK_D,), dtype=tl.float32)
 
     for block_i in range(0, max_blocks_per_seq):
-        if block_i < num_blocks:
+        if block_i < num_blocks_q:
             phys_block = tl.load(
                 block_table_ptr + seq_idx * block_table_stride + block_i
             )
-
             for tok_in_block in tl.static_range(0, BLOCK_BS):
                 abs_pos = block_i * block_size + tok_in_block
                 if abs_pos < kv_end:
@@ -237,34 +222,39 @@ def _dequant_and_attend_kernel(
                         + tok_in_block * num_heads_kv * head_size
                         + kvh_idx * head_size
                     )
-                    norm_off = (
+                    meta = (
                         phys_block * block_size * num_heads_kv
                         + tok_in_block * num_heads_kv
                         + kvh_idx
                     )
 
+                    # MSE main term (always).
                     k_idx_u8 = tl.load(
-                        cache_k_ptr + base + d_idx, mask=mask_d, other=0
+                        cache_k_idx_ptr + base + d_idx, mask=mask_d, other=0
                     ).to(tl.int32)
-                    rk_main = tl.load(codebook_ptr + k_idx_u8).to(tl.float32)
-                    qjl_sign = tl.load(
-                        cache_k_qjl_sign_ptr + base + d_idx,
-                        mask=mask_d, other=0,
-                    ).to(tl.float32)
+                    rk = tl.load(codebook_ptr + k_idx_u8).to(tl.float32)
+                    main_dot = tl.sum(q_rot * rk)
 
-                    main_dot = tl.sum(q_rot * rk_main)
-                    qjl_dot = tl.sum(sq * qjl_sign)
-                    r_norm = tl.load(cache_k_rnorm_ptr + norm_off)
-                    k_norm = tl.load(cache_k_norm_ptr + norm_off)
+                    k_norm = tl.load(cache_k_norm_ptr + meta)
 
-                    # <q, k> / sqrt(d) = <q_rotated, rotated_approx> * k_norm / d
-                    logit = (main_dot + qjl_coef * r_norm * qjl_dot) * k_norm * inv_d
+                    # Optional QJL correction (Algorithm 2).
+                    if USE_QJL:
+                        qjl_sign = tl.load(
+                            cache_k_qjl_sign_ptr + base + d_idx,
+                            mask=mask_d, other=0,
+                        ).to(tl.float32)
+                        qjl_dot = tl.sum(sq * qjl_sign)
+                        r_norm = tl.load(cache_k_rnorm_ptr + meta)
+                        logit = (main_dot + qjl_coef * r_norm * qjl_dot) \
+                                * k_norm * inv_d
+                    else:
+                        logit = main_dot * k_norm * inv_d
 
-                    # V dequant (Step 1): int8 per-(slot, head) * per-(slot, head) fp32 scale.
+                    # V dequant + flash accumulation.
                     v_int8 = tl.load(
-                        cache_v_ptr + base + d_idx, mask=mask_d, other=0
+                        cache_v_idx_ptr + base + d_idx, mask=mask_d, other=0
                     ).to(tl.float32)
-                    v_scale = tl.load(cache_v_scale_ptr + norm_off)
+                    v_scale = tl.load(cache_v_scale_ptr + meta)
                     v_vec = v_int8 * v_scale
 
                     m_new = tl.maximum(m_i, logit)
@@ -279,269 +269,140 @@ def _dequant_and_attend_kernel(
     tl.store(out_ptr + out_off, out_vec.to(OUT_DTYPE), mask=mask_d)
 
 
-_TQ_KSTATS_COUNTER = [0]
-
-
-def _tq_kstats_dump(
-    new_k: torch.Tensor,
-    codebook: GaussianCodebook,
-) -> None:
-    """Print per-dim outlier statistics for the incoming K tensor.
-
-    Emits three per-dim signals, averaged over (token, kv_head):
-      1. raw_max    -- max(|K|) per dim: identifies outlier channels in the
-                       original (pre-rotation, pre-norm) K.
-      2. rot_max    -- max(|H @ (k_normed * signs)|) per dim: if Hadamard
-                       equalizes as the paper assumes, this should be flat.
-      3. resid_abs  -- |rotated - codebook[idx]| per element: if one dim
-                       dominates, the per-head mean(|r|) scale is bogus.
-
-    The ``outlier_ratio`` is top1_dim_max / mean_dim_max. For healthy
-    N(0, 1) data (what the smoke test uses) it should be ~3x. For a real
-    LLM K tensor with an outlier channel it is typically 10x-100x. A high
-    ratio AFTER rotation is the smoking gun for Step 2's failure mode.
-    """
-    with torch.no_grad():
-        k_f = new_k.detach().float()                        # (T, H, D)
-        head_size = k_f.shape[-1]
-        signs = codebook.signs.float()
-        H = codebook.H.float()
-        cb = codebook.codebook.float()
-        boundaries = codebook.boundaries.float()
-
-        # 1) raw K per-dim outliers
-        raw_abs = k_f.abs()
-        raw_dim_max = raw_abs.amax(dim=(0, 1))              # (D,)
-        raw_dim_mean = raw_abs.mean(dim=(0, 1))             # (D,)
-        raw_top = float(raw_dim_max.max().item())
-        raw_avg = float(raw_dim_max.mean().item())
-
-        # 2) rotated K per-dim outliers (matches what store kernel sees)
-        k_norm = k_f.norm(dim=-1, keepdim=True).clamp(min=1e-6)
-        k_scaled = k_f * ((head_size ** 0.5) / k_norm)
-        rot = (k_scaled * signs) @ H.T                      # (T, H, D)
-        rot_abs = rot.abs()
-        rot_dim_max = rot_abs.amax(dim=(0, 1))
-        rot_top = float(rot_dim_max.max().item())
-        rot_avg = float(rot_dim_max.mean().item())
-
-        # 3) residual distribution after Lloyd-Max quant
-        idx = torch.bucketize(rot.contiguous(), boundaries)
-        rk_dq = cb[idx]
-        resid = (rot - rk_dq).abs()
-        r_max = float(resid.max().item())
-        r_mean = float(resid.mean().item())
-        r_p99 = float(resid.reshape(-1).quantile(0.99).item())
-
-        # top 3 outlier dims by raw max -- useful for locating channels
-        top_dims = raw_dim_max.topk(3).indices.tolist()
-        top_vals = raw_dim_max.topk(3).values.tolist()
-
-        print(
-            f"[TQ_KSTATS #{_TQ_KSTATS_COUNTER[0]}] "
-            f"T={k_f.shape[0]} H={k_f.shape[1]} D={head_size} | "
-            f"raw: top_max={raw_top:.3f} avg_max={raw_avg:.3f} "
-            f"ratio={raw_top / max(raw_avg, 1e-6):.1f}x "
-            f"top3_dims={top_dims} top3_vals={[f'{v:.2f}' for v in top_vals]} | "
-            f"rot: top_max={rot_top:.3f} avg_max={rot_avg:.3f} "
-            f"ratio={rot_top / max(rot_avg, 1e-6):.1f}x | "
-            f"resid: max={r_max:.4f} mean={r_mean:.4f} p99={r_p99:.4f} "
-            f"max/mean={r_max / max(r_mean, 1e-6):.1f}x",
-            flush=True,
-        )
-
-
+# =========================================================================
+# Python wrappers
+# =========================================================================
 def turboquant_store_kv(
     new_k: torch.Tensor,
     new_v: torch.Tensor,
-    cache_k: torch.Tensor,
-    cache_v: torch.Tensor,
+    cache_k_idx: torch.Tensor,
     cache_k_norm: torch.Tensor,
+    cache_v_idx: torch.Tensor,
     cache_v_scale: torch.Tensor,
-    cache_k_qjl_sign: torch.Tensor,
-    cache_k_rnorm: torch.Tensor,
     slot_mapping: torch.Tensor,
-    codebook: GaussianCodebook,
+    state: "QuantState",
     block_size: int,
+    cache_k_qjl_sign: torch.Tensor | None = None,
+    cache_k_rnorm: torch.Tensor | None = None,
 ) -> None:
-    """Store K via TurboQuant Algorithm 2 (paper §2.2) and V via int8.
+    """Quantize one batch of (K, V) into the paged cache.
 
-    Algorithm 2 stores per (slot, head):
-      - ``cache_k``: (b-1)-bit MSE index  (uint8)
-      - ``cache_k_norm``: fp32 ||k|| (stage 0 norm)
-      - ``cache_k_qjl_sign``: int8 ±1 per dim, sign(S @ r_unit)  (stage 4)
-      - ``cache_k_rnorm``: fp32 ||residual||
-    V keeps the per-(slot, head) symmetric int8 from Step 1.
+    ``cache_k_qjl_sign`` and ``cache_k_rnorm`` are required when
+    ``state.algo == "prod"`` and must be ``None`` for ``"mse"``.
     """
-    import os
-    if int(os.environ.get("TQ_KSTATS", "0")) and _TQ_KSTATS_COUNTER[0] < 8:
-        _TQ_KSTATS_COUNTER[0] += 1
-        _tq_kstats_dump(new_k, codebook)
-
     num_tokens, num_heads_kv, head_size = new_k.shape
-    K_CB = int(codebook.codebook.shape[0])
+    K_CB = int(state.codebook.shape[0])
 
-    boundaries = codebook.boundaries
+    boundaries = state.boundaries
     if boundaries.dtype != torch.float32:
         boundaries = boundaries.to(torch.float32)
+    codebook = state.codebook
+    if codebook.dtype != torch.float32:
+        codebook = codebook.to(torch.float32)
 
-    codebook_f32 = codebook.codebook
-    if codebook_f32.dtype != torch.float32:
-        codebook_f32 = codebook_f32.to(torch.float32)
+    use_qjl = state.algo == "prod"
+    if use_qjl:
+        assert cache_k_qjl_sign is not None and cache_k_rnorm is not None, (
+            "prod requires cache_k_qjl_sign and cache_k_rnorm"
+        )
+        qjl_matrix = state.S
+        qjl_sign_buf = cache_k_qjl_sign
+        rnorm_buf = cache_k_rnorm
+    else:
+        # Unused by kernel but must be valid pointers; reuse existing buffers.
+        qjl_matrix = state.H
+        qjl_sign_buf = cache_v_idx
+        rnorm_buf = cache_v_scale
 
     grid = (num_tokens, num_heads_kv)
     BLOCK_D = triton.next_power_of_2(head_size)
-
-    _quantize_and_store_kernel[grid](
+    _store_kernel[grid](
         new_k,
         new_v,
-        cache_k,
-        cache_v,
+        cache_k_idx,
         cache_k_norm,
+        cache_v_idx,
         cache_v_scale,
-        cache_k_qjl_sign,
-        cache_k_rnorm,
+        qjl_sign_buf,
+        rnorm_buf,
         slot_mapping,
-        codebook_f32,
-        codebook.H,
-        codebook.S,
-        codebook.signs,
+        codebook,
         boundaries,
+        state.H,
+        state.signs,
+        qjl_matrix,
         num_heads_kv=num_heads_kv,
         head_size=head_size,
         block_size=block_size,
         K_CB=K_CB,
         BLOCK_D=BLOCK_D,
+        USE_QJL=use_qjl,
     )
-
-
-_TQ_ATTN_DEBUG_COUNTER = [0]
 
 
 def turboquant_paged_attention(
     q: torch.Tensor,
-    cache_k: torch.Tensor,
-    cache_v: torch.Tensor,
+    cache_k_idx: torch.Tensor,
     cache_k_norm: torch.Tensor,
+    cache_v_idx: torch.Tensor,
     cache_v_scale: torch.Tensor,
-    cache_k_qjl_sign: torch.Tensor,
-    cache_k_rnorm: torch.Tensor,
     block_table: torch.Tensor,
     seq_lens: torch.Tensor,
     query_start_loc: torch.Tensor,
-    codebook: GaussianCodebook,
-    scale: float | None = None,
+    state: "QuantState",
+    cache_k_qjl_sign: torch.Tensor | None = None,
+    cache_k_rnorm: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Paged attention on a TurboQuant-Algorithm-2 K cache.
+    """Paged attention with dequant-on-the-fly K cache, varlen + causal.
 
-    Compared to the earlier implementation this version does attention
-    entirely in the rotated space, so the kernel never has to un-rotate K.
-    We pay a one-shot pre-rotation of Q on the host-side (torch mm) in
-    exchange for killing a d×d Hadamard multiply per KV token.
-
-    q shape: (num_query_tokens, num_heads_q, head_size)
-    Varlen metadata: same seq_lens / query_start_loc contract as before.
+    Per-query pre-rotations happen here on-device via torch.matmul so the
+    attend kernel stays free of Hadamard multiplies.
     """
-    import os
-    _tq_debug = int(os.environ.get("TQ_DEBUG", "0"))
-    _tq_disable_qjl = int(os.environ.get("TQ_DISABLE_QJL", "0"))
-
     num_query_tokens, num_heads_q, head_size = q.shape
-    _, block_size, num_heads_kv, _ = cache_k.shape
+    _, block_size, num_heads_kv, _ = cache_k_idx.shape
     num_seqs = int(seq_lens.shape[0])
 
-    inv_d = 1.0 / float(head_size)
-    import math as _math
-    qjl_coef = _math.sqrt(_math.pi / 2.0) / float(head_size)
+    assert query_start_loc.shape[0] == num_seqs + 1
+    assert block_table.shape[0] >= num_seqs
 
-    # --- Diagnostic probe: disable QJL contribution ---------------------
-    # When TQ_DISABLE_QJL=1 we zero out r_norm so the qjl_coef * r_norm *
-    # qjl_dot term collapses to 0. The kernel then computes pure Q_mse in
-    # rotated space with whatever bits-1 codebook is in place. Pair this
-    # with TURBOQUANT_BITS=9 to recover an 8-bit main codebook for a
-    # direct comparison against the legacy real-space Algorithm 1 kernel.
-    if _tq_disable_qjl:
-        cache_k_rnorm = torch.zeros_like(cache_k_rnorm)
+    codebook = state.codebook
+    if codebook.dtype != torch.float32:
+        codebook = codebook.to(torch.float32)
 
-    assert query_start_loc.shape[0] == num_seqs + 1, (
-        f"query_start_loc length {query_start_loc.shape[0]} != num_seqs+1 "
-        f"({num_seqs + 1}); shapes q={tuple(q.shape)} "
-        f"seq_lens={tuple(seq_lens.shape)} "
-        f"qsl={tuple(query_start_loc.shape)}"
-    )
-    assert block_table.shape[0] >= num_seqs, (
-        f"block_table rows {block_table.shape[0]} < num_seqs {num_seqs}"
-    )
+    use_qjl = state.algo == "prod"
+    if use_qjl:
+        assert cache_k_qjl_sign is not None and cache_k_rnorm is not None
 
-    if _tq_debug and _TQ_ATTN_DEBUG_COUNTER[0] < 8:
-        _TQ_ATTN_DEBUG_COUNTER[0] += 1
-        _qsl_cpu = query_start_loc.detach().to("cpu").tolist()
-        _sl_cpu = seq_lens.detach().to("cpu").tolist()
-        _bt_row0_head = block_table[0, :8].detach().to("cpu").tolist() \
-            if block_table.numel() > 0 else []
-        print(
-            f"[TQ_ATTN #{_TQ_ATTN_DEBUG_COUNTER[0]}] "
-            f"q.shape={tuple(q.shape)} q.dtype={q.dtype} "
-            f"num_query_tokens={num_query_tokens} num_seqs={num_seqs} "
-            f"qsl={_qsl_cpu} qsl.dtype={query_start_loc.dtype} "
-            f"seq_lens={_sl_cpu} seq_lens.dtype={seq_lens.dtype} "
-            f"block_table.shape={tuple(block_table.shape)} "
-            f"block_table.stride={tuple(block_table.stride())} "
-            f"block_table[0,:8]={_bt_row0_head} "
-            f"cache_k.shape={tuple(cache_k.shape)}",
-            flush=True,
-        )
-
-    codebook_f32 = codebook.codebook
-    if codebook_f32.dtype != torch.float32:
-        codebook_f32 = codebook_f32.to(torch.float32)
-
-    # --- per-query metadata (on-device, vectorised) ----------------------
+    # --- Per-query metadata (on-device, vectorised) ----------------------
     dev = q.device
     qsl = query_start_loc.to(device=dev, dtype=torch.int64)
     query_lens = qsl[1:] - qsl[:-1]
     seq_ids = torch.arange(num_seqs, dtype=torch.int64, device=dev)
     seq_id_per_query_i64 = torch.repeat_interleave(seq_ids, query_lens)
-    q_pos_per_query_i64 = (
+    q_pos_per_query = (
         torch.arange(num_query_tokens, dtype=torch.int64, device=dev)
         - qsl[:-1][seq_id_per_query_i64]
     )
-    prefix_len_per_seq_i64 = seq_lens.to(device=dev, dtype=torch.int64) - query_lens
+    prefix_len = seq_lens.to(device=dev, dtype=torch.int64) - query_lens
     kv_end_per_query_i64 = (
-        prefix_len_per_seq_i64[seq_id_per_query_i64] + q_pos_per_query_i64 + 1
+        prefix_len[seq_id_per_query_i64] + q_pos_per_query + 1
     )
-
     seq_id_per_query = seq_id_per_query_i64.to(torch.int32).contiguous()
     kv_end_per_query = kv_end_per_query_i64.to(torch.int32).contiguous()
 
-    if _tq_debug and _TQ_ATTN_DEBUG_COUNTER[0] <= 8:
-        _kv_end_cpu = kv_end_per_query.detach().to("cpu").tolist()
-        _seq_id_cpu = seq_id_per_query.detach().to("cpu").tolist()
-        print(
-            f"[TQ_ATTN #{_TQ_ATTN_DEBUG_COUNTER[0]} derived] "
-            f"query_lens={query_lens.detach().to('cpu').tolist()} "
-            f"prefix_len={prefix_len_per_seq_i64.detach().to('cpu').tolist()} "
-            f"seq_id_per_query[:16]={_seq_id_cpu[:16]} "
-            f"kv_end_per_query[:16]={_kv_end_cpu[:16]} "
-            f"kv_end_per_query[-1]={_kv_end_cpu[-1] if _kv_end_cpu else None}",
-            flush=True,
-        )
-
-    # --- Pre-rotate Q on the host side -----------------------------------
-    # q_rotated = H @ (signs * q).  In torch this is (q * signs) @ H.T.
-    # Sq        = S @ q_rotated.   One fp32 mm per query-head block; the
-    # cost is amortised over ALL KV tokens we will compare against.
-    H_f = codebook.H.to(torch.float32)
-    S_f = codebook.S.to(torch.float32)
-    signs_f = codebook.signs.to(torch.float32)
+    # --- Pre-rotate Q (and Sq for prod) ----------------------------------
+    H_f = state.H.to(torch.float32)
+    signs_f = state.signs.to(torch.float32)
     q_f = q.float()
-    q_rotated = (q_f * signs_f) @ H_f.T            # (T, H_q, d)
-    Sq = q_rotated @ S_f.T                         # (T, H_q, d)
-
-    # Kernel expects the same dtype as q for q_rotated / Sq, to keep the
-    # load dtypes matched.  (The kernel casts to fp32 internally.)
+    q_rotated = (q_f * signs_f) @ H_f.T
     q_rotated_k = q_rotated.to(q.dtype).contiguous()
-    Sq_k = Sq.to(q.dtype).contiguous()
+
+    if use_qjl:
+        S_f = state.S.to(torch.float32)
+        Sq = q_rotated @ S_f.T
+        Sq_k = Sq.to(q.dtype).contiguous()
+    else:
+        Sq_k = q_rotated_k  # unused by kernel but must be a valid pointer
 
     out = torch.empty_like(q)
     grid = (num_query_tokens, num_heads_q)
@@ -549,23 +410,29 @@ def turboquant_paged_attention(
     BLOCK_BS = block_size
     OUT_DTYPE = tl.bfloat16 if q.dtype == torch.bfloat16 else tl.float16
 
+    inv_d = 1.0 / float(head_size)
+    qjl_coef = math.sqrt(math.pi / 2.0) / float(head_size)
+
     actual_max_seq = int(seq_lens.max().item())
     actual_max_blocks = (actual_max_seq + block_size - 1) // block_size
     block_table_stride = int(block_table.shape[1])
 
-    _dequant_and_attend_kernel[grid](
+    qjl_sign_buf = cache_k_qjl_sign if use_qjl else cache_v_idx
+    rnorm_buf = cache_k_rnorm if use_qjl else cache_v_scale
+
+    _attend_kernel[grid](
         q_rotated_k,
         Sq_k,
-        cache_k,
-        cache_v,
+        cache_k_idx,
         cache_k_norm,
+        cache_v_idx,
         cache_v_scale,
-        cache_k_qjl_sign,
-        cache_k_rnorm,
+        qjl_sign_buf,
+        rnorm_buf,
         block_table,
         seq_id_per_query,
         kv_end_per_query,
-        codebook_f32,
+        codebook,
         out,
         inv_d,
         qjl_coef,
@@ -578,68 +445,6 @@ def turboquant_paged_attention(
         block_size=block_size,
         BLOCK_D=BLOCK_D,
         BLOCK_BS=BLOCK_BS,
+        USE_QJL=use_qjl,
     )
-
-    # --- optional PyTorch verification (TQ_VERIFY=1) ---------------------
-    # Reconstruct K the same way the kernel does and run plain softmax
-    # attention; the diff isolates Triton arithmetic from algorithmic bugs.
-    if int(os.environ.get("TQ_VERIFY", "0")) and num_query_tokens <= 128:
-        with torch.no_grad():
-            cb_ref = codebook.codebook.to(torch.float32)
-            H_ref = H_f
-            S_ref = S_f
-            signs_ref = signs_f
-            max_seq_for_ref = int(seq_lens.max().item())
-            k_ref = torch.zeros(
-                max_seq_for_ref, num_heads_kv, head_size,
-                dtype=torch.float32, device=q.device,
-            )
-            v_ref = torch.zeros_like(k_ref)
-            qjl_scale_const = _math.sqrt(_math.pi / 2.0) / float(head_size)
-            inv_sqrt_d = 1.0 / (head_size ** 0.5)
-            for pos in range(max_seq_for_ref):
-                bi = pos // block_size
-                toff = pos % block_size
-                phys = int(block_table[0, bi].item())
-                for h in range(num_heads_kv):
-                    idx = cache_k[phys, toff, h].long()
-                    rk_main = cb_ref[idx]
-                    qjl_sign = cache_k_qjl_sign[phys, toff, h].float()
-                    r_norm_h = float(cache_k_rnorm[phys, toff, h].item())
-                    # Paper: r_unit_approx = sqrt(pi/2)/d * S^T @ qjl_sign
-                    r_unit_approx = qjl_scale_const * (S_ref.T @ qjl_sign)
-                    rotated_approx = rk_main + r_norm_h * r_unit_approx
-                    k_unrot = rotated_approx @ H_ref
-                    k_unit = k_unrot * signs_ref
-                    k_norm_h = float(cache_k_norm[phys, toff, h].item())
-                    k_ref[pos, h] = k_unit * (k_norm_h * inv_sqrt_d)
-                    v_scale_h = float(cache_v_scale[phys, toff, h].item())
-                    v_ref[pos, h] = cache_v[phys, toff, h].float() * v_scale_h
-
-            gqa = num_heads_q // num_heads_kv
-            ref_out = torch.zeros_like(q, dtype=torch.float32)
-            sqrt_scale = 1.0 / (head_size ** 0.5)
-            for qi in range(num_query_tokens):
-                kv_end_i = int(kv_end_per_query[qi].item())
-                for h in range(num_heads_q):
-                    kh = h // gqa
-                    qv = q[qi, h].float()
-                    kk = k_ref[:kv_end_i, kh]
-                    vv = v_ref[:kv_end_i, kh]
-                    sc = (qv @ kk.T) * sqrt_scale
-                    w = torch.softmax(sc, dim=-1)
-                    ref_out[qi, h] = w @ vv
-
-            diff = (out.float() - ref_out).abs()
-            ref_abs_mean = ref_out.abs().mean().clamp(min=1e-6)
-            print(
-                f"[TQ_VERIFY] num_q={num_query_tokens} "
-                f"max_abs_err={float(diff.max().item()):.4f} "
-                f"mean_abs_err={float(diff.mean().item()):.4f} "
-                f"rel_err={float((diff.mean() / ref_abs_mean).item()):.4%} "
-                f"out_std={float(out.float().std().item()):.4f} "
-                f"ref_std={float(ref_out.std().item()):.4f} "
-                f"q_std={float(q.float().std().item()):.4f}",
-                flush=True,
-            )
     return out
