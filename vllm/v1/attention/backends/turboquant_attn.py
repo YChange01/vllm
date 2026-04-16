@@ -120,7 +120,12 @@ class TurboQuantAttentionBackend(AttentionBackend):
     def supports_block_size(cls, block_size: int | None) -> bool:
         return block_size is None or block_size % 16 == 0
 
-    forward_includes_kv_cache_update: bool = True
+    # Matches flash_attn / triton_attn: the wrapper drives `do_kv_cache_update`
+    # externally with the proper per-layer `forward_context.slot_mapping`,
+    # and `forward` only runs attend. Setting this True silently diverts the
+    # wrapper path and made our own forward-side KV update race the attend,
+    # producing deterministic gibberish (`://24`) regardless of quant bits.
+    forward_includes_kv_cache_update: bool = False
 
     @staticmethod
     def get_name() -> str:
@@ -324,11 +329,9 @@ class TurboQuantAttentionImpl(AttentionImpl):
             output.zero_()
             return output
 
-        if key is not None and value is not None:
-            self.do_kv_cache_update(
-                layer, key, value, kv_cache, attn_metadata.slot_mapping
-            )
-
+        # NOTE: do NOT call do_kv_cache_update here. The wrapper already did
+        # it via unified_kv_cache_update (forward_includes_kv_cache_update
+        # is False). Doing it again here would double-write / race.
         num_tokens = query.shape[0]
         q = query.view(num_tokens, self.num_heads, self.head_size)
 
