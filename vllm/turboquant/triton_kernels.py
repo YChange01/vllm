@@ -38,7 +38,7 @@ if TYPE_CHECKING:
     from vllm.turboquant.codebook import GaussianCodebook
 
 
-_NEG_LARGE = -1.0e30
+_NEG_LARGE: tl.constexpr = -1.0e30
 
 
 @triton.jit
@@ -83,7 +83,7 @@ def _quantize_and_store_kernel(
     k_norm_sq = tl.sum(k_vec * k_vec)
     k_inv_norm = 1.0 / tl.sqrt(tl.maximum(k_norm_sq, 1e-12))
     # Target norm: sqrt(head_size), so scale by sqrt(d) / ||k||.
-    k_scale = k_inv_norm * tl.sqrt(tl.float32(head_size))
+    k_scale = k_inv_norm * tl.sqrt(float(head_size))
     k_normed = k_vec * k_scale
 
     # Apply signs: sk = diag(s) * k.
