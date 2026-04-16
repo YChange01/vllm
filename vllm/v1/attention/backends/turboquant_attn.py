@@ -38,8 +38,9 @@ from vllm.v1.kv_cache_interface import AttentionSpec
 logger = init_logger(__name__)
 
 
-# Default codebook parameters. Expose as env-configurable later.
-TURBOQUANT_BITS = 4
+# Default codebook parameters. Configurable via env var.
+import os as _os
+TURBOQUANT_BITS = int(_os.environ.get("TURBOQUANT_BITS", "8"))
 
 
 @dataclass
