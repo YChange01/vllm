@@ -38,23 +38,27 @@ def dequant_kv_reference(
     cache_k_norm: torch.Tensor,
     cache_v: torch.Tensor,
     cache_v_scale: torch.Tensor,
-    cache_k_resid_sign: torch.Tensor,
-    cache_k_resid_scale: torch.Tensor,
+    cache_k_qjl_sign: torch.Tensor,
+    cache_k_rnorm: torch.Tensor,
     codebook: GaussianCodebook,
     block_table: torch.Tensor,
     seq_len: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Dequantise the K cache for sequence 0 up to seq_len, using the SAME
-    formula the Triton attend kernel does.
+    """Dequantise the K cache using the TurboQuant Algorithm 2 formula.
 
-    Step 2 adds the residual correction: in rotated space we reconstruct
-    rk ≈ codebook[idx] + sign * scale before un-rotation.
+    Per (slot, head):
+        r_unit_approx  = sqrt(pi/2)/d * S^T @ qjl_sign
+        rotated_approx = codebook[idx] + r_norm * r_unit_approx
+        k              = ((rotated_approx @ H) * signs) * (k_norm / sqrt(d))
     """
+    import math
     num_blocks, block_size, num_kv_heads, head_size = cache_k.shape
     inv_sqrt_d = 1.0 / (head_size ** 0.5)
+    qjl_scale_const = math.sqrt(math.pi / 2.0) / float(head_size)
 
     cb = codebook.codebook.to(torch.float32)
     H = codebook.H.to(torch.float32)
+    S = codebook.S.to(torch.float32)
     signs = codebook.signs.to(torch.float32)
 
     k_full = torch.zeros(seq_len, num_kv_heads, head_size,
@@ -65,13 +69,13 @@ def dequant_kv_reference(
         tok_in_block = p % block_size
         phys_block = int(block_table[0, block_i].item())
         for h in range(num_kv_heads):
-            idx = cache_k[phys_block, tok_in_block, h].long()  # (d,)
-            rk = cb[idx]                                       # (d,)
-            # Step 2: 1-bit residual correction in rotated space
-            rk_sign = cache_k_resid_sign[phys_block, tok_in_block, h].float()
-            rk_scale = float(cache_k_resid_scale[phys_block, tok_in_block, h].item())
-            rk = rk + rk_sign * rk_scale
-            k_unrot = rk @ H                                   # (d,) (H symmetric)
+            idx = cache_k[phys_block, tok_in_block, h].long()
+            rk_main = cb[idx]
+            qjl_sign = cache_k_qjl_sign[phys_block, tok_in_block, h].float()
+            r_norm_h = float(cache_k_rnorm[phys_block, tok_in_block, h].item())
+            r_unit_approx = qjl_scale_const * (S.T @ qjl_sign)
+            rotated_approx = rk_main + r_norm_h * r_unit_approx
+            k_unrot = rotated_approx @ H
             k_unit = k_unrot * signs
             k_norm_head = float(cache_k_norm[phys_block, tok_in_block, h].item())
             k_full[p, h] = k_unit * (k_norm_head * inv_sqrt_d)
@@ -136,11 +140,11 @@ def run_one_case(
                                dtype=torch.float32, device=device)
     cache_v_scale = torch.zeros(num_blocks, block_size, num_heads_kv,
                                 dtype=torch.float32, device=device)
-    # Step 2: 1-bit K residual sign + per-(slot,head) scale
-    cache_k_resid_sign = torch.zeros(num_blocks, block_size, num_heads_kv, head_size,
-                                     dtype=torch.int8, device=device)
-    cache_k_resid_scale = torch.zeros(num_blocks, block_size, num_heads_kv,
-                                      dtype=torch.float32, device=device)
+    # Algorithm 2: QJL sign bits + residual L2 norm
+    cache_k_qjl_sign = torch.zeros(num_blocks, block_size, num_heads_kv, head_size,
+                                   dtype=torch.int8, device=device)
+    cache_k_rnorm = torch.zeros(num_blocks, block_size, num_heads_kv,
+                                dtype=torch.float32, device=device)
 
     # Put this seq's tokens starting at block 1 slot 0 (skip block 0 to
     # mimic vLLM behaviour where block 0 is often reserved / warmup).
@@ -170,27 +174,27 @@ def run_one_case(
         cache_v=cache_v,
         cache_k_norm=cache_k_norm,
         cache_v_scale=cache_v_scale,
-        cache_k_resid_sign=cache_k_resid_sign,
-        cache_k_resid_scale=cache_k_resid_scale,
+        cache_k_qjl_sign=cache_k_qjl_sign,
+        cache_k_rnorm=cache_k_rnorm,
         slot_mapping=slot_mapping,
         codebook=codebook,
         block_size=block_size,
     )
     torch.cuda.synchronize()
 
-    # --- 2) Triton attend: first WITHOUT residual (Step 1 baseline) ------
-    # Zero the scale tensor to cancel sign*scale in the kernel -- keeps the
-    # dequant path bit-identical except the residual contribution.
-    scale_backup = cache_k_resid_scale.clone()
-    cache_k_resid_scale.zero_()
-    attn_out_step1 = turboquant_paged_attention(
+    # --- 2) Triton attend: Algorithm 1 baseline (no QJL residual) --------
+    # Zero the residual-norm tensor to cancel the QJL term -- effectively
+    # reverts to pure MSE TurboQuant (paper Algorithm 1).
+    rnorm_backup = cache_k_rnorm.clone()
+    cache_k_rnorm.zero_()
+    attn_out_mse = turboquant_paged_attention(
         q=q,
         cache_k=cache_k,
         cache_v=cache_v,
         cache_k_norm=cache_k_norm,
         cache_v_scale=cache_v_scale,
-        cache_k_resid_sign=cache_k_resid_sign,
-        cache_k_resid_scale=cache_k_resid_scale,
+        cache_k_qjl_sign=cache_k_qjl_sign,
+        cache_k_rnorm=cache_k_rnorm,
         block_table=block_table,
         seq_lens=seq_lens,
         query_start_loc=query_start_loc,
@@ -198,17 +202,17 @@ def run_one_case(
         scale=None,
     )
     torch.cuda.synchronize()
-    cache_k_resid_scale.copy_(scale_backup)
+    cache_k_rnorm.copy_(rnorm_backup)
 
-    # --- 2b) Triton attend WITH residual (Step 2) ------------------------
+    # --- 2b) Triton attend WITH QJL residual (Algorithm 2) --------------
     attn_out = turboquant_paged_attention(
         q=q,
         cache_k=cache_k,
         cache_v=cache_v,
         cache_k_norm=cache_k_norm,
         cache_v_scale=cache_v_scale,
-        cache_k_resid_sign=cache_k_resid_sign,
-        cache_k_resid_scale=cache_k_resid_scale,
+        cache_k_qjl_sign=cache_k_qjl_sign,
+        cache_k_rnorm=cache_k_rnorm,
         block_table=block_table,
         seq_lens=seq_lens,
         query_start_loc=query_start_loc,
@@ -223,8 +227,8 @@ def run_one_case(
         cache_k_norm=cache_k_norm,
         cache_v=cache_v,
         cache_v_scale=cache_v_scale,
-        cache_k_resid_sign=cache_k_resid_sign,
-        cache_k_resid_scale=cache_k_resid_scale,
+        cache_k_qjl_sign=cache_k_qjl_sign,
+        cache_k_rnorm=cache_k_rnorm,
         codebook=codebook,
         block_table=block_table,
         seq_len=num_tokens,
@@ -234,19 +238,18 @@ def run_one_case(
     ref_out = reference_attention(q.float(), k_dq, v_dq, kv_end_per_query)
 
     # --- 3b) FP ground-truth attention on the ORIGINAL unquantized K/V ----
-    # This is what Step 2 should actually move. The ref_out above uses the
-    # same quantized+dequantized K/V as the Triton kernel, so it measures
-    # kernel arithmetic fidelity (~0.14% bf16 floor) but NOT quantization
-    # quality. Comparing attn_out against this fp_ref_out shows the true
-    # end-to-end quantization error that the residual is supposed to shrink.
+    # ref_out uses the quantized+dequantized K/V that the kernel sees, so
+    # it mostly measures Triton-vs-Python arithmetic. fp_ref_out uses the
+    # UNQUANTIZED K/V; comparing attn_out against fp_ref_out is the real
+    # end-to-end quantization error number.
     fp_ref_out = reference_attention(
         q.float(), k.float(), v.float(), kv_end_per_query,
     )
 
     # --- 4) Compare -------------------------------------------------------
     fp_ref_abs_mean = fp_ref_out.abs().mean().clamp(min=1e-6)
-    step1_diff = (attn_out_step1.float() - fp_ref_out).abs()
-    step2_diff = (attn_out.float() - fp_ref_out).abs()
+    mse_diff = (attn_out_mse.float() - fp_ref_out).abs()      # Algorithm 1
+    a2_diff = (attn_out.float() - fp_ref_out).abs()           # Algorithm 2
     kern_diff = (attn_out.float() - ref_out).abs()
     return {
         "num_tokens": num_tokens,
@@ -254,10 +257,10 @@ def run_one_case(
         "kern_rel_err": float(
             (kern_diff.mean() / ref_out.abs().mean().clamp(min=1e-6)).item()
         ),
-        "step1_rel_err": float((step1_diff.mean() / fp_ref_abs_mean).item()),
-        "step2_rel_err": float((step2_diff.mean() / fp_ref_abs_mean).item()),
-        "step1_max_err": float(step1_diff.max().item()),
-        "step2_max_err": float(step2_diff.max().item()),
+        "mse_rel_err": float((mse_diff.mean() / fp_ref_abs_mean).item()),
+        "a2_rel_err": float((a2_diff.mean() / fp_ref_abs_mean).item()),
+        "mse_max_err": float(mse_diff.max().item()),
+        "a2_max_err": float(a2_diff.max().item()),
         "fp_ref_std": float(fp_ref_out.std().item()),
     }
 
@@ -271,27 +274,26 @@ def main():
 
     cases = [args.num_tokens] if args.num_tokens else [1, 4, 16, 32, 61, 128]
 
-    # Four error columns:
-    #   kern_rel    : Triton vs PyTorch on SAME quantized K/V
-    #                 (arithmetic fidelity, ~0.14% bf16 floor)
-    #   step1_rel   : Triton vs UNQUANTIZED K/V with residual scale zeroed
-    #                 (Step 1 equivalent -- Lloyd-Max + V int8, no residual)
-    #   step2_rel   : Triton vs UNQUANTIZED K/V with residual active
-    #                 (Step 2 -- should be smaller than step1_rel)
-    #   reduction   : 1 - step2_rel/step1_rel (how much residual helped)
-    print(f"{'num_tokens':>10} {'kern_rel':>10} {'step1_rel':>10} "
-          f"{'step2_rel':>10} {'reduction':>10} "
-          f"{'s1_max':>8} {'s2_max':>8}")
+    # Columns:
+    #   kern_rel   : Triton vs PyTorch on SAME quantized K/V (bf16 floor)
+    #   mse_rel    : Triton vs UNQUANTIZED K/V with r_norm=0
+    #                 (TurboQuant Algorithm 1, pure MSE)
+    #   a2_rel     : Triton vs UNQUANTIZED K/V with QJL residual active
+    #                 (TurboQuant Algorithm 2, paper's recipe)
+    #   reduction  : 1 - a2_rel / mse_rel (gain from QJL)
+    print(f"{'num_tokens':>10} {'kern_rel':>10} {'mse_rel':>10} "
+          f"{'a2_rel':>10} {'reduction':>10} "
+          f"{'mse_max':>8} {'a2_max':>8}")
     for n in cases:
         r = run_one_case(num_tokens=n, bits=args.bits)
-        reduction = 1.0 - r["step2_rel_err"] / max(r["step1_rel_err"], 1e-12)
+        reduction = 1.0 - r["a2_rel_err"] / max(r["mse_rel_err"], 1e-12)
         print(f"{r['num_tokens']:>10} "
               f"{r['kern_rel_err']:>10.4%} "
-              f"{r['step1_rel_err']:>10.4%} "
-              f"{r['step2_rel_err']:>10.4%} "
+              f"{r['mse_rel_err']:>10.4%} "
+              f"{r['a2_rel_err']:>10.4%} "
               f"{reduction:>10.2%} "
-              f"{r['step1_max_err']:>8.4f} "
-              f"{r['step2_max_err']:>8.4f}")
+              f"{r['mse_max_err']:>8.4f} "
+              f"{r['a2_max_err']:>8.4f}")
 
 
 if __name__ == "__main__":
