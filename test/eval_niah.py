@@ -34,7 +34,12 @@ import urllib.request
 FILLER_SENTENCE = "The cat sat on the mat and watched the rain. "
 
 
-def _post(url: str, payload: dict[str, Any], timeout: float = 300.0) -> dict[str, Any]:
+_REQUEST_TIMEOUT = 1800.0  # set from CLI; default 30 min for first Triton JIT
+
+
+def _post(url: str, payload: dict[str, Any], timeout: float | None = None) -> dict[str, Any]:
+    if timeout is None:
+        timeout = _REQUEST_TIMEOUT
     data = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(
         url,
@@ -48,9 +53,11 @@ def _post(url: str, payload: dict[str, Any], timeout: float = 300.0) -> dict[str
 
 def count_tokens(text: str, endpoint: str, model: str) -> int:
     """Ask the server to tokenize and return the token count."""
+    # /tokenize is cheap; cap at 60s so a dead server fails fast.
     out = _post(
         f"{endpoint}/tokenize",
         {"model": model, "prompt": text},
+        timeout=60.0,
     )
     # vLLM returns {"tokens": [...], "count": int, "max_model_len": int}
     return int(out.get("count", len(out.get("tokens", []))))
@@ -136,17 +143,26 @@ def run_grid(args: argparse.Namespace) -> None:
                 prompt, actual_tokens = build_haystack(
                     ctx, pos, needle, args.endpoint, args.model
                 )
-                completion = query(
-                    prompt, args.endpoint, args.model, args.max_tokens
-                )
-                ok = grade(completion, needle)
+                req_t0 = time.time()
+                try:
+                    completion = query(
+                        prompt, args.endpoint, args.model, args.max_tokens
+                    )
+                    ok = grade(completion, needle)
+                    req_elapsed = time.time() - req_t0
+                    status = "OK" if ok else "FAIL"
+                except Exception as e:
+                    completion = f"<error: {type(e).__name__}: {e}>"
+                    ok = False
+                    req_elapsed = time.time() - req_t0
+                    status = "ERR "
                 correct += int(ok)
                 done += 1
                 shown = completion.replace("\n", " ").strip()[:60]
                 print(
                     f"[{args.tag}] {done}/{total} "
                     f"ctx~{ctx}(={actual_tokens}) pos={pos:.2f} "
-                    f"needle={needle} {'OK' if ok else 'FAIL'} "
+                    f"needle={needle} {status} ({req_elapsed:.1f}s) "
                     f"| {shown!r}",
                     flush=True,
                 )
@@ -197,7 +213,13 @@ def main() -> None:
     ap.add_argument("--max-tokens", type=int, default=16)
     ap.add_argument("--tag", default="run",
                     help="label for this run in logs / summary")
+    ap.add_argument("--request-timeout", type=float, default=1800.0,
+                    help="per-request timeout in seconds (default 1800, "
+                         "generous for first Triton JIT compile)")
     args = ap.parse_args()
+
+    global _REQUEST_TIMEOUT
+    _REQUEST_TIMEOUT = float(args.request_timeout)
 
     try:
         run_grid(args)

@@ -28,6 +28,9 @@ POSITIONS="${POSITIONS:-0.1,0.5,0.9}"
 TRIALS="${TRIALS:-3}"
 SEED="${SEED:-42}"
 MAX_TOKENS="${MAX_TOKENS:-16}"
+REQUEST_TIMEOUT="${REQUEST_TIMEOUT:-1800}"  # seconds; first Triton JIT on a
+                                            # long ctx can take many minutes
+                                            # for the TurboQuant kernel today.
 
 FP_PORT=8010
 TQ_PORT=8009
@@ -111,6 +114,7 @@ run_stage() {
         --trials "$TRIALS" \
         --seed "$SEED" \
         --max-tokens "$MAX_TOKENS" \
+        --request-timeout "$REQUEST_TIMEOUT" \
         --tag "$tag" \
         2>&1 | tee "$elog"
 
