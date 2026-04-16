@@ -18,7 +18,7 @@ set -u
 
 MODEL="${1:-/mnt/nvme3n1/g00872988/models/Qwen3-0.6B}"
 PORT="${2:-8009}"
-GPU="${3:-1}"
+GPU="${3:-3}"
 MAX_LEN="${4:-4096}"
 
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
