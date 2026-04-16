@@ -128,6 +128,7 @@ def _dequant_and_attend_kernel(
     signs_ptr,            # (head_size,) fp16/bf16
     out_ptr,              # (num_seqs, num_heads_q, head_size) fp16/bf16
     scale,                # fp32 scalar, 1 / sqrt(head_size)
+    OUT_DTYPE: tl.constexpr,  # tl.float16 or tl.bfloat16
     num_heads_q: tl.constexpr,
     num_heads_kv: tl.constexpr,
     head_size: tl.constexpr,
@@ -203,7 +204,7 @@ def _dequant_and_attend_kernel(
 
     out_vec = acc / tl.maximum(l_i, 1e-12)
     out_off = (seq_idx * num_heads_q + qh_idx) * head_size + d_idx
-    tl.store(out_ptr + out_off, out_vec.to(tl.float16), mask=mask_d)
+    tl.store(out_ptr + out_off, out_vec.to(OUT_DTYPE), mask=mask_d)
 
 
 def turboquant_store_kv(
@@ -274,6 +275,7 @@ def turboquant_paged_attention(
     grid = (num_seqs, num_heads_q)
     BLOCK_D = triton.next_power_of_2(head_size)
     BLOCK_BS = block_size
+    OUT_DTYPE = tl.bfloat16 if q.dtype == torch.bfloat16 else tl.float16
 
     _dequant_and_attend_kernel[grid](
         q,
@@ -286,6 +288,7 @@ def turboquant_paged_attention(
         codebook.signs,
         out,
         scale,
+        OUT_DTYPE=OUT_DTYPE,
         num_heads_q=num_heads_q,
         num_heads_kv=num_heads_kv,
         head_size=head_size,

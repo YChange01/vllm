@@ -16,22 +16,22 @@ import torch
 
 
 def pack_int4(idx: torch.Tensor) -> torch.Tensor:
-    """idx: (..., d) uint8 ∈ [0, 16) -> packed (..., d/2) uint8.
+    """``idx: (..., d) uint8 in [0, 16) -> packed: (..., d/2) uint8``.
 
-    要求 d 是偶数. 低 nibble = idx[2i], 高 nibble = idx[2i+1].
+    Requires even ``d``. Low nibble = idx[2i], high nibble = idx[2i+1].
     """
     if idx.dtype != torch.uint8:
         idx = idx.to(torch.uint8)
     if idx.shape[-1] % 2 != 0:
         raise ValueError(f"last dim must be even, got {idx.shape[-1]}")
-    idx = idx & 0x0F  # 安全裁剪
+    idx = idx & 0x0F  # clamp to [0, 15]
     low = idx[..., 0::2]
     high = idx[..., 1::2]
     return low | (high << 4)
 
 
 def unpack_int4(packed: torch.Tensor, d: int) -> torch.Tensor:
-    """packed: (..., d/2) uint8 -> (..., d) uint8. 逆操作."""
+    """``packed: (..., d/2) uint8 -> (..., d) uint8``. Inverse of pack_int4."""
     if packed.shape[-1] * 2 != d:
         raise ValueError(
             f"packed last dim {packed.shape[-1]} != d/2 for d={d}"
@@ -46,7 +46,7 @@ def unpack_int4(packed: torch.Tensor, d: int) -> torch.Tensor:
 
 
 def cache_bytes_per_key(head_dim: int, bits: int) -> int:
-    """每个 key 的存储字节数."""
+    """Storage bytes per key vector."""
     bits_total = head_dim * bits
     if bits_total % 8 != 0:
         raise ValueError(f"head_dim * bits must be multiple of 8")

@@ -18,7 +18,7 @@ import torch
 def _lloyd_max_gaussian_numpy(
     bits: int, n_iter: int = 100, n_samples: int = 200_000, seed: int = 0
 ) -> np.ndarray:
-    """Lloyd-Max 迭代, 返回 2^bits 个 MSE 最优码字, 升序排列."""
+    """Lloyd-Max iteration. Returns 2^bits MSE-optimal codewords, sorted."""
     K = 2 ** bits
     rng = np.random.default_rng(seed)
     samples = rng.standard_normal(n_samples)
@@ -37,7 +37,7 @@ def _lloyd_max_gaussian_numpy(
 def build_codebook(
     bits: int, dtype: torch.dtype = torch.float16, device: str | torch.device = "cpu"
 ) -> torch.Tensor:
-    """返回形状 (K,) 的码本张量."""
+    """Return a ``(K,)`` codebook tensor on the given device."""
     c = _lloyd_max_gaussian_numpy(bits)
     return torch.tensor(c, dtype=dtype, device=device)
 
@@ -57,13 +57,13 @@ def build_rotation(
     dtype: torch.dtype = torch.float16,
     device: str | torch.device = "cpu",
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """返回 (H, signs).
+    """Return ``(H, signs)`` for the random orthogonal rotation Pi.
 
-    - H: 归一化 Hadamard 矩阵, shape (d, d)
-    - signs: {±1}^d, shape (d,)
+    - H: normalized Hadamard matrix, shape ``(d, d)``
+    - signs: ``{+1, -1}^d``, shape ``(d,)``
 
-    完整旋转 Π x = (signs ⊙ x) @ H^T
-    反旋转  Π^T x = (x @ H) ⊙ signs
+    Forward:  ``Pi x  = (signs * x) @ H.T``
+    Inverse:  ``Pi^T x = (x @ H) * signs``
     """
     g = torch.Generator().manual_seed(seed)
     H = _hadamard_matrix(d, dtype).to(device)
@@ -108,7 +108,7 @@ class GaussianCodebook:
 
 
 class RandomRotation:
-    """独立的随机旋转, 供 Triton kernel 和 PyTorch 验证共享."""
+    """Standalone random rotation, shared by Triton kernels and PyTorch reference."""
 
     def __init__(self, d: int, seed: int, dtype: torch.dtype, device: str | torch.device):
         self.d = d

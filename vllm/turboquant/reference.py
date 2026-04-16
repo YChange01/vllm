@@ -66,7 +66,7 @@ def paged_attention_reference(
     if scale is None:
         scale = 1.0 / math.sqrt(head_dim)
 
-    # 码本 lookup + 反旋转
+    # Codebook lookup + inverse rotation.
     cb = codebook.codebook  # (K_CB,)
     H = codebook.H
     signs = codebook.signs
@@ -83,7 +83,7 @@ def paged_attention_reference(
             take = min(block_size, seq_len - bi * block_size)
             k_idx = cache_k[phys, :take].long()  # (take, num_kv_heads, head_dim)
             rk = cb[k_idx]                        # (take, num_kv_heads, head_dim)
-            k = (rk @ H) * signs                  # 反旋转
+            k = (rk @ H) * signs                  # inverse rotation
             k_list.append(k)
             v_list.append(cache_v[phys, :take])
 
