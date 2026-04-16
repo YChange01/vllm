@@ -58,19 +58,28 @@ TURBOQUANT_BITS = int(os.environ.get("TURBOQUANT_BITS", "8"))
 # broken with BYPASS=1, the bug is NOT in the quant kernel but in how the
 # backend plugs into vLLM (output tensor, slot semantics, etc).
 TURBOQUANT_BYPASS = os.environ.get("TURBOQUANT_BYPASS", "0") == "1"
-# Diagnostic dump: log the FIRST do_kv_cache_update and FIRST forward()
-# invocation payload to TURBOQUANT_DEBUG_LOG. Path defaults to /tmp.
-TURBOQUANT_DEBUG = os.environ.get("TURBOQUANT_DEBUG", "0") == "1"
+# ALWAYS-ON diagnostic: log the FIRST do_kv_cache_update and FIRST forward()
+# payload for every distinct layer, the first time each is seen. No env
+# gate -- vllm serve spawns subprocesses and env vars don't propagate
+# reliably, so we instrument unconditionally and use a file instead of
+# stdout (which gets swallowed by vllm's logger).
 TURBOQUANT_DEBUG_LOG = os.environ.get(
     "TURBOQUANT_DEBUG_LOG", "/tmp/turboquant_debug.log"
 )
 _DEBUG_SEEN_STORE: set[int] = set()
 _DEBUG_SEEN_FWD: set[int] = set()
+# Append a module-load marker. Do NOT truncate -- multiple processes
+# import this module (driver + workers) and truncating would wipe each
+# other. run_bypass_debug.sh clears the file before starting the server.
+try:
+    with open(TURBOQUANT_DEBUG_LOG, "a") as _f:
+        _f.write(f"# module load pid={os.getpid()} algo={TURBOQUANT_ALGO} "
+                 f"bits={TURBOQUANT_BITS} bypass={TURBOQUANT_BYPASS}\n")
+except Exception:
+    pass
 
 
 def _dbg(msg: str) -> None:
-    if not TURBOQUANT_DEBUG:
-        return
     try:
         with open(TURBOQUANT_DEBUG_LOG, "a") as f:
             f.write(msg + "\n")
@@ -301,7 +310,7 @@ class TurboQuantAttentionImpl(AttentionImpl):
 
         self._ensure_buffers(kv_cache)
 
-        if TURBOQUANT_DEBUG and self._layer_seed not in _DEBUG_SEEN_STORE:
+        if self._layer_seed not in _DEBUG_SEEN_STORE:
             _DEBUG_SEEN_STORE.add(self._layer_seed)
             try:
                 sm = slot_mapping.detach().cpu().tolist()
@@ -371,7 +380,7 @@ class TurboQuantAttentionImpl(AttentionImpl):
 
         self._ensure_buffers(kv_cache)
 
-        if TURBOQUANT_DEBUG and self._layer_seed not in _DEBUG_SEEN_FWD:
+        if self._layer_seed not in _DEBUG_SEEN_FWD:
             _DEBUG_SEEN_FWD.add(self._layer_seed)
             try:
                 qsl = attn_metadata.query_start_loc.detach().cpu().tolist()
