@@ -107,6 +107,10 @@ def run_one_case(num_tokens: int, bits: int = 8, num_heads_q: int = 16,
                  block_size: int = 16,
                  dtype: torch.dtype = torch.bfloat16,
                  seed: int = 0) -> dict:
+    assert num_heads_q % num_heads_kv == 0, (
+        f"num_heads_q ({num_heads_q}) must be divisible by "
+        f"num_heads_kv ({num_heads_kv})"
+    )
     device = "cuda"
     torch.manual_seed(seed)
 
@@ -158,14 +162,26 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--num-tokens", type=int, default=None)
     ap.add_argument("--bits", type=int, default=8)
+    ap.add_argument("--num-heads-q", type=int, default=16)
+    ap.add_argument("--num-heads-kv", type=int, default=8)
+    ap.add_argument("--head-size", type=int, default=128)
     args = ap.parse_args()
 
     cases = [args.num_tokens] if args.num_tokens else [1, 4, 16, 32, 61, 128]
 
+    gqa = args.num_heads_q // args.num_heads_kv
+    print(f"# config: heads_q={args.num_heads_q} heads_kv={args.num_heads_kv} "
+          f"gqa={gqa} head_size={args.head_size} bits={args.bits}")
     print(f"{'num_tokens':>10} {'mse_rel':>10} {'prod_rel':>10} "
           f"{'reduction':>10} {'mse_max':>8} {'prod_max':>8}")
     for n in cases:
-        r = run_one_case(num_tokens=n, bits=args.bits)
+        r = run_one_case(
+            num_tokens=n,
+            bits=args.bits,
+            num_heads_q=args.num_heads_q,
+            num_heads_kv=args.num_heads_kv,
+            head_size=args.head_size,
+        )
         reduction = 1.0 - r["prod_rel"] / max(r["mse_rel"], 1e-12)
         print(f"{r['num_tokens']:>10} "
               f"{r['mse_rel']:>10.4%} {r['prod_rel']:>10.4%} "
