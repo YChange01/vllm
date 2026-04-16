@@ -116,7 +116,7 @@ def _dequant_and_attend_kernel(
     cache_k_ptr,          # (num_blocks, block_size, num_heads_kv, head_size) uint8
     cache_v_ptr,          # (num_blocks, block_size, num_heads_kv, head_size) fp16/bf16
     cache_k_norm_ptr,     # (num_blocks, block_size, num_heads_kv) fp32
-    block_table_ptr,      # (num_seqs, max_blocks_per_seq) int32
+    block_table_ptr,      # (num_seqs, block_table_stride) int32
     seq_lens_ptr,         # (num_seqs,) int32
     codebook_ptr,         # (K_CB,) fp32
     hadamard_ptr,         # (head_size, head_size) fp16/bf16
@@ -124,16 +124,29 @@ def _dequant_and_attend_kernel(
     out_ptr,              # (num_seqs, num_heads_q, head_size) fp16/bf16
     scale,                # fp32 scalar, 1 / sqrt(head_size)
     inv_sqrt_d,           # fp32 scalar, 1 / sqrt(head_size) for norm restoration
+    max_blocks_per_seq,   # runtime int: loop bound; keep SMALL for speed
+    block_table_stride,   # runtime int: real row stride of block_table
     OUT_DTYPE: tl.constexpr,
     num_heads_q: tl.constexpr,
     num_heads_kv: tl.constexpr,
     head_size: tl.constexpr,
     block_size: tl.constexpr,
-    max_blocks_per_seq: tl.constexpr,
     BLOCK_D: tl.constexpr,
     BLOCK_BS: tl.constexpr,
 ):
-    """One program = one (seq, q_head)."""
+    """One program = one (seq, q_head).
+
+    IMPORTANT:
+      * max_blocks_per_seq is the RUNTIME loop bound (use a Python for-range,
+        not tl.static_range, so Triton emits a real loop instead of
+        unrolling the body ~max_blocks_per_seq * BLOCK_BS times). Before this
+        fix, ctx=512 unrolled ~480 iterations each containing a 128x128
+        matvec, and Triton's JIT compile stalled for tens of minutes.
+      * block_table_stride is the ACTUAL row stride of block_table (typically
+        max_model_len // block_size from the metadata builder). Do NOT
+        reuse max_blocks_per_seq here -- that was the earlier silent bug
+        where prefill with num_seqs > 1 read the wrong rows of block_table.
+    """
     seq_idx = tl.program_id(0)
     qh_idx = tl.program_id(1)
 
@@ -161,10 +174,10 @@ def _dequant_and_attend_kernel(
     l_i = tl.zeros((), dtype=tl.float32)
     acc = tl.zeros((BLOCK_D,), dtype=tl.float32)
 
-    for block_i in tl.static_range(0, max_blocks_per_seq):
+    for block_i in range(0, max_blocks_per_seq):
         if block_i < num_blocks:
             phys_block = tl.load(
-                block_table_ptr + seq_idx * max_blocks_per_seq + block_i
+                block_table_ptr + seq_idx * block_table_stride + block_i
             )
 
             for tok_in_block in tl.static_range(0, BLOCK_BS):
@@ -276,6 +289,11 @@ def turboquant_paged_attention(
 
     actual_max_seq = int(seq_lens.max().item())
     actual_max_blocks = (actual_max_seq + block_size - 1) // block_size
+    # block_table is laid out with the scheduler's full per-seq stride
+    # (typically max_model_len // block_size). The kernel must use THIS
+    # stride to index rows; it must use `actual_max_blocks` only as the
+    # runtime loop bound so Triton does not unroll the entire stride.
+    block_table_stride = int(block_table.shape[1])
 
     _dequant_and_attend_kernel[grid](
         q,
@@ -290,12 +308,13 @@ def turboquant_paged_attention(
         out,
         scale,
         inv_sqrt_d,
+        actual_max_blocks,
+        block_table_stride,
         OUT_DTYPE=OUT_DTYPE,
         num_heads_q=num_heads_q,
         num_heads_kv=num_heads_kv,
         head_size=head_size,
         block_size=block_size,
-        max_blocks_per_seq=actual_max_blocks,
         BLOCK_D=BLOCK_D,
         BLOCK_BS=BLOCK_BS,
     )
