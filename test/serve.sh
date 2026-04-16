@@ -17,4 +17,6 @@ echo "port:  $PORT"
 echo "gpu:   ${CUDA_VISIBLE_DEVICES:-all}"
 echo ""
 
-vllm serve "$MODEL" --port "$PORT" --enforce-eager --attention-backend TURBOQUANT
+MAX_LEN="${4:-4096}"
+
+vllm serve "$MODEL" --port "$PORT" --enforce-eager --attention-backend TURBOQUANT --max-model-len "$MAX_LEN" --gpu-memory-utilization 0.7
