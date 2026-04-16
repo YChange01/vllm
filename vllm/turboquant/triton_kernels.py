@@ -271,6 +271,9 @@ def turboquant_store_kv(
     )
 
 
+_TQ_ATTN_DEBUG_COUNTER = [0]
+
+
 def turboquant_paged_attention(
     q: torch.Tensor,
     cache_k: torch.Tensor,
@@ -299,6 +302,9 @@ def turboquant_paged_attention(
                                 where s = seq_id_per_query[i] and p is the
                                 within-sequence position of token i.
     """
+    import os
+    _tq_debug = int(os.environ.get("TQ_DEBUG", "0"))
+
     num_query_tokens, num_heads_q, head_size = q.shape
     _, block_size, num_heads_kv, _ = cache_k.shape
     num_seqs = int(seq_lens.shape[0])
@@ -306,6 +312,39 @@ def turboquant_paged_attention(
     if scale is None:
         scale = 1.0 / (head_size ** 0.5)
     inv_sqrt_d = 1.0 / (head_size ** 0.5)
+
+    # Shape contract sanity.  Any mismatch here means vLLM fed us metadata
+    # whose layout we do NOT understand; continuing silently gives garbage
+    # attention (seen in the NIAH eval).  Fail loudly instead.
+    assert query_start_loc.shape[0] == num_seqs + 1, (
+        f"query_start_loc length {query_start_loc.shape[0]} != num_seqs+1 "
+        f"({num_seqs + 1}); shapes q={tuple(q.shape)} "
+        f"seq_lens={tuple(seq_lens.shape)} "
+        f"qsl={tuple(query_start_loc.shape)}"
+    )
+    assert block_table.shape[0] >= num_seqs, (
+        f"block_table rows {block_table.shape[0]} < num_seqs {num_seqs}"
+    )
+
+    if _tq_debug and _TQ_ATTN_DEBUG_COUNTER[0] < 8:
+        _TQ_ATTN_DEBUG_COUNTER[0] += 1
+        import torch as _t
+        _qsl_cpu = query_start_loc.detach().to("cpu").tolist()
+        _sl_cpu = seq_lens.detach().to("cpu").tolist()
+        _bt_row0_head = block_table[0, :8].detach().to("cpu").tolist() \
+            if block_table.numel() > 0 else []
+        print(
+            f"[TQ_ATTN #{_TQ_ATTN_DEBUG_COUNTER[0]}] "
+            f"q.shape={tuple(q.shape)} q.dtype={q.dtype} "
+            f"num_query_tokens={num_query_tokens} num_seqs={num_seqs} "
+            f"qsl={_qsl_cpu} qsl.dtype={query_start_loc.dtype} "
+            f"seq_lens={_sl_cpu} seq_lens.dtype={seq_lens.dtype} "
+            f"block_table.shape={tuple(block_table.shape)} "
+            f"block_table.stride={tuple(block_table.stride())} "
+            f"block_table[0,:8]={_bt_row0_head} "
+            f"cache_k.shape={tuple(cache_k.shape)}",
+            flush=True,
+        )
 
     codebook_f32 = codebook.codebook
     if codebook_f32.dtype != torch.float32:
@@ -335,6 +374,19 @@ def turboquant_paged_attention(
     # Kernel expects int32 pointers.
     seq_id_per_query = seq_id_per_query_i64.to(torch.int32).contiguous()
     kv_end_per_query = kv_end_per_query_i64.to(torch.int32).contiguous()
+
+    if _tq_debug and _TQ_ATTN_DEBUG_COUNTER[0] <= 8:
+        _kv_end_cpu = kv_end_per_query.detach().to("cpu").tolist()
+        _seq_id_cpu = seq_id_per_query.detach().to("cpu").tolist()
+        print(
+            f"[TQ_ATTN #{_TQ_ATTN_DEBUG_COUNTER[0]} derived] "
+            f"query_lens={query_lens.detach().to('cpu').tolist()} "
+            f"prefix_len={prefix_len_per_seq_i64.detach().to('cpu').tolist()} "
+            f"seq_id_per_query[:16]={_seq_id_cpu[:16]} "
+            f"kv_end_per_query[:16]={_kv_end_cpu[:16]} "
+            f"kv_end_per_query[-1]={_kv_end_cpu[-1] if _kv_end_cpu else None}",
+            flush=True,
+        )
 
     out = torch.empty_like(q)
     grid = (num_query_tokens, num_heads_q)
