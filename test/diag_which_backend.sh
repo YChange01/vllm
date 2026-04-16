@@ -41,8 +41,7 @@ setsid vllm serve "$MODEL" \
     >"$LOG" 2>&1 &
 CURRENT_PGID=$!
 
-# Wait up to ~6 minutes for the server to finish initializing. We want
-# ALL attention-related log lines, which only land after model load.
+# Wait for /health.
 echo "[which] waiting for /health ..."
 for _ in $(seq 1 72); do
     if curl -sf "http://localhost:${PORT}/health" >/dev/null 2>&1; then
@@ -56,8 +55,16 @@ for _ in $(seq 1 72); do
     sleep 5
 done
 
-# Let any final initialization messages flush.
-sleep 5
+# Fire a REAL completion so forward() actually runs with real slot_mapping.
+echo "[which] sending real completion request ..."
+unset http_proxy https_proxy all_proxy 2>/dev/null || true
+curl -s "http://localhost:${PORT}/v1/completions" \
+    -H 'Content-Type: application/json' \
+    -d "{\"model\":\"${MODEL}\",\"prompt\":\"Hello\",\"max_tokens\":4,\"temperature\":0}" \
+    > "$ROOT_DIR/diag_which_response.json" 2>&1 || true
+echo "[which] response saved to $ROOT_DIR/diag_which_response.json"
+
+sleep 3
 
 kill -TERM -"$CURRENT_PGID" 2>/dev/null || true
 wait "$CURRENT_PGID" 2>/dev/null || true
@@ -72,9 +79,20 @@ echo "[which] log lines: $(wc -l < "$LOG")  bytes: $(wc -c < "$LOG")"
 echo "==================================================================="
 
 echo ""
-echo "-- TURBOQUANT_DBG lines --"
-grep -na "TURBOQUANT_DBG" "$LOG" | _short 10
-echo "count: $(grep -c "TURBOQUANT_DBG" "$LOG" || true)"
+echo "-- model-load marker --"
+grep -na "TURBOQUANT_DBG\] # module" "$LOG" | _short 5
+
+echo ""
+echo "-- REAL store/fwd entries (num_tokens != 8192, excludes profile warmup) --"
+grep -na "TURBOQUANT_DBG" "$LOG" \
+    | grep -v "num_tokens=8192" \
+    | _short 20
+
+echo ""
+echo "-- Real completion response --"
+if [ -f "$ROOT_DIR/diag_which_response.json" ]; then
+    cat "$ROOT_DIR/diag_which_response.json" | cut -c1-300
+fi
 
 echo ""
 echo "-- backend / attention selection --"
