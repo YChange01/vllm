@@ -277,6 +277,13 @@ def turboquant_paged_attention(
     BLOCK_BS = block_size
     OUT_DTYPE = tl.bfloat16 if q.dtype == torch.bfloat16 else tl.float16
 
+    # Use actual max blocks from seq_lens, not the pre-allocated block_table
+    # width (which can be huge, e.g. 2560 for max_seq_len=40960). Using the
+    # allocation size as tl.static_range bound causes Triton to unroll 40K+
+    # iterations and hang during compilation.
+    actual_max_seq = int(seq_lens.max().item())
+    actual_max_blocks = (actual_max_seq + block_size - 1) // block_size
+
     _dequant_and_attend_kernel[grid](
         q,
         cache_k,
@@ -293,7 +300,7 @@ def turboquant_paged_attention(
         num_heads_kv=num_heads_kv,
         head_size=head_size,
         block_size=block_size,
-        max_blocks_per_seq=max_blocks_per_seq,
+        max_blocks_per_seq=actual_max_blocks,
         BLOCK_D=BLOCK_D,
         BLOCK_BS=BLOCK_BS,
     )
