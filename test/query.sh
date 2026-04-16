@@ -4,7 +4,7 @@
 
 MODEL="/mnt/nvme3n1/g00872988/models/Qwen3-0.6B"
 PROMPT="${1:-Hello}"
-PORT="${2:-8000}"
+PORT="${2:-8009}"
 
 echo "[health check]"
 curl -s http://localhost:${PORT}/health && echo ""
