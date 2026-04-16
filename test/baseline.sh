@@ -1,16 +1,17 @@
 #!/usr/bin/env bash
-# Baseline comparison: run the SAME prompt through FLASH_ATTN and TURBOQUANT
-# backends and print both completions side by side.
+# Baseline comparison: same prompt through three configurations.
 #
-# This script never kills any process. It only starts two background vllm
-# servers (FLASH_ATTN on $FP_PORT, TURBOQUANT on $TQ_PORT) and queries both.
-# Both servers stay alive after the script exits -- clean them up yourself
-# when you are done. Their PIDs are printed so you can find them.
+#   1. FLASH_ATTN           (fp reference)
+#   2. TURBOQUANT  b=8      (8-bit Lloyd-Max, default)
+#   3. TURBOQUANT  b=4      (4-bit Lloyd-Max, TURBOQUANT_BITS=4)
 #
-# Prerequisites (YOU manage these):
-#   - ports $FP_PORT (8010) and $TQ_PORT (8009) are free
-#   - GPU is free of stale engines (prior EngineCore processes killed)
-#   - proxy env vars unset if localhost must bypass corp proxy
+# Each server is started with setsid so it has its own process group; at
+# the end of that stage we kill the WHOLE group (signal -TERM to -PGID)
+# so stray EngineCore children cannot leak. We never pkill anything else.
+#
+# Prerequisite (user manages these):
+#   - ports 8009 and 8010 must be free
+#   - any prior zombies must be cleaned up already
 #
 # Usage:
 #   bash test/baseline.sh                         # defaults
@@ -29,10 +30,25 @@ TQ_PORT=8009
 
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 FP_LOG="$ROOT_DIR/baseline_fp.log"
-TQ_LOG="$ROOT_DIR/baseline_tq.log"
+TQ8_LOG="$ROOT_DIR/baseline_tq8.log"
+TQ4_LOG="$ROOT_DIR/baseline_tq4.log"
 
-# --- wait-for-health helper ---------------------------------------------
-# $1: port, $2: log path, $3: pid (for liveness check via ps, no signals)
+# Track the running server's process-group id so cleanup can kill the
+# whole group on early exit / Ctrl-C. Empty string = nothing to kill.
+CURRENT_PGID=""
+
+cleanup() {
+    local code=$?
+    if [ -n "$CURRENT_PGID" ]; then
+        echo "[baseline] interrupted; stopping process group $CURRENT_PGID"
+        kill -TERM -"$CURRENT_PGID" 2>/dev/null || true
+        wait "$CURRENT_PGID" 2>/dev/null || true
+    fi
+    exit "$code"
+}
+trap cleanup EXIT INT TERM
+
+# ---- wait for /health, using ps to probe liveness (no signals) ----------
 wait_healthy() {
     local port="$1" log="$2" pid="$3"
     for _ in $(seq 1 72); do   # up to 6 minutes
@@ -51,7 +67,7 @@ wait_healthy() {
     return 1
 }
 
-# --- query helper --------------------------------------------------------
+# ---- POST one completion ------------------------------------------------
 query_completion() {
     local port="$1"
     curl -s "http://localhost:${port}/v1/completions" \
@@ -59,65 +75,83 @@ query_completion() {
         -d "{\"model\":\"${MODEL}\",\"prompt\":\"${PROMPT}\",\"max_tokens\":${MAX_TOKENS},\"temperature\":0}"
 }
 
+parse_text() {
+    python3 -c 'import sys,json;print(json.load(sys.stdin)["choices"][0]["text"])' 2>/dev/null \
+        || echo "<parse failed>"
+}
+
+# ---- run one backend end-to-end -----------------------------------------
+# Globals read:  MODEL MAX_LEN CURRENT_PGID
+# Globals written: CURRENT_PGID, <OUT_VAR>
+# $1 label, $2 port, $3 log, $4 backend, $5 extra env (e.g. TURBOQUANT_BITS=4), $6 out-var name
+run_backend() {
+    local label="$1" port="$2" log="$3" backend="$4" extra_env="$5" out_var="$6"
+
+    echo ""
+    echo "[baseline] starting $label on port $port ..."
+    : > "$log"
+
+    # setsid makes the subprocess a new session leader (PID == PGID), so
+    # killing -PGID later reliably takes out the EngineCore children too.
+    if [ -n "$extra_env" ]; then
+        env $extra_env setsid vllm serve "$MODEL" \
+            --port "$port" \
+            --enforce-eager \
+            --attention-backend "$backend" \
+            --max-model-len "$MAX_LEN" \
+            --gpu-memory-utilization 0.3 \
+            >>"$log" 2>&1 &
+    else
+        setsid vllm serve "$MODEL" \
+            --port "$port" \
+            --enforce-eager \
+            --attention-backend "$backend" \
+            --max-model-len "$MAX_LEN" \
+            --gpu-memory-utilization 0.3 \
+            >>"$log" 2>&1 &
+    fi
+    CURRENT_PGID=$!
+
+    if ! wait_healthy "$port" "$log" "$CURRENT_PGID"; then
+        # trap cleanup will kill the group on exit
+        exit 1
+    fi
+
+    local out text
+    out=$(query_completion "$port")
+    text=$(echo "$out" | parse_text)
+    echo "[baseline] $label raw: $out"
+    echo "[baseline] $label text: $text"
+    printf -v "$out_var" '%s' "$text"
+
+    # Stop this server's entire process group so the next stage starts clean.
+    echo "[baseline] stopping $label process group $CURRENT_PGID"
+    kill -TERM -"$CURRENT_PGID" 2>/dev/null || true
+    wait "$CURRENT_PGID" 2>/dev/null || true
+    CURRENT_PGID=""
+    # Give the driver a moment to free KV cache / allocator state.
+    sleep 3
+}
+
+# ---- main ---------------------------------------------------------------
 export CUDA_VISIBLE_DEVICES="$GPU"
 echo "[baseline] model=$MODEL prompt='$PROMPT' max_tokens=$MAX_TOKENS gpu=$GPU"
-echo "[baseline] fp log -> $FP_LOG"
-echo "[baseline] tq log -> $TQ_LOG"
-: > "$FP_LOG"
-: > "$TQ_LOG"
+echo "[baseline] logs: $FP_LOG  $TQ8_LOG  $TQ4_LOG"
 
-# ========== 1) FLASH_ATTN baseline (port 8010) ===========================
-echo ""
-echo "[baseline] starting FLASH_ATTN serve on port $FP_PORT ..."
-(
-    cd "$ROOT_DIR"
-    vllm serve "$MODEL" \
-        --port "$FP_PORT" \
-        --enforce-eager \
-        --attention-backend FLASH_ATTN \
-        --max-model-len "$MAX_LEN" \
-        --gpu-memory-utilization 0.3 \
-        >>"$FP_LOG" 2>&1
-) &
-FP_PID=$!
-echo "[baseline] FLASH_ATTN pid=$FP_PID  (NOT auto-stopped; you manage it)"
-wait_healthy "$FP_PORT" "$FP_LOG" "$FP_PID" || exit 1
+FP_TEXT=""
+TQ8_TEXT=""
+TQ4_TEXT=""
 
-echo "[baseline] FLASH_ATTN query:"
-FP_OUT=$(query_completion "$FP_PORT")
-echo "$FP_OUT"
-FP_TEXT=$(echo "$FP_OUT" | python3 -c 'import sys,json;print(json.load(sys.stdin)["choices"][0]["text"])' 2>/dev/null || echo "<parse failed>")
-
-# ========== 2) TURBOQUANT (port 8009) ====================================
-echo ""
-echo "[baseline] starting TURBOQUANT serve on port $TQ_PORT ..."
-(
-    cd "$ROOT_DIR"
-    vllm serve "$MODEL" \
-        --port "$TQ_PORT" \
-        --enforce-eager \
-        --attention-backend TURBOQUANT \
-        --max-model-len "$MAX_LEN" \
-        --gpu-memory-utilization 0.3 \
-        >>"$TQ_LOG" 2>&1
-) &
-TQ_PID=$!
-echo "[baseline] TURBOQUANT pid=$TQ_PID  (NOT auto-stopped; you manage it)"
-wait_healthy "$TQ_PORT" "$TQ_LOG" "$TQ_PID" || exit 1
-
-echo "[baseline] TURBOQUANT query:"
-TQ_OUT=$(query_completion "$TQ_PORT")
-echo "$TQ_OUT"
-TQ_TEXT=$(echo "$TQ_OUT" | python3 -c 'import sys,json;print(json.load(sys.stdin)["choices"][0]["text"])' 2>/dev/null || echo "<parse failed>")
+run_backend "FLASH_ATTN"        "$FP_PORT" "$FP_LOG"  FLASH_ATTN  ""                  FP_TEXT
+run_backend "TURBOQUANT b=8"    "$TQ_PORT" "$TQ8_LOG" TURBOQUANT  "TURBOQUANT_BITS=8" TQ8_TEXT
+run_backend "TURBOQUANT b=4"    "$TQ_PORT" "$TQ4_LOG" TURBOQUANT  "TURBOQUANT_BITS=4" TQ4_TEXT
 
 echo ""
 echo "========================== SIDE-BY-SIDE =========================="
-echo "prompt:       ${PROMPT}"
-echo "max_tokens:   ${MAX_TOKENS}  (temperature=0, greedy decoding)"
-echo "FLASH_ATTN:   ${FP_TEXT}"
-echo "TURBOQUANT:   ${TQ_TEXT}"
+echo "prompt:          ${PROMPT}"
+echo "max_tokens:      ${MAX_TOKENS}  (temperature=0, greedy decoding)"
+echo "FLASH_ATTN:      ${FP_TEXT}"
+echo "TURBOQUANT b=8:  ${TQ8_TEXT}"
+echo "TURBOQUANT b=4:  ${TQ4_TEXT}"
 echo "=================================================================="
-echo "[baseline] full logs at: $FP_LOG  $TQ_LOG"
-echo "[baseline] both servers still running:"
-echo "[baseline]   FLASH_ATTN  pid=$FP_PID  port=$FP_PORT"
-echo "[baseline]   TURBOQUANT  pid=$TQ_PID  port=$TQ_PORT"
+echo "[baseline] done; all three servers have been stopped."
