@@ -426,4 +426,61 @@ def turboquant_paged_attention(
         BLOCK_D=BLOCK_D,
         BLOCK_BS=BLOCK_BS,
     )
+
+    # --- optional inline verification against a pure-PyTorch reference ----
+    # Enable with TQ_VERIFY=1 in the server env. This is slow (O(N^2) per
+    # call) but answers the last remaining question: given the EXACT tensors
+    # vLLM hands us, does the Triton kernel output match the mathematical
+    # reference? If diff is tiny, the bug is downstream of us.
+    if int(os.environ.get("TQ_VERIFY", "0")) and num_query_tokens <= 128:
+        with torch.no_grad():
+            cb_ref = codebook.codebook.to(torch.float32)
+            H_ref = codebook.H.to(torch.float32)
+            signs_ref = codebook.signs.to(torch.float32)
+            max_seq_for_ref = int(seq_lens.max().item())
+            # Dequantise K for sequence 0 up to max_seq_for_ref.
+            k_ref = torch.zeros(
+                max_seq_for_ref, num_heads_kv, head_size,
+                dtype=torch.float32, device=q.device,
+            )
+            v_ref = torch.zeros_like(k_ref)
+            for pos in range(max_seq_for_ref):
+                bi = pos // block_size
+                toff = pos % block_size
+                phys = int(block_table[0, bi].item())
+                for h in range(num_heads_kv):
+                    idx = cache_k[phys, toff, h].long()
+                    rk = cb_ref[idx]
+                    k_unrot = rk @ H_ref
+                    k_unit = k_unrot * signs_ref
+                    k_norm_h = float(cache_k_norm[phys, toff, h].item())
+                    k_ref[pos, h] = k_unit * (k_norm_h * inv_sqrt_d)
+                    v_ref[pos, h] = cache_v[phys, toff, h].float()
+
+            # Pure-PyTorch causal attention
+            gqa = num_heads_q // num_heads_kv
+            ref_out = torch.zeros_like(q, dtype=torch.float32)
+            for qi in range(num_query_tokens):
+                kv_end_i = int(kv_end_per_query[qi].item())
+                for h in range(num_heads_q):
+                    kh = h // gqa
+                    qv = q[qi, h].float()
+                    kk = k_ref[:kv_end_i, kh]
+                    vv = v_ref[:kv_end_i, kh]
+                    sc = (qv @ kk.T) * scale
+                    w = torch.softmax(sc, dim=-1)
+                    ref_out[qi, h] = w @ vv
+
+            diff = (out.float() - ref_out).abs()
+            ref_abs_mean = ref_out.abs().mean().clamp(min=1e-6)
+            print(
+                f"[TQ_VERIFY] num_q={num_query_tokens} "
+                f"max_abs_err={float(diff.max().item()):.4f} "
+                f"mean_abs_err={float(diff.mean().item()):.4f} "
+                f"rel_err={float((diff.mean() / ref_abs_mean).item()):.4%} "
+                f"out_std={float(out.float().std().item()):.4f} "
+                f"ref_std={float(ref_out.std().item()):.4f} "
+                f"q_std={float(q.float().std().item()):.4f}",
+                flush=True,
+            )
     return out
