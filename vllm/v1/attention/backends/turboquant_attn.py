@@ -209,6 +209,44 @@ class TurboQuantAttentionImpl(AttentionImpl):
             )
         return self._codebook
 
+    def _get_cache_views(self, kv_cache: torch.Tensor):
+        """Split kv_cache into K (uint8 idx) and V (fp16/bf16) views."""
+        cache_k_idx = kv_cache[0].view(torch.uint8)[
+            ..., : self.head_size
+        ].contiguous()
+        cache_v = kv_cache[1]
+        return cache_k_idx, cache_v
+
+    def do_kv_cache_update(
+        self,
+        layer: AttentionLayer,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        kv_cache: torch.Tensor,
+        slot_mapping: torch.Tensor,
+    ) -> None:
+        from vllm.turboquant.triton_kernels import turboquant_store_kv
+
+        if self.attn_type in (AttentionType.ENCODER_ONLY, AttentionType.ENCODER):
+            return
+
+        num_tokens = key.shape[0]
+        k = key.view(num_tokens, self.num_kv_heads, self.head_size)
+        v = value.view(num_tokens, self.num_kv_heads, self.head_size)
+
+        codebook = self._ensure_codebook(key.dtype, key.device)
+        cache_k_idx, cache_v = self._get_cache_views(kv_cache)
+
+        turboquant_store_kv(
+            new_k=k,
+            new_v=v,
+            cache_k=cache_k_idx,
+            cache_v=cache_v,
+            slot_mapping=slot_mapping,
+            codebook=codebook,
+            block_size=kv_cache.shape[2],
+        )
+
     def forward(
         self,
         layer: AttentionLayer,
@@ -227,38 +265,16 @@ class TurboQuantAttentionImpl(AttentionImpl):
             )
 
         if attn_metadata is None:
-            # Profile / warmup pass: vLLM calls forward with None metadata to
-            # probe shapes. Return zeros.
             output.zero_()
             return output
 
-        from vllm.turboquant.triton_kernels import (
-            turboquant_paged_attention,
-            turboquant_store_kv,
-        )
+        from vllm.turboquant.triton_kernels import turboquant_paged_attention
 
         num_tokens = query.shape[0]
         q = query.view(num_tokens, self.num_heads, self.head_size)
-        k = key.view(num_tokens, self.num_kv_heads, self.head_size)
-        v = value.view(num_tokens, self.num_kv_heads, self.head_size)
 
         codebook = self._ensure_codebook(query.dtype, query.device)
-
-        # kv_cache[0] == K slab, kv_cache[1] == V slab.
-        # We reinterpret the K slab as uint8 idx (see MVP caveat above).
-        cache_k_idx = kv_cache[0].view(torch.uint8)[..., : self.head_size].contiguous()
-        cache_v = kv_cache[1]
-        block_size = kv_cache.shape[2]
-
-        turboquant_store_kv(
-            new_k=k,
-            new_v=v,
-            cache_k=cache_k_idx,
-            cache_v=cache_v,
-            slot_mapping=attn_metadata.slot_mapping,
-            codebook=codebook,
-            block_size=block_size,
-        )
+        cache_k_idx, cache_v = self._get_cache_views(kv_cache)
 
         attn_out = turboquant_paged_attention(
             q=q,
