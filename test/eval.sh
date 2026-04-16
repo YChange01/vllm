@@ -20,8 +20,13 @@ set -u
 
 MODEL="${MODEL:-/mnt/nvme3n1/g00872988/models/Qwen3-0.6B}"
 GPU="${GPU:-3}"
-MAX_LEN="${MAX_LEN:-16384}"
-GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.5}"
+# NOTE: TurboQuant currently allocates a SEPARATE uint8 _k_idx buffer per
+# attention layer on top of vLLM's native bf16 KV cache. That roughly
+# doubles KV-cache memory for this backend. Keep max_model_len and
+# gpu_memory_utilization modest so the extra buffers fit -- override with
+# MAX_LEN=... GPU_MEM_UTIL=... when running at longer contexts.
+MAX_LEN="${MAX_LEN:-4096}"
+GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.3}"
 
 CTX="${CTX:-512,2048,4096}"
 POSITIONS="${POSITIONS:-0.1,0.5,0.9}"

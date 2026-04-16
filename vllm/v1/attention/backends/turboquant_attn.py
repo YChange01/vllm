@@ -230,14 +230,32 @@ class TurboQuantAttentionImpl(AttentionImpl):
             num_blocks = kv_cache.shape[1]
             block_size = kv_cache.shape[2]
             device = kv_cache.device
-            self._k_idx = torch.zeros(
-                num_blocks, block_size, self.num_kv_heads, self.head_size,
-                dtype=torch.uint8, device=device,
-            )
-            self._k_norms = torch.zeros(
-                num_blocks, block_size, self.num_kv_heads,
-                dtype=torch.float32, device=device,
-            )
+            k_idx_bytes = num_blocks * block_size * self.num_kv_heads * self.head_size
+            k_norms_bytes = num_blocks * block_size * self.num_kv_heads * 4
+            try:
+                self._k_idx = torch.zeros(
+                    num_blocks, block_size, self.num_kv_heads, self.head_size,
+                    dtype=torch.uint8, device=device,
+                )
+                self._k_norms = torch.zeros(
+                    num_blocks, block_size, self.num_kv_heads,
+                    dtype=torch.float32, device=device,
+                )
+            except torch.cuda.OutOfMemoryError as e:
+                # Extra context: this backend allocates a SEPARATE uint8 _k_idx
+                # buffer per layer on top of vLLM's native bf16 KV slab, so the
+                # effective KV memory is ~1.5x. If you hit this, lower
+                # --max-model-len or --gpu-memory-utilization, or free up the
+                # GPU first (stray EngineCore from a previous run is a common
+                # cause). Per-layer budget here:
+                raise torch.cuda.OutOfMemoryError(
+                    f"TurboQuant failed to allocate _k_idx "
+                    f"({k_idx_bytes / 2**20:.1f} MiB uint8) + _k_norms "
+                    f"({k_norms_bytes / 2**20:.1f} MiB fp32) on top of "
+                    f"vLLM's existing KV cache. num_blocks={num_blocks}, "
+                    f"block_size={block_size}, num_kv_heads={self.num_kv_heads}, "
+                    f"head_size={self.head_size}. Original error: {e}"
+                ) from e
         return self._k_idx, self._k_norms
 
     def do_kv_cache_update(
