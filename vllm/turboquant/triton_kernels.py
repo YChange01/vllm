@@ -112,20 +112,21 @@ def _quantize_and_store_kernel(
 
 @triton.jit
 def _dequant_and_attend_kernel(
-    q_ptr,                # (num_seqs, num_heads_q, head_size) fp16/bf16
-    cache_k_ptr,          # (num_blocks, block_size, num_heads_kv, head_size) uint8
-    cache_v_ptr,          # (num_blocks, block_size, num_heads_kv, head_size) fp16/bf16
-    cache_k_norm_ptr,     # (num_blocks, block_size, num_heads_kv) fp32
-    block_table_ptr,      # (num_seqs, block_table_stride) int32
-    seq_lens_ptr,         # (num_seqs,) int32
-    codebook_ptr,         # (K_CB,) fp32
-    hadamard_ptr,         # (head_size, head_size) fp16/bf16
-    signs_ptr,            # (head_size,) fp16/bf16
-    out_ptr,              # (num_seqs, num_heads_q, head_size) fp16/bf16
-    scale,                # fp32 scalar, 1 / sqrt(head_size)
-    inv_sqrt_d,           # fp32 scalar, 1 / sqrt(head_size) for norm restoration
-    max_blocks_per_seq,   # runtime int: loop bound; keep SMALL for speed
-    block_table_stride,   # runtime int: real row stride of block_table
+    q_ptr,                  # (num_query_tokens, num_heads_q, head_size) fp16/bf16
+    cache_k_ptr,            # (num_blocks, block_size, num_heads_kv, head_size) uint8
+    cache_v_ptr,            # (num_blocks, block_size, num_heads_kv, head_size) fp16/bf16
+    cache_k_norm_ptr,       # (num_blocks, block_size, num_heads_kv) fp32
+    block_table_ptr,        # (num_seqs, block_table_stride) int32
+    seq_id_per_query_ptr,   # (num_query_tokens,) int32 : which seq each q belongs to
+    kv_end_per_query_ptr,   # (num_query_tokens,) int32 : causal kv upper bound for each q
+    codebook_ptr,           # (K_CB,) fp32
+    hadamard_ptr,           # (head_size, head_size) fp16/bf16
+    signs_ptr,              # (head_size,) fp16/bf16
+    out_ptr,                # (num_query_tokens, num_heads_q, head_size) fp16/bf16
+    scale,                  # fp32 scalar, 1 / sqrt(head_size)
+    inv_sqrt_d,             # fp32 scalar, 1 / sqrt(head_size) for norm restoration
+    max_blocks_per_seq,     # runtime int: loop bound; keep SMALL for speed
+    block_table_stride,     # runtime int: real row stride of block_table
     OUT_DTYPE: tl.constexpr,
     num_heads_q: tl.constexpr,
     num_heads_kv: tl.constexpr,
@@ -134,32 +135,41 @@ def _dequant_and_attend_kernel(
     BLOCK_D: tl.constexpr,
     BLOCK_BS: tl.constexpr,
 ):
-    """One program = one (seq, q_head).
+    """One program = one (query_token, q_head).
 
-    IMPORTANT:
-      * max_blocks_per_seq is the RUNTIME loop bound (use a Python for-range,
-        not tl.static_range, so Triton emits a real loop instead of
-        unrolling the body ~max_blocks_per_seq * BLOCK_BS times). Before this
-        fix, ctx=512 unrolled ~480 iterations each containing a 128x128
-        matvec, and Triton's JIT compile stalled for tens of minutes.
-      * block_table_stride is the ACTUAL row stride of block_table (typically
-        max_model_len // block_size from the metadata builder). Do NOT
-        reuse max_blocks_per_seq here -- that was the earlier silent bug
-        where prefill with num_seqs > 1 read the wrong rows of block_table.
+    Varlen-aware: grid.x spans ALL query tokens across ALL sequences in the
+    batch (num_actual_tokens from vLLM metadata). Each program:
+      1. reads its sequence id from ``seq_id_per_query``
+      2. reads its causal kv upper bound from ``kv_end_per_query`` (for
+         pure decode this equals seq_lens[seq]; for prefill position p in
+         seq s it equals prefix_len[s] + p + 1)
+      3. indexes block_table at row seq_idx, stride block_table_stride
+      4. attends only to cache positions [0, kv_end)
+
+    Earlier revisions treated ``program_id(0)`` as "sequence index" and
+    pulled ``seq_lens[seq_idx]``, which was correct for decode (num_seqs==1
+    case) but broken for multi-token prefill (all query tokens live in the
+    same sequence so seq_idx > 0 overran seq_lens and skipped the causal
+    mask). This version is the first to handle prefill properly.
+
+    ``max_blocks_per_seq`` is kept as a runtime int so the outer loop
+    stays a real loop -- unrolling at ctx=512 is what made Triton JIT
+    hang for tens of minutes.
     """
-    seq_idx = tl.program_id(0)
+    q_idx = tl.program_id(0)
     qh_idx = tl.program_id(1)
 
     gqa_group = num_heads_q // num_heads_kv
     kvh_idx = qh_idx // gqa_group
 
-    seq_len = tl.load(seq_lens_ptr + seq_idx)
-    num_blocks = (seq_len + block_size - 1) // block_size
+    seq_idx = tl.load(seq_id_per_query_ptr + q_idx)
+    kv_end = tl.load(kv_end_per_query_ptr + q_idx)
+    num_blocks = (kv_end + block_size - 1) // block_size
 
     d_idx = tl.arange(0, BLOCK_D)
     mask_d = d_idx < head_size
 
-    q_off = (seq_idx * num_heads_q + qh_idx) * head_size + d_idx
+    q_off = (q_idx * num_heads_q + qh_idx) * head_size + d_idx
     q = tl.load(q_ptr + q_off, mask=mask_d, other=0.0).to(tl.float32)
 
     signs = tl.load(signs_ptr + d_idx, mask=mask_d, other=1.0).to(tl.float32)
@@ -182,7 +192,7 @@ def _dequant_and_attend_kernel(
 
             for tok_in_block in tl.static_range(0, BLOCK_BS):
                 abs_pos = block_i * block_size + tok_in_block
-                if abs_pos < seq_len:
+                if abs_pos < kv_end:
                     base = (
                         phys_block * block_size * num_heads_kv * head_size
                         + tok_in_block * num_heads_kv * head_size
@@ -218,7 +228,7 @@ def _dequant_and_attend_kernel(
                     m_i = m_new
 
     out_vec = acc / tl.maximum(l_i, 1e-12)
-    out_off = (seq_idx * num_heads_q + qh_idx) * head_size + d_idx
+    out_off = (q_idx * num_heads_q + qh_idx) * head_size + d_idx
     tl.store(out_ptr + out_off, out_vec.to(OUT_DTYPE), mask=mask_d)
 
 
@@ -268,11 +278,31 @@ def turboquant_paged_attention(
     cache_k_norm: torch.Tensor,
     block_table: torch.Tensor,
     seq_lens: torch.Tensor,
+    query_start_loc: torch.Tensor,
     codebook: GaussianCodebook,
     scale: float | None = None,
 ) -> torch.Tensor:
-    num_seqs, num_heads_q, head_size = q.shape
+    """Paged attention with dequant-on-the-fly K cache, varlen-aware.
+
+    q shape: (num_query_tokens, num_heads_q, head_size)
+        num_query_tokens is the SUM of query lengths across all sequences
+        in the batch (== vLLM's num_actual_tokens). For pure decode this
+        equals num_seqs; for prefill it can be arbitrarily larger.
+
+    Varlen metadata:
+        seq_lens:        (num_seqs,)    int, total context length per seq
+        query_start_loc: (num_seqs+1,)  int, cumulative query-token offsets
+
+    We derive per-query-token tensors on-device:
+        seq_id_per_query[i]   = which sequence query token i belongs to
+        kv_end_per_query[i]   = causal upper bound, i.e. prefix_len[s] + p + 1
+                                where s = seq_id_per_query[i] and p is the
+                                within-sequence position of token i.
+    """
+    num_query_tokens, num_heads_q, head_size = q.shape
     _, block_size, num_heads_kv, _ = cache_k.shape
+    num_seqs = int(seq_lens.shape[0])
+
     if scale is None:
         scale = 1.0 / (head_size ** 0.5)
     inv_sqrt_d = 1.0 / (head_size ** 0.5)
@@ -281,8 +311,25 @@ def turboquant_paged_attention(
     if codebook_f32.dtype != torch.float32:
         codebook_f32 = codebook_f32.to(torch.float32)
 
+    # --- per-query metadata (all on-device, vectorised) ------------------
+    # query_lens[s] = #query tokens contributed by sequence s in this batch
+    qsl = query_start_loc.to(torch.int32)
+    query_lens = qsl[1:] - qsl[:-1]                                # (num_seqs,)
+    seq_ids = torch.arange(num_seqs, dtype=torch.int32, device=q.device)
+    seq_id_per_query = torch.repeat_interleave(seq_ids, query_lens)  # (num_q,)
+    # Position WITHIN sequence for each query token:
+    q_pos_per_query = (
+        torch.arange(num_query_tokens, dtype=torch.int32, device=q.device)
+        - qsl[:-1][seq_id_per_query]
+    )
+    # prefix_len[s] = tokens already in cache BEFORE this batch's queries.
+    prefix_len_per_seq = seq_lens.to(torch.int32) - query_lens     # (num_seqs,)
+    kv_end_per_query = (
+        prefix_len_per_seq[seq_id_per_query] + q_pos_per_query + 1
+    ).to(torch.int32)
+
     out = torch.empty_like(q)
-    grid = (num_seqs, num_heads_q)
+    grid = (num_query_tokens, num_heads_q)
     BLOCK_D = triton.next_power_of_2(head_size)
     BLOCK_BS = block_size
     OUT_DTYPE = tl.bfloat16 if q.dtype == torch.bfloat16 else tl.float16
@@ -291,7 +338,7 @@ def turboquant_paged_attention(
     actual_max_blocks = (actual_max_seq + block_size - 1) // block_size
     # block_table is laid out with the scheduler's full per-seq stride
     # (typically max_model_len // block_size). The kernel must use THIS
-    # stride to index rows; it must use `actual_max_blocks` only as the
+    # stride to index rows; it must use actual_max_blocks only as the
     # runtime loop bound so Triton does not unroll the entire stride.
     block_table_stride = int(block_table.shape[1])
 
@@ -301,7 +348,8 @@ def turboquant_paged_attention(
         cache_v,
         cache_k_norm,
         block_table,
-        seq_lens,
+        seq_id_per_query,
+        kv_end_per_query,
         codebook_f32,
         codebook.H,
         codebook.signs,

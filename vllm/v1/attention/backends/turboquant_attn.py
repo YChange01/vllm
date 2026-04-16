@@ -316,6 +316,7 @@ class TurboQuantAttentionImpl(AttentionImpl):
             cache_k_norm=k_norms,
             block_table=attn_metadata.block_table,
             seq_lens=attn_metadata.seq_lens,
+            query_start_loc=attn_metadata.query_start_loc,
             codebook=codebook,
             scale=self.scale,
         )
