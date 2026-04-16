@@ -114,7 +114,7 @@ class TurboQuantAttentionBackend(AttentionBackend):
             return True
         return block_size % 16 == 0
 
-    forward_includes_kv_cache_update: bool = False
+    forward_includes_kv_cache_update: bool = True
 
     @staticmethod
     def get_name() -> str:
@@ -292,6 +292,13 @@ class TurboQuantAttentionImpl(AttentionImpl):
         if attn_metadata is None:
             output.zero_()
             return output
+
+        # With forward_includes_kv_cache_update=True, vLLM skips the separate
+        # do_kv_cache_update() call. We must store K/V here ourselves.
+        if key is not None and value is not None:
+            self.do_kv_cache_update(
+                layer, key, value, kv_cache, attn_metadata.slot_mapping
+            )
 
         from vllm.turboquant.triton_kernels import turboquant_paged_attention
 
