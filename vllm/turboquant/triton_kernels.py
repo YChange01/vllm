@@ -312,21 +312,29 @@ def turboquant_paged_attention(
         codebook_f32 = codebook_f32.to(torch.float32)
 
     # --- per-query metadata (all on-device, vectorised) ------------------
-    # query_lens[s] = #query tokens contributed by sequence s in this batch
-    qsl = query_start_loc.to(torch.int32)
+    # Everything downstream needs to live on the same device as q and use
+    # int64 for index ops / int32 only for the final kernel-arg tensors.
+    # torch.repeat_interleave requires the `repeats` tensor to be Long, and
+    # advanced indexing with int32 indices has been quirky across torch
+    # versions -- use int64 throughout the host-side math, cast to int32
+    # only when handing tensors to the kernel.
+    dev = q.device
+    qsl = query_start_loc.to(device=dev, dtype=torch.int64)
     query_lens = qsl[1:] - qsl[:-1]                                # (num_seqs,)
-    seq_ids = torch.arange(num_seqs, dtype=torch.int32, device=q.device)
-    seq_id_per_query = torch.repeat_interleave(seq_ids, query_lens)  # (num_q,)
-    # Position WITHIN sequence for each query token:
-    q_pos_per_query = (
-        torch.arange(num_query_tokens, dtype=torch.int32, device=q.device)
-        - qsl[:-1][seq_id_per_query]
+    seq_ids = torch.arange(num_seqs, dtype=torch.int64, device=dev)
+    seq_id_per_query_i64 = torch.repeat_interleave(seq_ids, query_lens)  # (num_q,)
+    q_pos_per_query_i64 = (
+        torch.arange(num_query_tokens, dtype=torch.int64, device=dev)
+        - qsl[:-1][seq_id_per_query_i64]
     )
-    # prefix_len[s] = tokens already in cache BEFORE this batch's queries.
-    prefix_len_per_seq = seq_lens.to(torch.int32) - query_lens     # (num_seqs,)
-    kv_end_per_query = (
-        prefix_len_per_seq[seq_id_per_query] + q_pos_per_query + 1
-    ).to(torch.int32)
+    prefix_len_per_seq_i64 = seq_lens.to(device=dev, dtype=torch.int64) - query_lens
+    kv_end_per_query_i64 = (
+        prefix_len_per_seq_i64[seq_id_per_query_i64] + q_pos_per_query_i64 + 1
+    )
+
+    # Kernel expects int32 pointers.
+    seq_id_per_query = seq_id_per_query_i64.to(torch.int32).contiguous()
+    kv_end_per_query = kv_end_per_query_i64.to(torch.int32).contiguous()
 
     out = torch.empty_like(q)
     grid = (num_query_tokens, num_heads_q)
