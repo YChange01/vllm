@@ -38,7 +38,7 @@ if TYPE_CHECKING:
     from vllm.turboquant.codebook import GaussianCodebook
 
 
-_NEG_LARGE: tl.constexpr = -1.0e30
+_NEG_LARGE = tl.constexpr(-1.0e30)
 
 
 @triton.jit
