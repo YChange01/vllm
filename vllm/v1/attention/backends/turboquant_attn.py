@@ -170,12 +170,15 @@ class TurboQuantAttentionBackend(AttentionBackend):
     def supports_block_size(cls, block_size: int | None) -> bool:
         return block_size is None or block_size % 16 == 0
 
-    # Matches flash_attn / triton_attn: the wrapper drives `do_kv_cache_update`
-    # externally with the proper per-layer `forward_context.slot_mapping`,
-    # and `forward` only runs attend. Setting this True silently diverts the
-    # wrapper path and made our own forward-side KV update race the attend,
-    # producing deterministic gibberish (`://24`) regardless of quant bits.
-    forward_includes_kv_cache_update: bool = False
+    # IMPORTANT: must be True.
+    # We own a SEPARATE `_k_fp`/`_k_idx` buffer (not vllm's kv_cache), so we
+    # need `forward` to receive `key`/`value` every call and store them
+    # ourselves. With False, vllm uses `unified_kv_cache_update` -> ideal for
+    # backends that write into vllm's kv_cache, but NOT called on every
+    # decode step when async scheduling is on -- observed: decode step 2 was
+    # missing a `do_kv_cache_update` call for slot 19, leaving our buffer
+    # zero at that slot, which produced `://24`.
+    forward_includes_kv_cache_update: bool = True
 
     @staticmethod
     def get_name() -> str:
@@ -401,9 +404,15 @@ class TurboQuantAttentionImpl(AttentionImpl):
             output.zero_()
             return output
 
-        # NOTE: do NOT call do_kv_cache_update here. The wrapper already did
-        # it via unified_kv_cache_update (forward_includes_kv_cache_update
-        # is False). Doing it again here would double-write / race.
+        # forward_includes_kv_cache_update is True: the wrapper does NOT
+        # invoke unified_kv_cache_update, so we store K/V ourselves here,
+        # every forward call (including every decode step). Using our own
+        # parallel buffer is what forces this -- see class-level comment.
+        if key is not None and value is not None:
+            self.do_kv_cache_update(
+                layer, key, value, kv_cache, attn_metadata.slot_mapping
+            )
+
         num_tokens = query.shape[0]
         q = query.view(num_tokens, self.num_heads, self.head_size)
 
