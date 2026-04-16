@@ -247,7 +247,7 @@ echo "$QUERY_OUT"
 sleep 1
 
 echo "[diag] writing filtered diag log to $DIAG_LOG"
-grep -E '\[(FWD +|FWDCALL|STORE|ATTN +)L[0-9]+\]' "$SERVE_LOG" > "$DIAG_LOG" || true
+grep -E '\[(FWD|FWDCALL|STORE|ATTN) +L[0-9]+\]' "$SERVE_LOG" > "$DIAG_LOG" || true
 
 echo ""
 echo "================= FWD / FWDCALL / STORE / ATTN ================="
