@@ -60,27 +60,62 @@ src = path.read_text()
 store_probe = '''
         if int(os.environ.get("TQ_DEBUG", "0")):
             _slot0 = int(slot_mapping[0].item())
-            _cv = cache_v.view(-1, self.num_kv_heads, self.head_size)
-            _cv_std = _cv[_slot0].float().std().item() if _slot0 >= 0 else -1.0
+            _cv_flat = cache_v.view(-1, self.num_kv_heads, self.head_size)
+            _ki_flat = self._k_idx.view(-1, self.num_kv_heads, self.head_size)
+            _kn_flat = self._k_norms.view(-1, self.num_kv_heads)
+            if _slot0 >= 0:
+                _cv_std = _cv_flat[_slot0].float().std().item()
+                _ki_slot = _ki_flat[_slot0]
+                _ki_max = int(_ki_slot.max().item())
+                _ki_nonzero_frac = float((_ki_slot != 0).float().mean().item())
+                _kn_mean = float(_kn_flat[_slot0].mean().item())
+                # Reconstruct dequantised K at slot0 (head 0) for parity check.
+                _idx0 = _ki_slot[0].long()
+                _cb = codebook.codebook.to(torch.float32)
+                _deq = _cb[_idx0] * _kn_flat[_slot0, 0].item()
+                _deq_std = float(_deq.std().item())
+            else:
+                _cv_std = -1.0
+                _ki_max = -1
+                _ki_nonzero_frac = -1.0
+                _kn_mean = -1.0
+                _deq_std = -1.0
             print(
                 f"[STORE L{self._layer_seed}] nt={num_tokens} "
                 f"slot={slot_mapping[:4].tolist()} "
                 f"k_std={k.float().std().item():.3f} "
                 f"v_std={v.float().std().item():.3f} "
-                f"cache_v_at_slot_std={_cv_std:.3f} "
-                f"k_idx_at_slot_max={int(self._k_idx[_slot0].max().item()) if _slot0 >= 0 else -1} "
-                f"k_norm_at_slot={self._k_norms[_slot0].mean().item() if _slot0 >= 0 else -1:.3f}",
+                f"cache_v_slot_std={_cv_std:.3f} "
+                f"k_idx_max={_ki_max} "
+                f"k_idx_nonzero={_ki_nonzero_frac:.3f} "
+                f"k_norm_slot={_kn_mean:.3f} "
+                f"deq_k_std={_deq_std:.3f}",
                 flush=True,
             )
 '''
 
 attn_probe = '''
         if int(os.environ.get("TQ_DEBUG", "0")):
+            _slot0 = int(attn_metadata.slot_mapping[0].item())
+            _ki_flat = self._k_idx.view(-1, self.num_kv_heads, self.head_size)
+            _kn_flat = self._k_norms.view(-1, self.num_kv_heads)
+            if _slot0 >= 0:
+                _ki_slot = _ki_flat[_slot0]
+                _ki_max = int(_ki_slot.max().item())
+                _ki_nonzero_frac = float((_ki_slot != 0).float().mean().item())
+                _kn_mean = float(_kn_flat[_slot0].mean().item())
+            else:
+                _ki_max = -1
+                _ki_nonzero_frac = -1.0
+                _kn_mean = -1.0
             print(
                 f"[ATTN  L{self._layer_seed}] nt={num_tokens} "
                 f"seq_lens={attn_metadata.seq_lens[:2].tolist()} "
                 f"bt0={attn_metadata.block_table[0, :2].tolist()} "
                 f"slot={attn_metadata.slot_mapping[:2].tolist()} "
+                f"k_idx_max={_ki_max} "
+                f"k_idx_nonzero={_ki_nonzero_frac:.3f} "
+                f"k_norm_slot={_kn_mean:.3f} "
                 f"q_std={q.float().std().item():.3f} "
                 f"out_std={attn_out.float().std().item():.3f} "
                 f"out_absmean={attn_out.float().abs().mean().item():.4f}",
@@ -152,7 +187,7 @@ echo "$QUERY_OUT"
 sleep 1
 
 echo "[diag] writing filtered diag log to $DIAG_LOG"
-grep -E '^\[STORE L[0-2] |^\[ATTN  L[0-2] ' "$SERVE_LOG" > "$DIAG_LOG" || true
+grep -E '\[(STORE|ATTN +)L[0-9]+\]' "$SERVE_LOG" > "$DIAG_LOG" || true
 
 echo ""
 echo "================= first 3 layers, STORE + ATTN ================="
