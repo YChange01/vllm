@@ -31,16 +31,19 @@ _NEG_LARGE = tl.constexpr(-1.0e30)
 
 @triton.jit
 def _quantize_and_store_kernel(
-    new_k_ptr,           # (num_tokens, num_heads_kv, head_size) fp16/bf16
-    new_v_ptr,           # (num_tokens, num_heads_kv, head_size) fp16/bf16
-    cache_k_ptr,         # (num_blocks, block_size, num_heads_kv, head_size) uint8
-    cache_v_ptr,         # (num_blocks, block_size, num_heads_kv, head_size) int8   <-- Step 1
-    cache_k_norm_ptr,    # (num_blocks, block_size, num_heads_kv) fp32
-    cache_v_scale_ptr,   # (num_blocks, block_size, num_heads_kv) fp32              <-- Step 1
-    slot_mapping_ptr,    # (num_tokens,) int64
-    hadamard_ptr,        # (head_size, head_size) fp16/bf16
-    signs_ptr,           # (head_size,) fp16/bf16
-    boundaries_ptr,      # (K_CB - 1,) fp32
+    new_k_ptr,                  # (num_tokens, num_heads_kv, head_size) fp16/bf16
+    new_v_ptr,                  # (num_tokens, num_heads_kv, head_size) fp16/bf16
+    cache_k_ptr,                # (num_blocks, block_size, num_heads_kv, head_size) uint8
+    cache_v_ptr,                # (num_blocks, block_size, num_heads_kv, head_size) int8
+    cache_k_norm_ptr,           # (num_blocks, block_size, num_heads_kv) fp32
+    cache_v_scale_ptr,          # (num_blocks, block_size, num_heads_kv) fp32
+    cache_k_resid_sign_ptr,     # (num_blocks, block_size, num_heads_kv, head_size) int8  <-- Step 2
+    cache_k_resid_scale_ptr,    # (num_blocks, block_size, num_heads_kv) fp32             <-- Step 2
+    slot_mapping_ptr,           # (num_tokens,) int64
+    codebook_ptr,               # (K_CB,) fp32   <-- Step 2 (also needed to compute residual)
+    hadamard_ptr,               # (head_size, head_size) fp16/bf16
+    signs_ptr,                  # (head_size,) fp16/bf16
+    boundaries_ptr,             # (K_CB - 1,) fp32
     num_heads_kv: tl.constexpr,
     head_size: tl.constexpr,
     block_size: tl.constexpr,
@@ -49,11 +52,15 @@ def _quantize_and_store_kernel(
 ):
     """One program = one (token, kv_head) pair.
 
-    Step 1 adds V quantization on the store path: for each (token, kv_head)
-    we compute scale = max(|v|) / 127 and store the per-element int8 value
-    plus the scale. Dequant in the attend kernel is `int8 * scale`. Per-head
-    symmetric int8 is a first pass -- cheap, no rotation, no codebook, good
-    enough to prove the pipeline and cut V memory roughly in half.
+    Step 1 added V quantization: per-(token, kv_head) symmetric int8 with
+    scale = max(|v|) / 127, dequant = int8 * scale.
+
+    Step 2 adds a 1-bit residual correction to K (TurboQuant_prod direction).
+    After Lloyd-Max quantization picks codebook index `idx`, we compute the
+    residual `r = rotated - codebook[idx]` and store sign(r) (int8, ±1) plus
+    a per-(slot,head) fp32 scale = mean(|r|). The attend kernel reconstructs
+    k_rotated ≈ codebook[idx] + sign(r) * scale, which removes the MSE-
+    quantizer's systematic inner-product bias (paper §2).
     """
     tok = tl.program_id(0)
     head = tl.program_id(1)
@@ -107,6 +114,21 @@ def _quantize_and_store_kernel(
     )
     tl.store(cache_k_ptr + cache_off, idx_u8, mask=mask_d)
 
+    # --- K residual: 1-bit QJL-style correction (Step 2) ---
+    # Dequant the freshly-picked index, subtract from rotated to get residual,
+    # then summarise residual as (sign, mean-abs). Under Hadamard rotation the
+    # coordinates are approximately iid Gaussian, so a single per-head scale
+    # is a reasonable sufficient statistic. Using mean(|r|) = E[|r|] matches
+    # the moment an unbiased 1-bit reconstruction would emit for N(0, sigma^2).
+    rk_dq = tl.load(codebook_ptr + idx).to(tl.float32)
+    residual = rotated - rk_dq
+    resid_abs = tl.where(mask_d, tl.abs(residual), 0.0)
+    resid_scale = tl.sum(resid_abs) / float(head_size)
+    resid_scale = tl.maximum(resid_scale, 1e-12)
+    resid_sign = tl.where(residual >= 0.0, 1.0, -1.0)
+    tl.store(cache_k_resid_scale_ptr + meta_off, resid_scale)
+    tl.store(cache_k_resid_sign_ptr + cache_off, resid_sign.to(tl.int8), mask=mask_d)
+
     # --- V quantization (Step 1) ---
     # Per-(token, head) symmetric int8: scale = max|v| / 127, stored as fp32.
     v_abs = tl.where(mask_d, tl.abs(v_vec), 0.0)
@@ -120,18 +142,20 @@ def _quantize_and_store_kernel(
 
 @triton.jit
 def _dequant_and_attend_kernel(
-    q_ptr,                  # (num_query_tokens, num_heads_q, head_size) fp16/bf16
-    cache_k_ptr,            # (num_blocks, block_size, num_heads_kv, head_size) uint8
-    cache_v_ptr,            # (num_blocks, block_size, num_heads_kv, head_size) int8
-    cache_k_norm_ptr,       # (num_blocks, block_size, num_heads_kv) fp32
-    cache_v_scale_ptr,      # (num_blocks, block_size, num_heads_kv) fp32 (Step 1)
-    block_table_ptr,        # (num_seqs, block_table_stride) int32
-    seq_id_per_query_ptr,   # (num_query_tokens,) int32 : which seq each q belongs to
-    kv_end_per_query_ptr,   # (num_query_tokens,) int32 : causal kv upper bound for each q
-    codebook_ptr,           # (K_CB,) fp32
-    hadamard_ptr,           # (head_size, head_size) fp16/bf16
-    signs_ptr,              # (head_size,) fp16/bf16
-    out_ptr,                # (num_query_tokens, num_heads_q, head_size) fp16/bf16
+    q_ptr,                      # (num_query_tokens, num_heads_q, head_size) fp16/bf16
+    cache_k_ptr,                # (num_blocks, block_size, num_heads_kv, head_size) uint8
+    cache_v_ptr,                # (num_blocks, block_size, num_heads_kv, head_size) int8
+    cache_k_norm_ptr,           # (num_blocks, block_size, num_heads_kv) fp32
+    cache_v_scale_ptr,          # (num_blocks, block_size, num_heads_kv) fp32 (Step 1)
+    cache_k_resid_sign_ptr,     # (num_blocks, block_size, num_heads_kv, head_size) int8 (Step 2)
+    cache_k_resid_scale_ptr,    # (num_blocks, block_size, num_heads_kv) fp32 (Step 2)
+    block_table_ptr,            # (num_seqs, block_table_stride) int32
+    seq_id_per_query_ptr,       # (num_query_tokens,) int32 : which seq each q belongs to
+    kv_end_per_query_ptr,       # (num_query_tokens,) int32 : causal kv upper bound for each q
+    codebook_ptr,               # (K_CB,) fp32
+    hadamard_ptr,               # (head_size, head_size) fp16/bf16
+    signs_ptr,                  # (head_size,) fp16/bf16
+    out_ptr,                    # (num_query_tokens, num_heads_q, head_size) fp16/bf16
     scale,                  # fp32 scalar, 1 / sqrt(head_size)
     inv_sqrt_d,             # fp32 scalar, 1 / sqrt(head_size) for norm restoration
     max_blocks_per_seq,     # runtime int: loop bound; keep SMALL for speed
@@ -207,19 +231,32 @@ def _dequant_and_attend_kernel(
                         + tok_in_block * num_heads_kv * head_size
                         + kvh_idx * head_size
                     )
-                    k_idx_u8 = tl.load(
-                        cache_k_ptr + base + d_idx, mask=mask_d, other=0
-                    ).to(tl.int32)
-                    rk = tl.load(codebook_ptr + k_idx_u8).to(tl.float32)
-                    k_unrot = tl.sum(H_tile * rk[None, :], axis=1)
-                    k_unit = k_unrot * signs
-
-                    # Restore original norm: k = k_unit * (k_norm / sqrt(d)).
                     norm_off = (
                         phys_block * block_size * num_heads_kv
                         + tok_in_block * num_heads_kv
                         + kvh_idx
                     )
+
+                    k_idx_u8 = tl.load(
+                        cache_k_ptr + base + d_idx, mask=mask_d, other=0
+                    ).to(tl.int32)
+                    rk = tl.load(codebook_ptr + k_idx_u8).to(tl.float32)
+
+                    # Step 2: 1-bit residual correction in rotated space.
+                    # sign in {-1, +1} (int8), scale per (slot, head) fp32.
+                    # Setting _k_resid_scale to all zeros at the Python layer
+                    # cleanly reverts to Step 1 behaviour, which is useful for
+                    # A/B debugging without rebuilding the Triton kernel.
+                    resid_sign = tl.load(
+                        cache_k_resid_sign_ptr + base + d_idx,
+                        mask=mask_d, other=0,
+                    ).to(tl.float32)
+                    resid_scale = tl.load(cache_k_resid_scale_ptr + norm_off)
+                    rk = rk + resid_sign * resid_scale
+
+                    k_unrot = tl.sum(H_tile * rk[None, :], axis=1)
+                    k_unit = k_unrot * signs
+
                     k_norm = tl.load(cache_k_norm_ptr + norm_off)
                     k_vec = k_unit * (k_norm * inv_sqrt_d)
 
@@ -251,16 +288,22 @@ def turboquant_store_kv(
     cache_v: torch.Tensor,
     cache_k_norm: torch.Tensor,
     cache_v_scale: torch.Tensor,
+    cache_k_resid_sign: torch.Tensor,
+    cache_k_resid_scale: torch.Tensor,
     slot_mapping: torch.Tensor,
     codebook: GaussianCodebook,
     block_size: int,
 ) -> None:
-    """Quantize ``new_k`` (Lloyd-Max + Hadamard) and ``new_v`` (per-(slot,head)
-    symmetric int8) into the paged K/V caches.
+    """Quantize ``new_k`` (Lloyd-Max + Hadamard + 1-bit residual) and
+    ``new_v`` (per-(slot,head) symmetric int8) into the paged K/V caches.
 
-    Step 1 extends this to also produce V scales. ``cache_v`` is now an int8
-    tensor (same shape as cache_k) and ``cache_v_scale`` is a per-(slot,head)
-    fp32 scale tensor parallel to ``cache_k_norm``.
+    Step 1 added V scales. Step 2 adds the K residual buffers:
+      - ``cache_k_resid_sign``: int8, same shape as ``cache_k``, values ±1.
+      - ``cache_k_resid_scale``: fp32, same shape as ``cache_k_norm``.
+
+    The residual is computed in the rotated (Hadamard) space and absorbs the
+    first-moment error of the MSE codebook, which is what biased inner
+    products on long contexts (see NIAH gap).
     """
     num_tokens, num_heads_kv, head_size = new_k.shape
     K_CB = int(codebook.codebook.shape[0])
@@ -268,6 +311,10 @@ def turboquant_store_kv(
     boundaries = codebook.boundaries
     if boundaries.dtype != torch.float32:
         boundaries = boundaries.to(torch.float32)
+
+    codebook_f32 = codebook.codebook
+    if codebook_f32.dtype != torch.float32:
+        codebook_f32 = codebook_f32.to(torch.float32)
 
     grid = (num_tokens, num_heads_kv)
     BLOCK_D = triton.next_power_of_2(head_size)
@@ -279,7 +326,10 @@ def turboquant_store_kv(
         cache_v,
         cache_k_norm,
         cache_v_scale,
+        cache_k_resid_sign,
+        cache_k_resid_scale,
         slot_mapping,
+        codebook_f32,
         codebook.H,
         codebook.signs,
         boundaries,
@@ -300,6 +350,8 @@ def turboquant_paged_attention(
     cache_v: torch.Tensor,
     cache_k_norm: torch.Tensor,
     cache_v_scale: torch.Tensor,
+    cache_k_resid_sign: torch.Tensor,
+    cache_k_resid_scale: torch.Tensor,
     block_table: torch.Tensor,
     seq_lens: torch.Tensor,
     query_start_loc: torch.Tensor,
@@ -429,6 +481,8 @@ def turboquant_paged_attention(
         cache_v,
         cache_k_norm,
         cache_v_scale,
+        cache_k_resid_sign,
+        cache_k_resid_scale,
         block_table,
         seq_id_per_query,
         kv_end_per_query,
@@ -473,6 +527,10 @@ def turboquant_paged_attention(
                 for h in range(num_heads_kv):
                     idx = cache_k[phys, toff, h].long()
                     rk = cb_ref[idx]
+                    # Step 2: apply residual correction in rotated space
+                    rk_sign = cache_k_resid_sign[phys, toff, h].float()
+                    rk_scale = float(cache_k_resid_scale[phys, toff, h].item())
+                    rk = rk + rk_sign * rk_scale
                     k_unrot = rk @ H_ref
                     k_unit = k_unrot * signs_ref
                     k_norm_h = float(cache_k_norm[phys, toff, h].item())

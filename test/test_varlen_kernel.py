@@ -38,13 +38,18 @@ def dequant_kv_reference(
     cache_k_norm: torch.Tensor,
     cache_v: torch.Tensor,
     cache_v_scale: torch.Tensor,
+    cache_k_resid_sign: torch.Tensor,
+    cache_k_resid_scale: torch.Tensor,
     codebook: GaussianCodebook,
     block_table: torch.Tensor,
     seq_len: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Dequantise the K cache for sequence 0 up to seq_len, using the SAME
-    formula the Triton attend kernel does. Returns k of shape
-    (seq_len, num_kv_heads, head_size), dtype fp32."""
+    formula the Triton attend kernel does.
+
+    Step 2 adds the residual correction: in rotated space we reconstruct
+    rk ≈ codebook[idx] + sign * scale before un-rotation.
+    """
     num_blocks, block_size, num_kv_heads, head_size = cache_k.shape
     inv_sqrt_d = 1.0 / (head_size ** 0.5)
 
@@ -62,6 +67,10 @@ def dequant_kv_reference(
         for h in range(num_kv_heads):
             idx = cache_k[phys_block, tok_in_block, h].long()  # (d,)
             rk = cb[idx]                                       # (d,)
+            # Step 2: 1-bit residual correction in rotated space
+            rk_sign = cache_k_resid_sign[phys_block, tok_in_block, h].float()
+            rk_scale = float(cache_k_resid_scale[phys_block, tok_in_block, h].item())
+            rk = rk + rk_sign * rk_scale
             k_unrot = rk @ H                                   # (d,) (H symmetric)
             k_unit = k_unrot * signs
             k_norm_head = float(cache_k_norm[phys_block, tok_in_block, h].item())
@@ -127,6 +136,11 @@ def run_one_case(
                                dtype=torch.float32, device=device)
     cache_v_scale = torch.zeros(num_blocks, block_size, num_heads_kv,
                                 dtype=torch.float32, device=device)
+    # Step 2: 1-bit K residual sign + per-(slot,head) scale
+    cache_k_resid_sign = torch.zeros(num_blocks, block_size, num_heads_kv, head_size,
+                                     dtype=torch.int8, device=device)
+    cache_k_resid_scale = torch.zeros(num_blocks, block_size, num_heads_kv,
+                                      dtype=torch.float32, device=device)
 
     # Put this seq's tokens starting at block 1 slot 0 (skip block 0 to
     # mimic vLLM behaviour where block 0 is often reserved / warmup).
@@ -156,6 +170,8 @@ def run_one_case(
         cache_v=cache_v,
         cache_k_norm=cache_k_norm,
         cache_v_scale=cache_v_scale,
+        cache_k_resid_sign=cache_k_resid_sign,
+        cache_k_resid_scale=cache_k_resid_scale,
         slot_mapping=slot_mapping,
         codebook=codebook,
         block_size=block_size,
@@ -169,6 +185,8 @@ def run_one_case(
         cache_v=cache_v,
         cache_k_norm=cache_k_norm,
         cache_v_scale=cache_v_scale,
+        cache_k_resid_sign=cache_k_resid_sign,
+        cache_k_resid_scale=cache_k_resid_scale,
         block_table=block_table,
         seq_lens=seq_lens,
         query_start_loc=query_start_loc,
@@ -183,6 +201,8 @@ def run_one_case(
         cache_k_norm=cache_k_norm,
         cache_v=cache_v,
         cache_v_scale=cache_v_scale,
+        cache_k_resid_sign=cache_k_resid_sign,
+        cache_k_resid_scale=cache_k_resid_scale,
         codebook=codebook,
         block_table=block_table,
         seq_len=num_tokens,
