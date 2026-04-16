@@ -178,7 +178,29 @@ def run_one_case(
     )
     torch.cuda.synchronize()
 
-    # --- 2) Triton attend over the whole prefill -------------------------
+    # --- 2) Triton attend: first WITHOUT residual (Step 1 baseline) ------
+    # Zero the scale tensor to cancel sign*scale in the kernel -- keeps the
+    # dequant path bit-identical except the residual contribution.
+    scale_backup = cache_k_resid_scale.clone()
+    cache_k_resid_scale.zero_()
+    attn_out_step1 = turboquant_paged_attention(
+        q=q,
+        cache_k=cache_k,
+        cache_v=cache_v,
+        cache_k_norm=cache_k_norm,
+        cache_v_scale=cache_v_scale,
+        cache_k_resid_sign=cache_k_resid_sign,
+        cache_k_resid_scale=cache_k_resid_scale,
+        block_table=block_table,
+        seq_lens=seq_lens,
+        query_start_loc=query_start_loc,
+        codebook=codebook,
+        scale=None,
+    )
+    torch.cuda.synchronize()
+    cache_k_resid_scale.copy_(scale_backup)
+
+    # --- 2b) Triton attend WITH residual (Step 2) ------------------------
     attn_out = turboquant_paged_attention(
         q=q,
         cache_k=cache_k,
@@ -222,22 +244,21 @@ def run_one_case(
     )
 
     # --- 4) Compare -------------------------------------------------------
-    # kernel vs quant-reference (measures Triton arithmetic fidelity)
+    fp_ref_abs_mean = fp_ref_out.abs().mean().clamp(min=1e-6)
+    step1_diff = (attn_out_step1.float() - fp_ref_out).abs()
+    step2_diff = (attn_out.float() - fp_ref_out).abs()
     kern_diff = (attn_out.float() - ref_out).abs()
-    # kernel vs FP ground truth (measures total quantization error)
-    quant_diff = (attn_out.float() - fp_ref_out).abs()
     return {
         "num_tokens": num_tokens,
         "bits": bits,
         "kern_rel_err": float(
             (kern_diff.mean() / ref_out.abs().mean().clamp(min=1e-6)).item()
         ),
-        "quant_rel_err": float(
-            (quant_diff.mean() / fp_ref_out.abs().mean().clamp(min=1e-6)).item()
-        ),
-        "quant_max_err": float(quant_diff.max().item()),
+        "step1_rel_err": float((step1_diff.mean() / fp_ref_abs_mean).item()),
+        "step2_rel_err": float((step2_diff.mean() / fp_ref_abs_mean).item()),
+        "step1_max_err": float(step1_diff.max().item()),
+        "step2_max_err": float(step2_diff.max().item()),
         "fp_ref_std": float(fp_ref_out.std().item()),
-        "attn_out_std": float(attn_out.float().std().item()),
     }
 
 
@@ -250,22 +271,27 @@ def main():
 
     cases = [args.num_tokens] if args.num_tokens else [1, 4, 16, 32, 61, 128]
 
-    # Two error columns:
-    #   kern_rel_err  : Triton kernel vs PyTorch on SAME quantized K/V
-    #                   (measures kernel arithmetic, should be ~0.14% bf16 floor)
-    #   quant_rel_err : Triton kernel vs PyTorch on UNQUANTIZED K/V
-    #                   (measures total quantization error — this is the one
-    #                   Step 2's residual is supposed to shrink)
-    print(f"{'num_tokens':>12} {'kern_rel':>12} {'quant_rel':>12} "
-          f"{'quant_max':>12} {'fp_std':>10} {'attn_std':>10}")
+    # Four error columns:
+    #   kern_rel    : Triton vs PyTorch on SAME quantized K/V
+    #                 (arithmetic fidelity, ~0.14% bf16 floor)
+    #   step1_rel   : Triton vs UNQUANTIZED K/V with residual scale zeroed
+    #                 (Step 1 equivalent -- Lloyd-Max + V int8, no residual)
+    #   step2_rel   : Triton vs UNQUANTIZED K/V with residual active
+    #                 (Step 2 -- should be smaller than step1_rel)
+    #   reduction   : 1 - step2_rel/step1_rel (how much residual helped)
+    print(f"{'num_tokens':>10} {'kern_rel':>10} {'step1_rel':>10} "
+          f"{'step2_rel':>10} {'reduction':>10} "
+          f"{'s1_max':>8} {'s2_max':>8}")
     for n in cases:
         r = run_one_case(num_tokens=n, bits=args.bits)
-        print(f"{r['num_tokens']:>12} "
-              f"{r['kern_rel_err']:>12.4%} "
-              f"{r['quant_rel_err']:>12.4%} "
-              f"{r['quant_max_err']:>12.4f} "
-              f"{r['fp_ref_std']:>10.4f} "
-              f"{r['attn_out_std']:>10.4f}")
+        reduction = 1.0 - r["step2_rel_err"] / max(r["step1_rel_err"], 1e-12)
+        print(f"{r['num_tokens']:>10} "
+              f"{r['kern_rel_err']:>10.4%} "
+              f"{r['step1_rel_err']:>10.4%} "
+              f"{r['step2_rel_err']:>10.4%} "
+              f"{reduction:>10.2%} "
+              f"{r['step1_max_err']:>8.4f} "
+              f"{r['step2_max_err']:>8.4f}")
 
 
 if __name__ == "__main__":
