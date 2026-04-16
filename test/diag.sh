@@ -101,16 +101,35 @@ store_probe = '''
                     _ki_max = int(_ki_slot.max().item())
                     _ki_nonzero_frac = float((_ki_slot != 0).float().mean().item())
                     _kn_mean = float(_kn_flat[_slot0].mean().item())
+                    # Mirror kernel dequant EXACTLY:
+                    #   rk      = codebook[idx]      (rotated, normalized)
+                    #   k_unrot = H @ rk             (inverse rotation, H symmetric)
+                    #   k_unit  = k_unrot * signs
+                    #   k_vec   = k_unit * (k_norm / sqrt(d))
                     _idx0 = _ki_slot[0].long()
                     _cb = codebook.codebook.to(torch.float32)
-                    _deq = _cb[_idx0] * _kn_flat[_slot0, 0].item()
-                    _deq_std = float(_deq.std().item())
+                    _H = codebook.H.to(torch.float32)
+                    _signs_f = codebook.signs.to(torch.float32)
+                    _rk = _cb[_idx0]
+                    _k_unrot = _rk @ _H
+                    _k_unit = _k_unrot * _signs_f
+                    _k_norm_head = float(_kn_flat[_slot0, 0].item())
+                    _inv_sqrt_d = float(self.head_size) ** -0.5
+                    _k_recon = _k_unit * (_k_norm_head * _inv_sqrt_d)
+                    _k_orig = k[0, 0, :].float()
+                    _recon_mae = float((_k_recon - _k_orig).abs().mean().item())
+                    _recon_max = float((_k_recon - _k_orig).abs().max().item())
+                    _k_recon_std = float(_k_recon.std().item())
+                    _k_orig_std = float(_k_orig.std().item())
                 else:
                     _cv_std = -1.0
                     _ki_max = -1
                     _ki_nonzero_frac = -1.0
                     _kn_mean = -1.0
-                    _deq_std = -1.0
+                    _recon_mae = -1.0
+                    _recon_max = -1.0
+                    _k_recon_std = -1.0
+                    _k_orig_std = -1.0
                 print(
                     f"[STORE L{self._layer_seed}] nt={num_tokens} "
                     f"slot={slot_mapping[:4].tolist()} "
@@ -120,7 +139,10 @@ store_probe = '''
                     f"k_idx_max={_ki_max} "
                     f"k_idx_nonzero={_ki_nonzero_frac:.3f} "
                     f"k_norm_slot={_kn_mean:.3f} "
-                    f"deq_k_std={_deq_std:.3f}",
+                    f"k_orig_std_h0={_k_orig_std:.3f} "
+                    f"k_recon_std_h0={_k_recon_std:.3f} "
+                    f"recon_mae={_recon_mae:.4f} "
+                    f"recon_max={_recon_max:.4f}",
                     flush=True,
                 )
             except Exception as _e:
