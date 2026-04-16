@@ -2,7 +2,8 @@
 # Baseline comparison: run the SAME prompt through FLASH_ATTN and TURBOQUANT
 # backends and print both completions side by side.
 #
-# Only run this AFTER you have stopped any existing server on the target ports.
+# NOTE: this script does NOT kill zombie processes. Make sure ports 8009
+# and 8010 are free and no stale EngineCore is running before you launch it.
 # Uses port 8010 for the fp baseline (FLASH_ATTN) and 8009 for TurboQuant.
 #
 # Usage:
@@ -24,16 +25,7 @@ ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 FP_LOG="$ROOT_DIR/baseline_fp.log"
 TQ_LOG="$ROOT_DIR/baseline_tq.log"
 
-# --- cleanup: kill any zombie engine cores from previous runs ------------
-kill_zombies() {
-    pkill -9 -f 'vllm serve'    2>/dev/null || true
-    pkill -9 -f 'VllmWorker'    2>/dev/null || true
-    pkill -9 -f 'EngineCore'    2>/dev/null || true
-    # Give file descriptors a moment to drop before we rebind ports.
-    sleep 2
-}
-
-# --- cleanup on exit -----------------------------------------------------
+# --- cleanup on exit: only touch servers THIS script started ------------
 cleanup() {
     local code=$?
     if [ -n "${FP_PID:-}" ]; then
@@ -44,9 +36,6 @@ cleanup() {
         echo "[baseline] stopping TURBOQUANT serve pid=$TQ_PID"
         kill "$TQ_PID" 2>/dev/null || true
     fi
-    # Make sure nothing lingers across reruns.
-    pkill -9 -f 'vllm serve' 2>/dev/null || true
-    pkill -9 -f 'EngineCore' 2>/dev/null || true
     exit "$code"
 }
 trap cleanup EXIT INT TERM
@@ -82,8 +71,6 @@ query_completion() {
 # --- proxy unset (localhost must not go through corp proxy) --------------
 unset http_proxy https_proxy all_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY
 
-kill_zombies
-
 export CUDA_VISIBLE_DEVICES="$GPU"
 echo "[baseline] model=$MODEL prompt='$PROMPT' max_tokens=$MAX_TOKENS gpu=$GPU"
 echo "[baseline] fp log -> $FP_LOG"
@@ -117,8 +104,6 @@ echo "[baseline] stopping FLASH_ATTN"
 kill "$FP_PID" 2>/dev/null || true
 wait "$FP_PID" 2>/dev/null || true
 FP_PID=""
-# Make sure the subprocess tree is gone before we spin up the next backend.
-pkill -9 -f 'EngineCore' 2>/dev/null || true
 sleep 3
 
 # ========== 2) TURBOQUANT =================================================
