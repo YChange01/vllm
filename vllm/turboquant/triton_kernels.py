@@ -94,7 +94,11 @@ def _quantize_and_store_kernel(
         b = tl.load(boundaries_ptr + k).to(tl.float32)
         idx += (rotated > b).to(tl.int32)
 
-    idx_u8 = idx.to(tl.uint8) & 0x0F
+    # cache_k is uint8, so idx (in [0, K_CB-1]) fits directly for K_CB <= 256.
+    # Do NOT mask with 0x0F: that would truncate the top 4 bits whenever
+    # TURBOQUANT_BITS > 4, aliasing every 8-bit index onto the first 16
+    # codebook entries (the extreme-negative tail of the Lloyd-Max table).
+    idx_u8 = idx.to(tl.uint8)
 
     cache_off = (
         block_idx * block_size * num_heads_kv * head_size
