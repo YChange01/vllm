@@ -58,6 +58,24 @@ TURBOQUANT_BITS = int(os.environ.get("TURBOQUANT_BITS", "8"))
 # broken with BYPASS=1, the bug is NOT in the quant kernel but in how the
 # backend plugs into vLLM (output tensor, slot semantics, etc).
 TURBOQUANT_BYPASS = os.environ.get("TURBOQUANT_BYPASS", "0") == "1"
+# Diagnostic dump: log the FIRST do_kv_cache_update and FIRST forward()
+# invocation payload to TURBOQUANT_DEBUG_LOG. Path defaults to /tmp.
+TURBOQUANT_DEBUG = os.environ.get("TURBOQUANT_DEBUG", "0") == "1"
+TURBOQUANT_DEBUG_LOG = os.environ.get(
+    "TURBOQUANT_DEBUG_LOG", "/tmp/turboquant_debug.log"
+)
+_DEBUG_SEEN_STORE: set[int] = set()
+_DEBUG_SEEN_FWD: set[int] = set()
+
+
+def _dbg(msg: str) -> None:
+    if not TURBOQUANT_DEBUG:
+        return
+    try:
+        with open(TURBOQUANT_DEBUG_LOG, "a") as f:
+            f.write(msg + "\n")
+    except Exception:
+        pass
 
 if TURBOQUANT_ALGO not in ("mse", "prod"):
     raise ValueError(
@@ -283,6 +301,22 @@ class TurboQuantAttentionImpl(AttentionImpl):
 
         self._ensure_buffers(kv_cache)
 
+        if TURBOQUANT_DEBUG and self._layer_seed not in _DEBUG_SEEN_STORE:
+            _DEBUG_SEEN_STORE.add(self._layer_seed)
+            try:
+                sm = slot_mapping.detach().cpu().tolist()
+                k0 = k.detach().float().cpu()[:2, 0, :4].tolist()
+                v0 = v.detach().float().cpu()[:2, 0, :4].tolist()
+                _dbg(
+                    f"[store L{self._layer_seed}] num_tokens={num_tokens} "
+                    f"key.shape={tuple(key.shape)} kv_cache.shape={tuple(kv_cache.shape)} "
+                    f"slot_mapping={sm} bypass={TURBOQUANT_BYPASS} "
+                    f"forward_includes_kv_cache_update={TurboQuantAttentionBackend.forward_includes_kv_cache_update} "
+                    f"k[:2,0,:4]={k0} v[:2,0,:4]={v0}"
+                )
+            except Exception as e:
+                _dbg(f"[store L{self._layer_seed}] dbg err: {e}")
+
         if TURBOQUANT_BYPASS:
             block_size = kv_cache.shape[2]
             valid = slot_mapping >= 0
@@ -336,6 +370,26 @@ class TurboQuantAttentionImpl(AttentionImpl):
         q = query.view(num_tokens, self.num_heads, self.head_size)
 
         self._ensure_buffers(kv_cache)
+
+        if TURBOQUANT_DEBUG and self._layer_seed not in _DEBUG_SEEN_FWD:
+            _DEBUG_SEEN_FWD.add(self._layer_seed)
+            try:
+                qsl = attn_metadata.query_start_loc.detach().cpu().tolist()
+                sl = attn_metadata.seq_lens.detach().cpu().tolist()
+                bt = attn_metadata.block_table[: len(sl), :4].detach().cpu().tolist()
+                sm = attn_metadata.slot_mapping.detach().cpu().tolist()
+                q0 = q.detach().float().cpu()[:1, 0, :4].tolist()
+                out_shape = tuple(output.shape)
+                _dbg(
+                    f"[fwd   L{self._layer_seed}] num_tokens={num_tokens} "
+                    f"q.shape={tuple(q.shape)} out.shape={out_shape} "
+                    f"scale={self.scale:.6f} sqrt(1/d)={1.0/self.head_size**0.5:.6f} "
+                    f"qsl={qsl} seq_lens={sl} block_table[:4]={bt} "
+                    f"slot_mapping={sm} bypass={TURBOQUANT_BYPASS} "
+                    f"q[0,0,:4]={q0}"
+                )
+            except Exception as e:
+                _dbg(f"[fwd L{self._layer_seed}] dbg err: {e}")
 
         if TURBOQUANT_BYPASS:
             attn_out = _fp_paged_attention(
