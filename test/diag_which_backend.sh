@@ -41,19 +41,23 @@ setsid vllm serve "$MODEL" \
     >"$LOG" 2>&1 &
 CURRENT_PGID=$!
 
-# Wait up to ~60s for startup lines to land.
-for _ in $(seq 1 30); do
-    if grep -q "Selected attention\|Using .* backend\|attention.*backend\|TURBOQUANT_DBG" "$LOG" 2>/dev/null; then
+# Wait up to ~6 minutes for the server to finish initializing. We want
+# ALL attention-related log lines, which only land after model load.
+echo "[which] waiting for /health ..."
+for _ in $(seq 1 72); do
+    if curl -sf "http://localhost:${PORT}/health" >/dev/null 2>&1; then
+        echo "[which] server healthy"
         break
     fi
     if ! ps -p "$CURRENT_PGID" >/dev/null 2>&1; then
+        echo "[which] server exited early"
         break
     fi
-    sleep 2
+    sleep 5
 done
 
-# Give it a couple more seconds for the logs to flush.
-sleep 3
+# Let any final initialization messages flush.
+sleep 5
 
 kill -TERM -"$CURRENT_PGID" 2>/dev/null || true
 wait "$CURRENT_PGID" 2>/dev/null || true
