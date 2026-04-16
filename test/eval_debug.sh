@@ -17,7 +17,7 @@
 
 set -u
 
-MODEL="${MODEL:-/mnt/nvme3n1/g00872988/models/Qwen3-0.6B}"
+MODEL="${MODEL:-/mnt/nvme3n1/g00872988/models/Llama-3.1-8B-Instruct}"
 GPU="${GPU:-3}"
 MAX_LEN="${MAX_LEN:-4096}"
 GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.3}"

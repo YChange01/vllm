@@ -4,7 +4,7 @@
 #   bash test/serve.sh                          # default model, card 0
 #   bash test/serve.sh /path/to/model 8000 1    # custom model, port, card
 
-MODEL="${1:-/mnt/nvme3n1/g00872988/models/Qwen3-0.6B}"
+MODEL="${1:-/mnt/nvme3n1/g00872988/models/Llama-3.1-8B-Instruct}"
 PORT="${2:-8009}"
 GPU="${3:-1}"
 

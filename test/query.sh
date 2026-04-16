@@ -2,7 +2,7 @@
 # Send a test query to the running vLLM server.
 # Usage: bash test/query.sh [PROMPT] [PORT]
 
-MODEL="/mnt/nvme3n1/g00872988/models/Qwen3-0.6B"
+MODEL="/mnt/nvme3n1/g00872988/models/Llama-3.1-8B-Instruct"
 PROMPT="${1:-Hello}"
 PORT="${2:-8009}"
 

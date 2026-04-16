@@ -12,7 +12,7 @@ deterministic filler + digit match for a fast, reproducible CI-friendly signal.
 Usage:
     python test/eval_niah.py \
         --endpoint http://localhost:8009 \
-        --model /mnt/nvme3n1/g00872988/models/Qwen3-0.6B \
+        --model /mnt/nvme3n1/g00872988/models/Llama-3.1-8B-Instruct \
         --ctx-lens 512,2048,4096 \
         --positions 0.1,0.5,0.9 \
         --trials 3 \

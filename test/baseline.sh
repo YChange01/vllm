@@ -19,7 +19,7 @@
 
 set -u
 
-MODEL="${MODEL:-/mnt/nvme3n1/g00872988/models/Qwen3-0.6B}"
+MODEL="${MODEL:-/mnt/nvme3n1/g00872988/models/Llama-3.1-8B-Instruct}"
 PROMPT="${1:-Hello}"
 MAX_TOKENS="${2:-4}"
 GPU="${3:-3}"

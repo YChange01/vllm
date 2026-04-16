@@ -18,7 +18,7 @@
 
 set -u
 
-MODEL="${MODEL:-/mnt/nvme3n1/g00872988/models/Qwen3-0.6B}"
+MODEL="${MODEL:-/mnt/nvme3n1/g00872988/models/Llama-3.1-8B-Instruct}"
 GPU="${GPU:-3}"
 # NOTE: TurboQuant currently allocates a SEPARATE uint8 _k_idx buffer per
 # attention layer on top of vLLM's native bf16 KV cache. That roughly

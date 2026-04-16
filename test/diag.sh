@@ -16,7 +16,7 @@
 
 set -u
 
-MODEL="${1:-/mnt/nvme3n1/g00872988/models/Qwen3-0.6B}"
+MODEL="${1:-/mnt/nvme3n1/g00872988/models/Llama-3.1-8B-Instruct}"
 PORT="${2:-8009}"
 GPU="${3:-3}"
 MAX_LEN="${4:-4096}"
