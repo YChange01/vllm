@@ -1,107 +1,133 @@
 #!/usr/bin/env bash
 # One-shot diagnostic scratchpad. Overwritten every time.
 #
-# Current probe: localize bug between Triton kernel impl vs algorithm.
-# Run mse b=8 with TURBOQUANT_PYREF=1 (pure-PyTorch fp32 ref attend
-# kernel) on the long prompt. Compare text output to the broken
-# Triton-kernel run.
-#
-#   PYREF correct + Triton broken  -> bug in Triton kernel implementation
-#                                     (memory layout, static_range gating,
-#                                     flash accumulation, dtype handling)
-#   PYREF broken too               -> bug in algorithm itself (rotation,
-#                                     codebook reconstruction, inv_d)
-#
-# NOTE: PYREF is SLOW (Python loops). Expect ~minutes for 26-token prefill
-# with 32 layers. Only use for diagnostic, not production.
+# Current probe: PYREF and Triton produce identical broken text for mse b=8
+# on long prompt. Bug is in the algorithm, NOT the Triton implementation.
+# Three quick checks (no model launch needed) to localize it:
+#   (1) PYREF [out L0..L31] |attn|.mean / |attn|.max -- check if PYREF
+#       respects the soft-max bound  out <= max|v|. If yes, math bound
+#       holds and Triton has an additional impl bug. If no, my bound
+#       reasoning was wrong and we look elsewhere.
+#   (2) Hadamard sanity:  H @ H.T == I, ||H||^2 per row == 1, H[0,0]
+#       == 1/sqrt(d). Catches normalization or construction error.
+#   (3) Codebook range vs rotated coord range -- catches "codebook
+#       trained on N(0,1) but rotated values live elsewhere" mismatch.
 
 set -u
 
 cd "$(dirname "$0")/.."
 
-GPU="${GPU:-3}"
-PROMPT="${PROMPT:-Machine learning has transformed many fields over the past decade with deep neural networks achieving remarkable performance on natural language understanding and speech synthesis.}"
-MAX_TOKENS="${MAX_TOKENS:-4}"
-
-ROOT_DIR="$(pwd)"
-TS="$(date +%Y%m%d_%H%M%S)"
-LOG_DIR="$ROOT_DIR/logs/pyref_$TS"
-mkdir -p "$LOG_DIR"
-ln -sfn "$LOG_DIR" "$ROOT_DIR/logs/pyref_latest"
-SERVE_LOG="$LOG_DIR/server.log"
-DBG_LOG="$LOG_DIR/turboquant_debug.log"
-
-echo "[temp] GPU=$GPU MAX_TOKENS=$MAX_TOKENS"
-echo "[temp] PROMPT=\"$PROMPT\""
-echo "[temp] log dir: $LOG_DIR"
-echo ""
-
-PORT=8009
-CURRENT_PGID=""
-cleanup() {
-    local code=$?
-    if [ -n "$CURRENT_PGID" ]; then
-        echo "[temp] cleanup pgid $CURRENT_PGID"
-        kill -TERM -"$CURRENT_PGID" 2>/dev/null || true
-        wait "$CURRENT_PGID" 2>/dev/null || true
-    fi
-    exit "$code"
-}
-trap cleanup EXIT INT TERM
+PYREF_LOG="logs/pyref_latest/turboquant_debug.log"
 
 echo "=========================================================="
-echo "Launching mse b=8 with TURBOQUANT_PYREF=1"
+echo "(1) PYREF per-layer |attn|.mean / |attn|.max  (call=0 only)"
+echo "    rows where MSE means equal max|v| upper bound = 0.482"
+echo "    are the math-correct case; bigger means something off"
 echo "=========================================================="
-: > "$SERVE_LOG"
-env CUDA_VISIBLE_DEVICES="$GPU" \
-    TURBOQUANT_ALGO=mse \
-    TURBOQUANT_BITS=8 \
-    TURBOQUANT_PYREF=1 \
-    TURBOQUANT_DEBUG_LOG="$DBG_LOG" \
-    setsid vllm serve /mnt/nvme3n1/g00872988/models/Llama-3.1-8B-Instruct \
-        --port "$PORT" \
-        --enforce-eager \
-        --attention-backend TURBOQUANT \
-        --max-model-len 4096 \
-        --gpu-memory-utilization 0.3 \
-        >>"$SERVE_LOG" 2>&1 &
-CURRENT_PGID=$!
-
-echo "[temp] waiting for /health (PYREF takes a while to compile)..."
-for _ in $(seq 1 96); do
-    if curl -sf "http://localhost:${PORT}/health" >/dev/null 2>&1; then
-        echo "[temp] healthy"
-        break
-    fi
-    if ! ps -p "$CURRENT_PGID" >/dev/null 2>&1; then
-        echo "[temp] server exited early; tail of log:" >&2
-        tail -n 60 "$SERVE_LOG" >&2
-        exit 1
-    fi
-    sleep 5
-done
-
-echo ""
-echo "[temp] sending completion request (this is SLOW under PYREF)..."
-RESP=$(curl -s "http://localhost:${PORT}/v1/completions" \
-    -H 'Content-Type: application/json' \
-    -d "{\"model\":\"/mnt/nvme3n1/g00872988/models/Llama-3.1-8B-Instruct\",\"prompt\":\"${PROMPT}\",\"max_tokens\":${MAX_TOKENS},\"temperature\":0}" \
-    --max-time 1800)
-echo "[temp] raw: $RESP"
-TEXT=$(echo "$RESP" | python3 -c 'import sys,json;print(json.load(sys.stdin)["choices"][0]["text"])' 2>/dev/null || echo "<parse failed>")
-
-kill -TERM -"$CURRENT_PGID" 2>/dev/null || true
-wait "$CURRENT_PGID" 2>/dev/null || true
-CURRENT_PGID=""
+if [ -f "$PYREF_LOG" ]; then
+    grep "^\[out " "$PYREF_LOG" | head -40
+else
+    echo "(missing $PYREF_LOG)"
+fi
 
 echo ""
 echo "=========================================================="
-echo "RESULT"
+echo "(2) Hadamard sanity check"
+echo "    ||H @ H.T - I||_max should be ~0  (orthonormal)"
+echo "    H[0,0] should equal 1/sqrt(128) = 0.0883883..."
+echo "    each row's L2 squared should be 1.0"
 echo "=========================================================="
-echo "PROMPT:               $PROMPT"
-echo "FLASH_ATTN expected:  However, the field"
-echo "TRITON kernel saw:    ://owowow                          (broken)"
-echo "PYREF mse b=8 saw:    $TEXT"
+python3 -c "
+import torch, sys
+sys.path.insert(0, '.')
+from vllm.turboquant.codebook import _hadamard_matrix
+H = _hadamard_matrix(128, torch.float32)
+HHt = H @ H.T
+print('||H @ H.T - I||_max =', (HHt - torch.eye(128)).abs().max().item())
+print('H[0,0]              =', H[0,0].item(), ' expected', 1/128**0.5)
+print('row L2^2 mean       =', (H*H).sum(dim=1).mean().item(), ' expected 1.0')
+print('H symmetric?        =', torch.equal(H, H.T))
+"
+
 echo ""
-echo "If PYREF text is reasonable -> Triton kernel bug"
-echo "If PYREF text is also gibberish -> algorithm bug"
+echo "=========================================================="
+echo "(3) Codebook range vs expected rotated-coord range"
+echo "    rotated coords ~ N(0,1) so should fit in [-3, 3]."
+echo "    For mse b=8, codebook should span roughly that range."
+echo "=========================================================="
+python3 -c "
+import torch, sys
+sys.path.insert(0, '.')
+from vllm.turboquant.codebook import QuantState
+state = QuantState(algo='mse', bits=8, head_dim=128, seed=0,
+                   dtype=torch.float32, device='cpu')
+cb = state.codebook
+print('codebook K_CB        =', cb.shape[0])
+print('codebook[0]          =', float(cb[0]),  '(min centroid)')
+print('codebook[-1]         =', float(cb[-1]), '(max centroid)')
+print('codebook spacing min =', float((cb[1:] - cb[:-1]).min()))
+print('codebook spacing max =', float((cb[1:] - cb[:-1]).max()))
+print('boundaries.shape     =', state.boundaries.shape)
+"
+
+echo ""
+echo "=========================================================="
+echo "(4) Pure-python store+attend on REAL Llama L0 K (single token)"
+echo "    Take token 1 from the long-prompt L0 store log:"
+echo "    k = [3.5, 3.03, 3.44, -1.88, ...] (we know first 4 dims),"
+echo "    fake the other 124 dims as zeros, run through reconstruction,"
+echo "    show what main_dot * k_norm * inv_d would be vs the true <q,k>/sqrt(d)."
+echo "    If reconstructed logit is MUCH bigger / smaller than expected,"
+echo "    the algorithm scaling is wrong."
+echo "=========================================================="
+python3 -c "
+import torch, math, sys
+sys.path.insert(0, '.')
+from vllm.turboquant.codebook import QuantState
+
+torch.manual_seed(0)
+d = 128
+state = QuantState(algo='mse', bits=8, head_dim=d, seed=0,
+                   dtype=torch.float32, device='cpu')
+H = state.H
+signs = state.signs
+codebook = state.codebook
+boundaries = state.boundaries
+
+# A representative Llama L0 K: per-coord magnitude ~3, sparse sample.
+k = torch.zeros(d, dtype=torch.float32)
+k[0], k[1], k[2], k[3] = 3.5, 3.03, 3.44, -1.88
+k[10:30] = torch.randn(20) * 1.0
+k[60:80] = torch.randn(20) * 1.0
+k_norm = float(k.norm())
+print(f'k_norm                 = {k_norm:.4f}')
+
+k_normed = k * (math.sqrt(d) / k_norm)
+print(f'||k_normed||           = {k_normed.norm().item():.4f}  (expect sqrt(d)={math.sqrt(d):.4f})')
+
+rotated = H @ (signs * k_normed)
+print(f'||rotated||            = {rotated.norm().item():.4f}  (expect sqrt(d))')
+print(f'rotated min,max        = {float(rotated.min()):.3f}, {float(rotated.max()):.3f}')
+print(f'rotated per-coord std  = {float(rotated.std()):.3f}  (expect ~1.0 for codebook fit)')
+
+# Quantize
+idx = torch.zeros(d, dtype=torch.int32)
+for i in range(codebook.shape[0] - 1):
+    idx += (rotated > boundaries[i]).int()
+rk = codebook[idx.long()]
+print(f'rk min,max             = {float(rk.min()):.3f}, {float(rk.max()):.3f}')
+print(f'reconstruction error   = ||rotated - rk|| = {(rotated-rk).norm().item():.4f}')
+print(f'  rel err              = {(rotated-rk).norm().item() / rotated.norm().item():.4%}')
+
+# Pretend a query q = e_0 (unit basis), expect <q,k> = k[0] = 3.5
+q = torch.zeros(d, dtype=torch.float32)
+q[0] = 1.0
+true_logit = (q * k).sum().item() / math.sqrt(d)
+print(f'true   <q,k>/sqrt(d)   = {true_logit:.4f}  (using q=e_0, so equals k[0]/sqrt(d) = {3.5/math.sqrt(d):.4f})')
+
+q_rot = H @ (signs * q)
+main_dot = (q_rot * rk).sum().item()
+recon_logit = main_dot * k_norm / d
+print(f'recon logit            = main_dot * k_norm / d = {recon_logit:.4f}')
+print(f'logit relative error   = {abs(recon_logit - true_logit) / max(abs(true_logit), 1e-9):.4%}')
+"
