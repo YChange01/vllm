@@ -96,6 +96,25 @@ def _scatter_paged(
     cache[b_idx, off] = values[valid]
 
 
+def _maybe_pack_4bit(idx_uint8: torch.Tensor, K_CB: int) -> torch.Tensor:
+    """Pack two 4-bit indices per byte iff ``K_CB <= 16``.
+
+    Packs consecutive even/odd entries along the last dim:
+
+        packed[..., i] = idx[..., 2i] | (idx[..., 2i + 1] << 4)
+
+    Returns the input unchanged when ``K_CB > 16``.
+    """
+    if K_CB > 16:
+        return idx_uint8
+    assert idx_uint8.shape[-1] % 2 == 0, (
+        f"last dim {idx_uint8.shape[-1]} must be even for 4-bit packing"
+    )
+    low = idx_uint8[..., 0::2]
+    high = idx_uint8[..., 1::2]
+    return (low | (high << 4)).to(torch.uint8)
+
+
 def turboquant_store_kv(
     new_k: torch.Tensor,
     cache_k_idx: torch.Tensor,
@@ -134,13 +153,17 @@ def turboquant_store_kv(
             "prod requires cache_k_qjl_sign and cache_k_rnorm"
         )
 
+    K_CB = int(state.codebook.shape[0])
     idx_uint8, k_norm, rotated, idx32 = _quantize_lloyd_max(new_k, state)
-    _scatter_paged(cache_k_idx, idx_uint8, slot_mapping, block_size)
+    idx_packed = _maybe_pack_4bit(idx_uint8, K_CB)
+    _scatter_paged(cache_k_idx, idx_packed, slot_mapping, block_size)
     _scatter_paged(cache_k_norm, k_norm, slot_mapping, block_size)
 
     if use_qjl:
         codebook_f = state.codebook.to(torch.float32)
         S_f = state.S.to(torch.float32)
+        # QJL is computed against the *unpacked* idx, so use the original
+        # int64 idx32 we got from _quantize_lloyd_max.
         rk = codebook_f[idx32]                                  # (T, H_kv, d)
         r = rotated - rk
         r_norm = r.norm(dim=-1).clamp_min(1e-6)
@@ -174,6 +197,8 @@ def turboquant_store_v(
     """
     if new_v.shape[0] == 0:
         return
+    K_CB = int(state.codebook.shape[0])
     idx_uint8, v_norm, _rotated, _idx32 = _quantize_lloyd_max(new_v, state)
-    _scatter_paged(cache_v_idx, idx_uint8, slot_mapping, block_size)
+    idx_packed = _maybe_pack_4bit(idx_uint8, K_CB)
+    _scatter_paged(cache_v_idx, idx_packed, slot_mapping, block_size)
     _scatter_paged(cache_v_norm, v_norm, slot_mapping, block_size)

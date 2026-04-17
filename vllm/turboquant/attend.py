@@ -50,10 +50,10 @@ _NEG_LARGE = tl.constexpr(-1.0e30)
 def _attend_kernel(
     q_rotated_ptr,                  # (T_q, H_q, d)  fp16/bf16  H @ (signs * q)
     Sq_ptr,                         # (T_q, H_q, d)  fp16/bf16  S @ q_rotated  (prod only)
-    cache_k_idx_ptr,                # (num_blocks, bs, H_kv, d) uint8
-    cache_k_norm_ptr,               # (num_blocks, bs, H_kv)    fp32
-    cache_v_idx_ptr,                # (num_blocks, bs, H_kv, d) uint8
-    cache_v_norm_ptr,               # (num_blocks, bs, H_kv)    fp32
+    cache_k_idx_ptr,                # (num_blocks, bs, H_kv, idx_dim) uint8
+    cache_k_norm_ptr,               # (num_blocks, bs, H_kv)          fp32
+    cache_v_idx_ptr,                # (num_blocks, bs, H_kv, idx_dim) uint8
+    cache_v_norm_ptr,               # (num_blocks, bs, H_kv)          fp32
     cache_k_qjl_sign_ptr,           # (num_blocks, bs, H_kv, d) int8 (prod only)
     cache_k_rnorm_ptr,              # (num_blocks, bs, H_kv)    fp32 (prod only)
     block_table_ptr,                # (num_seqs, block_table_stride) int32
@@ -68,11 +68,15 @@ def _attend_kernel(
     OUT_DTYPE: tl.constexpr,
     num_heads_q: tl.constexpr,
     num_heads_kv: tl.constexpr,
-    head_size: tl.constexpr,
+    head_size: tl.constexpr,        # logical head dim
+    idx_dim: tl.constexpr,          # physical last-dim of cache_k_idx /
+                                    # cache_v_idx (head_size if unpacked,
+                                    # head_size // 2 if 4-bit packed)
     block_size: tl.constexpr,
     BLOCK_D: tl.constexpr,
     BLOCK_BS: tl.constexpr,
     USE_QJL: tl.constexpr,
+    USE_4BIT_PACK: tl.constexpr,    # True iff K_CB <= 16 (idx fits in nibble)
 ):
     q_idx = tl.program_id(0)
     qh_idx = tl.program_id(1)
@@ -96,6 +100,12 @@ def _attend_kernel(
     l_i = tl.zeros((), dtype=tl.float32)
     acc = tl.zeros((BLOCK_D,), dtype=tl.float32)
 
+    # When 4-bit packed, two coords share a byte. d_pack picks the byte,
+    # is_high picks the nibble. Computed once outside the loop.
+    if USE_4BIT_PACK:
+        d_pack = d_idx // 2                  # (BLOCK_D,)
+        is_high = (d_idx % 2) == 1           # (BLOCK_D,)
+
     for block_i in range(0, max_blocks_per_seq):
         if block_i < num_blocks_q:
             phys_block = tl.load(
@@ -104,10 +114,10 @@ def _attend_kernel(
             for tok_in_block in tl.static_range(0, BLOCK_BS):
                 abs_pos = block_i * block_size + tok_in_block
                 if abs_pos < kv_end:
-                    base = (
-                        phys_block * block_size * num_heads_kv * head_size
-                        + tok_in_block * num_heads_kv * head_size
-                        + kvh_idx * head_size
+                    base_idx = (
+                        phys_block * block_size * num_heads_kv * idx_dim
+                        + tok_in_block * num_heads_kv * idx_dim
+                        + kvh_idx * idx_dim
                     )
                     meta = (
                         phys_block * block_size * num_heads_kv
@@ -115,17 +125,35 @@ def _attend_kernel(
                         + kvh_idx
                     )
 
-                    # K dequant + logit.
-                    k_idx_u8 = tl.load(
-                        cache_k_idx_ptr + base + d_idx, mask=mask_d, other=0
-                    ).to(tl.int32)
+                    # K idx load: packed or unpacked.
+                    if USE_4BIT_PACK:
+                        packed_k = tl.load(
+                            cache_k_idx_ptr + base_idx + d_pack,
+                            mask=mask_d, other=0,
+                        ).to(tl.uint8)
+                        k_low = packed_k & 0xF
+                        k_high = (packed_k >> 4) & 0xF
+                        k_idx_u8 = tl.where(is_high, k_high, k_low).to(tl.int32)
+                    else:
+                        k_idx_u8 = tl.load(
+                            cache_k_idx_ptr + base_idx + d_idx,
+                            mask=mask_d, other=0,
+                        ).to(tl.int32)
+
                     rk = tl.load(codebook_ptr + k_idx_u8).to(tl.float32)
                     main_dot = tl.sum(q_rot * rk)
                     k_norm = tl.load(cache_k_norm_ptr + meta)
 
                     if USE_QJL:
+                        # QJL sign cache is unpacked int8 -- uses the
+                        # logical head_size stride, not idx_dim.
+                        base_full = (
+                            phys_block * block_size * num_heads_kv * head_size
+                            + tok_in_block * num_heads_kv * head_size
+                            + kvh_idx * head_size
+                        )
                         qjl_sign = tl.load(
-                            cache_k_qjl_sign_ptr + base + d_idx,
+                            cache_k_qjl_sign_ptr + base_full + d_idx,
                             mask=mask_d, other=0,
                         ).to(tl.float32)
                         qjl_dot = tl.sum(sq * qjl_sign)
@@ -136,11 +164,22 @@ def _attend_kernel(
                         logit = main_dot * k_norm * inv_d
 
                     # V dequant in rotated space (||·|| = sqrt(d) per slot).
-                    # The post-rotation is applied once per (query, head)
-                    # in the Python wrapper, not per slot here.
-                    v_idx_u8 = tl.load(
-                        cache_v_idx_ptr + base + d_idx, mask=mask_d, other=0
-                    ).to(tl.int32)
+                    # Post-rotation is applied once per (query, head) in
+                    # the Python wrapper, not per slot here.
+                    if USE_4BIT_PACK:
+                        packed_v = tl.load(
+                            cache_v_idx_ptr + base_idx + d_pack,
+                            mask=mask_d, other=0,
+                        ).to(tl.uint8)
+                        v_low = packed_v & 0xF
+                        v_high = (packed_v >> 4) & 0xF
+                        v_idx_u8 = tl.where(is_high, v_high, v_low).to(tl.int32)
+                    else:
+                        v_idx_u8 = tl.load(
+                            cache_v_idx_ptr + base_idx + d_idx,
+                            mask=mask_d, other=0,
+                        ).to(tl.int32)
+
                     rv = tl.load(codebook_ptr + v_idx_u8).to(tl.float32)
                     v_norm = tl.load(cache_v_norm_ptr + meta)
                     v_vec = rv * v_norm
@@ -181,7 +220,7 @@ def turboquant_paged_attention(
     softmax-weighted V sum.
     """
     num_query_tokens, num_heads_q, head_size = q.shape
-    _, block_size, num_heads_kv, _ = cache_k_idx.shape
+    _, block_size, num_heads_kv, idx_dim = cache_k_idx.shape
     num_seqs = int(seq_lens.shape[0])
     assert query_start_loc.shape[0] == num_seqs + 1
     assert block_table.shape[0] >= num_seqs
@@ -191,6 +230,13 @@ def turboquant_paged_attention(
         assert cache_k_qjl_sign is not None and cache_k_rnorm is not None
 
     codebook_f = state.codebook.to(torch.float32)
+    K_CB = int(codebook_f.shape[0])
+    use_4bit_pack = K_CB <= 16
+    expected_idx_dim = head_size // 2 if use_4bit_pack else head_size
+    assert idx_dim == expected_idx_dim, (
+        f"cache_k_idx last dim {idx_dim} != expected {expected_idx_dim} "
+        f"(K_CB={K_CB}, head_size={head_size})"
+    )
 
     # Per-query metadata on-device (vectorized).
     dev = q.device
@@ -262,10 +308,12 @@ def turboquant_paged_attention(
         num_heads_q=num_heads_q,
         num_heads_kv=num_heads_kv,
         head_size=head_size,
+        idx_dim=idx_dim,
         block_size=block_size,
         BLOCK_D=BLOCK_D,
         BLOCK_BS=BLOCK_BS,
         USE_QJL=use_qjl,
+        USE_4BIT_PACK=use_4bit_pack,
     )
 
     # Post-rotate V back to original space:

@@ -252,17 +252,30 @@ class TurboQuantAttentionImpl(AttentionImpl):
         block_size = kv_cache.shape[2]
         device = kv_cache.device
 
-        shape_dim = (num_blocks, block_size, self.num_kv_heads, self.head_size)
+        # Pack two 4-bit indices per byte when the codebook fits in 4
+        # bits. ``QuantState.codebook`` size is 2^bits for mse and
+        # 2^(bits-1) for prod.
+        K_CB = 1 << (TURBOQUANT_BITS - 1 if TURBOQUANT_ALGO == "prod"
+                     else TURBOQUANT_BITS)
+        idx_last_dim = (
+            self.head_size // 2 if K_CB <= 16 else self.head_size
+        )
+
+        shape_idx = (num_blocks, block_size, self.num_kv_heads, idx_last_dim)
+        shape_full = (num_blocks, block_size, self.num_kv_heads, self.head_size)
         shape_meta = (num_blocks, block_size, self.num_kv_heads)
 
-        self._k_idx = torch.zeros(shape_dim, dtype=torch.uint8, device=device)
+        self._k_idx = torch.zeros(shape_idx, dtype=torch.uint8, device=device)
         self._k_norm = torch.zeros(shape_meta, dtype=torch.float32, device=device)
-        self._v_idx = torch.zeros(shape_dim, dtype=torch.uint8, device=device)
+        self._v_idx = torch.zeros(shape_idx, dtype=torch.uint8, device=device)
         self._v_norm = torch.zeros(shape_meta, dtype=torch.float32, device=device)
 
         if TURBOQUANT_ALGO == "prod":
+            # QJL sign stays unpacked int8 for now (-1 / +1 per coord).
+            # Could pack to a 1-bit bitfield (8x further saving on this
+            # buffer) -- left as a follow-up.
             self._k_qjl_sign = torch.zeros(
-                shape_dim, dtype=torch.int8, device=device
+                shape_full, dtype=torch.int8, device=device
             )
             self._k_rnorm = torch.zeros(
                 shape_meta, dtype=torch.float32, device=device

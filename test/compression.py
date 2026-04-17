@@ -32,18 +32,23 @@ import math
 
 def static_layer_bytes(
     num_blocks: int, block_size: int, num_kv_heads: int, head_size: int,
-    algo: str,
+    algo: str, bits: int,
 ) -> dict[str, int]:
     """Bytes per layer for our K + V cache buffers."""
+    K_CB = 1 << (bits - 1 if algo == "prod" else bits)
+    pack_4bit = K_CB <= 16
+    idx_last = head_size // 2 if pack_4bit else head_size
     dim_elems = num_blocks * block_size * num_kv_heads * head_size
+    idx_elems = num_blocks * block_size * num_kv_heads * idx_last
     meta_elems = num_blocks * block_size * num_kv_heads
     out = {
-        "k_idx (uint8)": dim_elems * 1,
+        "k_idx (uint8)": idx_elems * 1,
         "k_norm (fp32)": meta_elems * 4,
-        "v_idx (uint8)": dim_elems * 1,
+        "v_idx (uint8)": idx_elems * 1,
         "v_norm (fp32)": meta_elems * 4,
     }
     if algo == "prod":
+        # QJL sign stays unpacked int8 for now.
         out["k_qjl_sign (int8)"] = dim_elems * 1
         out["k_rnorm (fp32)"] = meta_elems * 4
     return out
@@ -69,43 +74,44 @@ def report(num_blocks, block_size, num_kv_heads, head_size, num_layers):
           f"num_kv_heads={num_kv_heads} head_size={head_size} "
           f"num_layers={num_layers}")
     print()
-    print(f"{'algo':<6} {'per-layer K+V':>14} {'all layers':>14} "
-          f"{'bf16 all layers':>16} {'B/coord':>10} {'ratio':>8}")
-    print("-" * 75)
+    print(f"{'algo':<6} {'bits':>5} {'per-layer K+V':>14} "
+          f"{'all layers':>14} {'bf16 all layers':>16} "
+          f"{'B/coord':>10} {'ratio':>8}")
+    print("-" * 87)
     bf16_layer = bf16_baseline_layer_bytes(
         num_blocks, block_size, num_kv_heads, head_size)
     bf16_total = bf16_layer * num_layers
     coords_per_layer = num_blocks * block_size * num_kv_heads * head_size
 
     for algo in ("mse", "prod"):
-        sizes = static_layer_bytes(
-            num_blocks, block_size, num_kv_heads, head_size, algo)
-        layer_total = sum(sizes.values())
-        full_total = layer_total * num_layers
-        # bytes-per-coord counts EACH coord for K and V separately,
-        # so denominator = 2 * coords_per_layer.
-        b_per_coord = layer_total / (2 * coords_per_layer)
-        ratio = bf16_total / full_total
-        print(f"{algo:<6} {fmt_bytes(layer_total):>14} "
-              f"{fmt_bytes(full_total):>14} {fmt_bytes(bf16_total):>16} "
-              f"{b_per_coord:>9.3f}  {ratio:>7.2f}x")
+        for bits in (4, 8):
+            sizes = static_layer_bytes(
+                num_blocks, block_size, num_kv_heads, head_size, algo, bits)
+            layer_total = sum(sizes.values())
+            full_total = layer_total * num_layers
+            b_per_coord = layer_total / (2 * coords_per_layer)
+            ratio = bf16_total / full_total
+            print(f"{algo:<6} {bits:>5} {fmt_bytes(layer_total):>14} "
+                  f"{fmt_bytes(full_total):>14} "
+                  f"{fmt_bytes(bf16_total):>16} "
+                  f"{b_per_coord:>9.3f}  {ratio:>7.2f}x")
 
     print()
-    print("Per-buffer breakdown (algo=mse):")
-    for name, b in static_layer_bytes(
-            num_blocks, block_size, num_kv_heads, head_size, "mse").items():
-        print(f"  {name:<20} {fmt_bytes(b)}")
-    print()
-    print("Per-buffer breakdown (algo=prod):")
-    for name, b in static_layer_bytes(
-            num_blocks, block_size, num_kv_heads, head_size, "prod").items():
-        print(f"  {name:<20} {fmt_bytes(b)}")
+    print("Per-buffer breakdown:")
+    for algo in ("mse", "prod"):
+        for bits in (4, 8):
+            print(f"  algo={algo}  bits={bits}:")
+            for name, b in static_layer_bytes(
+                    num_blocks, block_size, num_kv_heads, head_size,
+                    algo, bits).items():
+                print(f"    {name:<20} {fmt_bytes(b)}")
     print()
     print("NOTES:")
-    print("  - bits=4 vs bits=8 makes NO difference here (we use uint8 "
-          "regardless).")
-    print("    Real bits=4 compression needs nibble packing "
-          "(2x 4-bit per byte) -- not yet implemented.")
+    print("  - bits=4 packs two 4-bit indices per byte (head_size//2 "
+          "storage).")
+    print("  - bits=8 stores one index per byte (full head_size).")
+    print("  - QJL sign for prod is still int8 unpacked (could become a "
+          "1-bit bitfield for further savings).")
     print("  - vLLM still allocates its own bf16 kv_cache that we ignore;"
           " that's separate wasted memory.")
 

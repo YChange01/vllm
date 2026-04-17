@@ -50,12 +50,14 @@ def reference_attention(
 
 
 def _alloc_cache(num_blocks: int, block_size: int, num_heads_kv: int,
-                 head_size: int, device, algo: str):
-    c_k_idx = torch.zeros(num_blocks, block_size, num_heads_kv, head_size,
+                 head_size: int, device, algo: str, bits: int):
+    K_CB = 1 << (bits - 1 if algo == "prod" else bits)
+    idx_last = head_size // 2 if K_CB <= 16 else head_size
+    c_k_idx = torch.zeros(num_blocks, block_size, num_heads_kv, idx_last,
                           dtype=torch.uint8, device=device)
     c_k_norm = torch.zeros(num_blocks, block_size, num_heads_kv,
                            dtype=torch.float32, device=device)
-    c_v_idx = torch.zeros(num_blocks, block_size, num_heads_kv, head_size,
+    c_v_idx = torch.zeros(num_blocks, block_size, num_heads_kv, idx_last,
                           dtype=torch.uint8, device=device)
     c_v_norm = torch.zeros(num_blocks, block_size, num_heads_kv,
                            dtype=torch.float32, device=device)
@@ -77,7 +79,7 @@ def _run_algo(algo: str, num_tokens: int, bits: int, q, k, v, slot_mapping,
                        seed=42, dtype=dtype, device=device)
     (c_k_idx, c_k_norm, c_v_idx, c_v_norm,
      c_k_qjl, c_k_rnorm) = _alloc_cache(
-        num_blocks, block_size, num_heads_kv, head_size, device, algo,
+        num_blocks, block_size, num_heads_kv, head_size, device, algo, bits,
     )
     turboquant_store_kv(
         new_k=k,
