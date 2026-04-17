@@ -1,43 +1,33 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Flash-decoding + LUT-gather Triton attend kernel for TurboQuant.
+"""Triton attend kernel for TurboQuant -- flash-decoding variant.
 
-Two-kernel pipeline:
+History note (keep):
+  An earlier version of this file built a per-program LUT
+      LUT[j, c] = q_rot[j] * codebook[c]
+  in registers and gathered via mask-sum. On B200 the mask-sum gather
+  paid K_CB x more register ops per KV slot without a corresponding
+  HW shmem gather benefit, and it hurt throughput. It has been removed.
+  This file is now a pure flash-decoding (split-KV) attend with direct
+  per-slot codebook gather -- same per-slot inner loop as ``attend.py``
+  but with two delivery modes:
 
-  1. ``_flash_lut_attend_kernel``  grid = (T_q, H_q, K_SPLIT)
-     - Each program owns one (query, head) and one K-split chunk of the
-       KV sequence. Per-program register LUT
-           LUT[j, c] = q_rot[j] * codebook[c]      (BLOCK_D x K_CB fp32)
-       is built once and reused for all slots in the chunk. Per slot,
-       ``main_dot = sum_j LUT[j, k_idx[j]]`` is computed via mask-sum
-       gather over the register LUT. V is dequantized per slot via the
-       small (K_CB <= 16) shared codebook.
-     - Writes partial (m_i, l_i, acc) for this split to scratch.
+    1. Split mode (T_q == 1, long ctx): grid (1, H_q, K_SPLIT), each
+       program scans ~ctx/K_SPLIT slots and writes a partial
+       (m, l, acc) triple; a combine kernel online-softmax-merges them.
+       Lifts SM occupancy at batch=1 decode where the base kernel's
+       (1, H_q) grid leaves most SMs idle.
+    2. Direct mode (T_q >= 2 or ctx too short): grid (T_q, H_q, 1),
+       single pass, writes directly to ``out`` with no combine. Same
+       cost as the base kernel, avoiding the combine-kernel launch +
+       partial scratch allocations when they wouldn't help.
 
-  2. ``_combine_kernel``  grid = (T_q, H_q)
-     - Online-softmax-merges the K_SPLIT partials into the final
-       softmax-weighted V sum in rotated space. Single pass.
+Toggle ``TURBOQUANT_USE_LUT=1`` switches the backend to this path.
+Autotune picks (num_warps, num_stages) keyed by the kernel signature.
 
-Motivations:
-
-  * Occupancy. Base kernel grid was (T_q, H_q). At decode T_q=1 and
-    H_q=32 that is 32 programs -- B200 has 108 SMs, so occupancy
-    capped at ~30%. Splitting the KV dim gives (1, 32, K_SPLIT) =
-    32 * K_SPLIT programs. For K_SPLIT >= 4 we saturate SMs.
-
-  * LUT. One Python matmul (q * signs @ H.T) per layer is kept; the
-    kernel's per-slot K dequant becomes a register-LUT gather. V
-    dequant is per-slot codebook lookup -- V is reconstructed as a
-    full d-dim vector, so a per-(j,c) LUT gives no benefit.
-
-  * Autotune. Tune (num_warps, num_stages) at JIT time keyed by the
-    head-size / K_CB / K_SPLIT / USE_QJL quadruple.
-
-Scope: b=4 only (K_CB <= 16). K/V idx caches are always 4-bit
-nibble-packed (two indices per uint8). QJL sign cache is 1-bit packed
-(8 signs per byte). Post-rotation of the V accumulator back to the
-original space is done in Python on the combine kernel's output --
-not fused here, to keep the combine kernel simple.
+Scope: b=4 only (K_CB <= 16, 4-bit nibble-packed K/V idx). QJL sign
+for prod is 1-bit packed (8 signs/byte). Post-rotation of V back to
+the original space is in Python on the kernel output.
 """
 
 from __future__ import annotations
@@ -59,27 +49,28 @@ _NEG_LARGE = tl.constexpr(-1.0e30)
 # ---------------------------------------------------------------------------
 # K_SPLIT policy
 # ---------------------------------------------------------------------------
-# Pick K_SPLIT based on max seq len so that each split processes roughly
-# ~_KV_CHUNK_TARGET slots. Quantized to a small set of power-of-two values
-# to keep the Triton JIT cache small. Must cover decode (T_q=1, need high
-# K_SPLIT) and prefill (T_q large, K_SPLIT=1 is fine because the (T_q, H_q)
-# grid already has plenty of programs).
-_KV_CHUNK_TARGET = 256
-_K_SPLIT_CHOICES = (1, 4, 8, 16, 32, 64)
+# Rules:
+#   * T_q * H_q >= SM_TARGET  -> grid is already big enough; K_SPLIT = 1.
+#   * max_seq_len < MIN_SLOTS_PER_SPLIT -> splitting would make each chunk
+#     too small; K_SPLIT = 1.
+#   * Otherwise pick the smallest power of two in _CHOICES that gives
+#     T_q * H_q * K_SPLIT >= SM_TARGET, and each split processes
+#     >= MIN_SLOTS_PER_SPLIT slots.
+_SM_TARGET = 256                     # programs needed to saturate B200 SMs
+_MIN_SLOTS_PER_SPLIT = 256
+_K_SPLIT_CHOICES = (1, 2, 4, 8, 16, 32, 64)
 
 
 def _pick_k_split(max_seq_len: int, num_query_tokens: int,
                   num_heads_q: int) -> int:
-    """Choose K_SPLIT balancing per-program work against grid size."""
-    # Prefill: grid (T_q, H_q) already large, don't split.
-    if num_query_tokens > 16:
+    base_programs = num_query_tokens * num_heads_q
+    if base_programs >= _SM_TARGET:
         return 1
-    # Decode: want K_SPLIT * H_q >= ~256 programs to saturate SMs.
-    want = max(
-        1,
-        (max_seq_len + _KV_CHUNK_TARGET - 1) // _KV_CHUNK_TARGET,
-    )
-    want = max(want, 256 // max(num_heads_q, 1))
+    if max_seq_len < _MIN_SLOTS_PER_SPLIT:
+        return 1
+    want_for_sm = (_SM_TARGET + base_programs - 1) // base_programs
+    want_for_kv = max(1, max_seq_len // _MIN_SLOTS_PER_SPLIT)
+    want = min(want_for_sm, want_for_kv)
     for choice in _K_SPLIT_CHOICES:
         if choice >= want:
             return choice
@@ -87,7 +78,7 @@ def _pick_k_split(max_seq_len: int, num_query_tokens: int,
 
 
 # ---------------------------------------------------------------------------
-# Autotuned attend kernel
+# Attend kernel (autotuned)
 # ---------------------------------------------------------------------------
 _AUTOTUNE_CONFIGS = [
     triton.Config({}, num_warps=2, num_stages=2),
@@ -100,10 +91,10 @@ _AUTOTUNE_CONFIGS = [
 
 @triton.autotune(
     configs=_AUTOTUNE_CONFIGS,
-    key=["head_size", "K_CB", "K_SPLIT", "USE_QJL"],
+    key=["head_size", "K_CB", "K_SPLIT", "USE_QJL", "WRITE_DIRECT"],
 )
 @triton.jit
-def _flash_lut_attend_kernel(
+def _attend_kernel(
     q_rotated_ptr,                  # (T_q, H_q, d) fp16/bf16
     Sq_ptr,                         # (T_q, H_q, d) fp16/bf16  prod only
     cache_k_idx_ptr,                # (num_blocks, bs, H_kv, d/2) uint8
@@ -116,12 +107,14 @@ def _flash_lut_attend_kernel(
     seq_id_per_query_ptr,           # (T_q,) int32
     kv_end_per_query_ptr,           # (T_q,) int32  one-past-last kv pos
     codebook_ptr,                   # (K_CB,) fp32
-    partial_m_ptr,                  # (T_q, H_q, K_SPLIT) fp32
-    partial_l_ptr,                  # (T_q, H_q, K_SPLIT) fp32
-    partial_acc_ptr,                # (T_q, H_q, K_SPLIT, d) fp32
+    out_ptr,                        # (T_q, H_q, d) fp16/bf16  direct mode
+    partial_m_ptr,                  # (T_q, H_q, K_SPLIT) fp32  split mode
+    partial_l_ptr,                  # (T_q, H_q, K_SPLIT) fp32  split mode
+    partial_acc_ptr,                # (T_q, H_q, K_SPLIT, d) fp32 split mode
     inv_d,
     qjl_coef,
     block_table_stride,
+    OUT_DTYPE: tl.constexpr,
     num_heads_q: tl.constexpr,
     num_heads_kv: tl.constexpr,
     head_size: tl.constexpr,
@@ -132,6 +125,7 @@ def _flash_lut_attend_kernel(
     K_CB: tl.constexpr,
     USE_QJL: tl.constexpr,
     K_SPLIT: tl.constexpr,
+    WRITE_DIRECT: tl.constexpr,
 ):
     q_idx = tl.program_id(0)
     qh_idx = tl.program_id(1)
@@ -143,36 +137,19 @@ def _flash_lut_attend_kernel(
     seq_idx = tl.load(seq_id_per_query_ptr + q_idx)
     kv_end = tl.load(kv_end_per_query_ptr + q_idx)
 
-    # Per-split KV range (ceil-div so the last split handles the tail).
+    # Per-split KV range. When K_SPLIT == 1, kv_lo=0, kv_hi=kv_end.
     kv_per_split = (kv_end + K_SPLIT - 1) // K_SPLIT
     kv_lo = split_idx * kv_per_split
     kv_hi = tl.minimum((split_idx + 1) * kv_per_split, kv_end)
 
     d_idx = tl.arange(0, BLOCK_D)
-    c_idx = tl.arange(0, K_CB)
     mask_d = d_idx < head_size
 
-    # Output offsets for partials.
-    partial_scalar_off = (q_idx * num_heads_q + qh_idx) * K_SPLIT + split_idx
-    partial_acc_off = (
-        ((q_idx * num_heads_q + qh_idx) * K_SPLIT + split_idx) * head_size
-        + d_idx
-    )
-
-    # Load Q rotated (and Sq for prod) into registers.
+    # Query-side loads (once per program).
     q_off = (q_idx * num_heads_q + qh_idx) * head_size + d_idx
     q_rot = tl.load(q_rotated_ptr + q_off, mask=mask_d, other=0.0).to(tl.float32)
     if USE_QJL:
         sq = tl.load(Sq_ptr + q_off, mask=mask_d, other=0.0).to(tl.float32)
-
-    # Small codebook (K_CB <= 16 scalars). Load once per program.
-    codebook_vec = tl.load(codebook_ptr + c_idx).to(tl.float32)
-
-    # Per-(query, head) LUT in registers:
-    #     LUT[j, c] = q_rot[j] * codebook[c]
-    # For head_size=128, K_CB=16 -> (128, 16) = 2048 fp32 = 8 KB. Compiler
-    # decides between registers and shared memory.
-    LUT = q_rot[:, None] * codebook_vec[None, :]
 
     m_i = tl.full((), _NEG_LARGE, dtype=tl.float32)
     l_i = tl.zeros((), dtype=tl.float32)
@@ -203,7 +180,7 @@ def _flash_lut_attend_kernel(
                     + kvh_idx
                 )
 
-                # --- K dequant + main_dot via LUT gather ---
+                # K dequant: nibble unpack + direct codebook lookup.
                 packed_k = tl.load(
                     cache_k_idx_ptr + base_idx + d_pack,
                     mask=mask_d, other=0,
@@ -212,8 +189,8 @@ def _flash_lut_attend_kernel(
                 k_high = (packed_k >> 4) & 0xF
                 k_idx_u8 = tl.where(is_high, k_high, k_low).to(tl.int32)
 
-                one_hot = (k_idx_u8[:, None] == c_idx[None, :])
-                main_dot = tl.sum(tl.where(one_hot, LUT, 0.0))
+                rk = tl.load(codebook_ptr + k_idx_u8).to(tl.float32)
+                main_dot = tl.sum(q_rot * rk)
 
                 k_norm = tl.load(cache_k_norm_ptr + meta)
 
@@ -238,7 +215,7 @@ def _flash_lut_attend_kernel(
                 else:
                     logit = main_dot * k_norm * inv_d
 
-                # --- V dequant (per-slot, shared small codebook) ---
+                # V dequant.
                 packed_v = tl.load(
                     cache_v_idx_ptr + base_idx + d_pack,
                     mask=mask_d, other=0,
@@ -251,7 +228,7 @@ def _flash_lut_attend_kernel(
                 v_norm = tl.load(cache_v_norm_ptr + meta)
                 v_vec = rv * v_norm
 
-                # --- Flash softmax online accumulation ---
+                # Online softmax accumulation.
                 m_new = tl.maximum(m_i, logit)
                 alpha = tl.exp(m_i - m_new)
                 beta = tl.exp(logit - m_new)
@@ -259,20 +236,34 @@ def _flash_lut_attend_kernel(
                 acc = acc * alpha + beta * v_vec
                 m_i = m_new
 
-    tl.store(partial_m_ptr + partial_scalar_off, m_i)
-    tl.store(partial_l_ptr + partial_scalar_off, l_i)
-    tl.store(partial_acc_ptr + partial_acc_off, acc, mask=mask_d)
+    if WRITE_DIRECT:
+        # K_SPLIT must be 1 here. Normalize and emit final output.
+        out_vec = acc / tl.maximum(l_i, 1e-12)
+        out_off = (q_idx * num_heads_q + qh_idx) * head_size + d_idx
+        tl.store(out_ptr + out_off, out_vec.to(OUT_DTYPE), mask=mask_d)
+    else:
+        # Emit partial for this split; combine kernel finishes the job.
+        partial_scalar_off = (
+            (q_idx * num_heads_q + qh_idx) * K_SPLIT + split_idx
+        )
+        partial_acc_off = (
+            ((q_idx * num_heads_q + qh_idx) * K_SPLIT + split_idx) * head_size
+            + d_idx
+        )
+        tl.store(partial_m_ptr + partial_scalar_off, m_i)
+        tl.store(partial_l_ptr + partial_scalar_off, l_i)
+        tl.store(partial_acc_ptr + partial_acc_off, acc, mask=mask_d)
 
 
 # ---------------------------------------------------------------------------
-# Combine kernel: merge K_SPLIT partials into final output (rotated space)
+# Combine kernel (only invoked when K_SPLIT > 1)
 # ---------------------------------------------------------------------------
 @triton.jit
 def _combine_kernel(
     partial_m_ptr,                  # (T_q, H_q, K_SPLIT) fp32
     partial_l_ptr,                  # (T_q, H_q, K_SPLIT) fp32
     partial_acc_ptr,                # (T_q, H_q, K_SPLIT, d) fp32
-    out_ptr,                        # (T_q, H_q, d) fp16/bf16 rotated space
+    out_ptr,                        # (T_q, H_q, d) OUT_DTYPE
     num_heads_q: tl.constexpr,
     head_size: tl.constexpr,
     BLOCK_D: tl.constexpr,
@@ -312,6 +303,9 @@ def _combine_kernel(
     tl.store(out_ptr + out_off, out_vec.to(OUT_DTYPE), mask=mask_d)
 
 
+# ---------------------------------------------------------------------------
+# Python wrapper
+# ---------------------------------------------------------------------------
 def turboquant_paged_attention_lut(
     q: torch.Tensor,
     cache_k_idx: torch.Tensor,
@@ -325,12 +319,6 @@ def turboquant_paged_attention_lut(
     cache_k_qjl_sign: torch.Tensor | None = None,
     cache_k_rnorm: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Flash-decoding + LUT paged attention.
-
-    Same interface as ``turboquant_paged_attention``. Decides K_SPLIT
-    from ``seq_lens.max()`` and T_q, launches the split attend kernel
-    plus the combine kernel, then Python-side post-rotates V.
-    """
     num_query_tokens, num_heads_q, head_size = q.shape
     _, block_size, num_heads_kv, idx_dim = cache_k_idx.shape
     num_seqs = int(seq_lens.shape[0])
@@ -347,12 +335,10 @@ def turboquant_paged_attention_lut(
         f"LUT kernel is b=4 only (K_CB <= 16); got K_CB={K_CB}"
     )
     assert idx_dim == head_size // 2, (
-        f"cache_k_idx last dim {idx_dim} != head_size/2; "
-        f"LUT kernel requires 4-bit nibble pack"
+        f"cache_k_idx last dim {idx_dim} != head_size/2 -- b=4 only"
     )
 
     dev = q.device
-
     qsl = query_start_loc.to(device=dev, dtype=torch.int64)
     query_lens = qsl[1:] - qsl[:-1]
     seq_ids = torch.arange(num_seqs, dtype=torch.int64, device=dev)
@@ -368,8 +354,6 @@ def turboquant_paged_attention_lut(
     seq_id_per_query = seq_id_per_query_i64.to(torch.int32).contiguous()
     kv_end_per_query = kv_end_per_query_i64.to(torch.int32).contiguous()
 
-    # Pre-rotate Q (and Sq for prod) in Python. Hadamard is symmetric
-    # so H.T == H; keeping the .T for explicitness in code reading.
     H_f = state.H.to(torch.float32)
     signs_f = state.signs.to(torch.float32)
     q_f = q.float()
@@ -394,13 +378,7 @@ def turboquant_paged_attention_lut(
 
     max_seq_len = int(seq_lens.max().item())
     K_SPLIT = _pick_k_split(max_seq_len, num_query_tokens, num_heads_q)
-
-    # Scratch buffers for partials.
-    partial_shape_scalar = (num_query_tokens, num_heads_q, K_SPLIT)
-    partial_shape_acc = (num_query_tokens, num_heads_q, K_SPLIT, head_size)
-    partial_m = torch.empty(partial_shape_scalar, dtype=torch.float32, device=dev)
-    partial_l = torch.empty(partial_shape_scalar, dtype=torch.float32, device=dev)
-    partial_acc = torch.empty(partial_shape_acc, dtype=torch.float32, device=dev)
+    write_direct = (K_SPLIT == 1)
 
     out = torch.empty_like(q)
     BLOCK_D = triton.next_power_of_2(head_size)
@@ -410,9 +388,26 @@ def turboquant_paged_attention_lut(
     qjl_coef = math.sqrt(math.pi / 2.0) / float(head_size)
     block_table_stride = int(block_table.shape[1])
 
-    # 1) Attend kernel — fills partials.
+    # Allocate partial scratch only when we actually split.
+    if write_direct:
+        # Dummy 1-element fp32 tensors so pointers are valid; the kernel
+        # branch that reads/writes them is dead (constexpr-guarded).
+        partial_m = torch.empty(1, dtype=torch.float32, device=dev)
+        partial_l = torch.empty(1, dtype=torch.float32, device=dev)
+        partial_acc = torch.empty(1, dtype=torch.float32, device=dev)
+    else:
+        partial_m = torch.empty(
+            (num_query_tokens, num_heads_q, K_SPLIT),
+            dtype=torch.float32, device=dev,
+        )
+        partial_l = torch.empty_like(partial_m)
+        partial_acc = torch.empty(
+            (num_query_tokens, num_heads_q, K_SPLIT, head_size),
+            dtype=torch.float32, device=dev,
+        )
+
     grid_attend = (num_query_tokens, num_heads_q, K_SPLIT)
-    _flash_lut_attend_kernel[grid_attend](
+    _attend_kernel[grid_attend](
         q_rotated_k,
         Sq_k,
         cache_k_idx,
@@ -425,12 +420,14 @@ def turboquant_paged_attention_lut(
         seq_id_per_query,
         kv_end_per_query,
         codebook_f,
+        out,
         partial_m,
         partial_l,
         partial_acc,
         inv_d,
         qjl_coef,
         block_table_stride,
+        OUT_DTYPE=OUT_DTYPE,
         num_heads_q=num_heads_q,
         num_heads_kv=num_heads_kv,
         head_size=head_size,
@@ -441,22 +438,22 @@ def turboquant_paged_attention_lut(
         K_CB=K_CB,
         USE_QJL=use_qjl,
         K_SPLIT=K_SPLIT,
+        WRITE_DIRECT=write_direct,
     )
 
-    # 2) Combine kernel — online-softmax merge, writes `out` in rotated
-    # V space.
-    grid_combine = (num_query_tokens, num_heads_q)
-    _combine_kernel[grid_combine](
-        partial_m,
-        partial_l,
-        partial_acc,
-        out,
-        num_heads_q=num_heads_q,
-        head_size=head_size,
-        BLOCK_D=BLOCK_D,
-        K_SPLIT=K_SPLIT,
-        OUT_DTYPE=OUT_DTYPE,
-    )
+    if not write_direct:
+        grid_combine = (num_query_tokens, num_heads_q)
+        _combine_kernel[grid_combine](
+            partial_m,
+            partial_l,
+            partial_acc,
+            out,
+            num_heads_q=num_heads_q,
+            head_size=head_size,
+            BLOCK_D=BLOCK_D,
+            K_SPLIT=K_SPLIT,
+            OUT_DTYPE=OUT_DTYPE,
+        )
 
     # Post-rotate V back to original space.
     out_f = out.float()
