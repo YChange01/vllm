@@ -51,18 +51,18 @@ _NEG_LARGE = tl.constexpr(-1.0e30)
 
 
 # =========================================================================
-# Store kernel: quantize K (mse or prod), store V as-is in bf16/fp16
-# V is kept in the input dtype -- paper only quantizes K, and int8 V
-# produced outputs exceeding max|v| in long-prefill cases (|attn|.max >
-# max|v| is mathematically impossible for correct softmax-weighted sum).
+# Store kernel: quantize K (mse or prod) only.
+# V is now stored in Python (do_kv_cache_update) -- multi-token grids of
+# this kernel produced corrupted V (stored_v|.|max == |k|max instead of
+# |v|max) on B200, even when V was stored as the very first op after
+# load. Decode (single-token grid) was fine. The Python copy bypasses
+# whatever Triton multi-program issue triggers it.
 # =========================================================================
 @triton.jit
 def _store_kernel(
     new_k_ptr,                      # (T, H_kv, d) fp16/bf16
-    new_v_ptr,                      # (T, H_kv, d) fp16/bf16
     cache_k_idx_ptr,                # (num_blocks, bs, H_kv, d) uint8
     cache_k_norm_ptr,               # (num_blocks, bs, H_kv) fp32
-    cache_v_fp_ptr,                 # (num_blocks, bs, H_kv, d) fp16/bf16 -- V raw
     cache_k_qjl_sign_ptr,           # int8 (prod only; unused if USE_QJL=False)
     cache_k_rnorm_ptr,              # fp32 (prod only)
     slot_mapping_ptr,               # (T,) int64
@@ -77,7 +77,6 @@ def _store_kernel(
     K_CB: tl.constexpr,
     BLOCK_D: tl.constexpr,
     USE_QJL: tl.constexpr,
-    V_DTYPE: tl.constexpr,
 ):
     """One program = one (token, kv_head) pair."""
     tok = tl.program_id(0)
@@ -106,21 +105,9 @@ def _store_kernel(
         + head
     )
 
-    # --- V FIRST ---
-    # Store V immediately after load. Empirically, leaving the V store
-    # at the end of the kernel (after the 255-iteration K Lloyd-Max
-    # boundary loop and the H_tile (BLOCK_D x BLOCK_D) reduction) caused
-    # cache_v_fp to be partially overwritten with K-derived values --
-    # max stored V matched per-layer |k|max instead of input |v|max,
-    # producing |attn|.max > max|v| at decode (mathematically impossible
-    # for correct softmax-weighted sum). Suspected register-pressure /
-    # spill issue in Triton -- moving the store before any K work
-    # eliminates the window in which v_vec can be clobbered.
-    kv_off = (tok * num_heads_kv + head) * head_size + d_idx
-    v_vec = tl.load(new_v_ptr + kv_off, mask=mask_d, other=0.0).to(tl.float32)
-    tl.store(cache_v_fp_ptr + cache_off, v_vec.to(V_DTYPE), mask=mask_d)
-
     # --- K: load + rotation primitives ---
+    # V is stored separately in Python (see do_kv_cache_update).
+    kv_off = (tok * num_heads_kv + head) * head_size + d_idx
     k_vec = tl.load(new_k_ptr + kv_off, mask=mask_d, other=0.0).to(tl.float32)
 
     signs = tl.load(signs_ptr + d_idx, mask=mask_d, other=1.0).to(tl.float32)
@@ -280,17 +267,18 @@ def _attend_kernel(
 # =========================================================================
 def turboquant_store_kv(
     new_k: torch.Tensor,
-    new_v: torch.Tensor,
     cache_k_idx: torch.Tensor,
     cache_k_norm: torch.Tensor,
-    cache_v_fp: torch.Tensor,
     slot_mapping: torch.Tensor,
     state: "QuantState",
     block_size: int,
     cache_k_qjl_sign: torch.Tensor | None = None,
     cache_k_rnorm: torch.Tensor | None = None,
 ) -> None:
-    """Quantize K (Lloyd-Max) and copy V as-is into the paged cache.
+    """Quantize K (Lloyd-Max) into the paged cache.
+
+    V is stored separately in Python (caller's responsibility) -- a
+    multi-token Triton grid corrupted V even when V was the first store.
 
     ``cache_k_qjl_sign`` and ``cache_k_rnorm`` are required when
     ``state.algo == "prod"`` and must be ``None`` for ``"mse"``.
@@ -319,16 +307,12 @@ def turboquant_store_kv(
         qjl_sign_buf = cache_k_idx
         rnorm_buf = cache_k_norm
 
-    v_tl_dtype = tl.bfloat16 if cache_v_fp.dtype == torch.bfloat16 else tl.float16
-
     grid = (num_tokens, num_heads_kv)
     BLOCK_D = triton.next_power_of_2(head_size)
     _store_kernel[grid](
         new_k,
-        new_v,
         cache_k_idx,
         cache_k_norm,
-        cache_v_fp,
         qjl_sign_buf,
         rnorm_buf,
         slot_mapping,
@@ -343,7 +327,6 @@ def turboquant_store_kv(
         K_CB=K_CB,
         BLOCK_D=BLOCK_D,
         USE_QJL=use_qjl,
-        V_DTYPE=v_tl_dtype,
     )
 
 

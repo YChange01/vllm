@@ -79,13 +79,19 @@ def _run_algo(algo: str, num_tokens: int, bits: int, q, k, v, slot_mapping,
         num_blocks, block_size, num_heads_kv, head_size, device, algo, dtype,
     )
     turboquant_store_kv(
-        new_k=k, new_v=v,
+        new_k=k,
         cache_k_idx=c_k_idx, cache_k_norm=c_k_norm,
-        cache_v_fp=c_v_fp,
         slot_mapping=slot_mapping,
         state=state, block_size=block_size,
         cache_k_qjl_sign=c_k_qjl, cache_k_rnorm=c_k_rnorm,
     )
+    # V is stored in Python now (mirrors backend's do_kv_cache_update).
+    valid = slot_mapping >= 0
+    slots = slot_mapping[valid].to(torch.int64)
+    if slots.numel() > 0:
+        b_idx = slots // block_size
+        off = slots % block_size
+        c_v_fp[b_idx, off] = v[valid]
     torch.cuda.synchronize()
     out = turboquant_paged_attention(
         q=q,

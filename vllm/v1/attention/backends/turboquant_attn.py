@@ -420,26 +420,30 @@ class TurboQuantAttentionImpl(AttentionImpl):
 
         block_size = kv_cache.shape[2]
 
+        # V store: always direct python copy. The Triton store kernel had
+        # a num_tokens-dependent corruption of cache_v_fp (only multi-
+        # token grids were affected); decoupling V from the kernel is
+        # the only path that round-trips correctly.
+        valid = slot_mapping >= 0
+        slots = slot_mapping[valid].to(torch.int64)
+        if slots.numel() > 0:
+            b_idx = slots // block_size
+            off = slots % block_size
+            self._v_fp[b_idx, off] = v[valid]
+
         if TURBOQUANT_BYPASS:
-            valid = slot_mapping >= 0
-            slots = slot_mapping[valid].to(torch.int64)
             if slots.numel() > 0:
-                b_idx = slots // block_size
-                off = slots % block_size
                 self._k_fp[b_idx, off] = k[valid]
-                self._v_fp[b_idx, off] = v[valid]
             return
 
         state = self._ensure_state(key.dtype, key.device)
         turboquant_store_kv(
             new_k=k,
-            new_v=v,
             cache_k_idx=self._k_idx,
             cache_k_norm=self._k_norm,
-            cache_v_fp=self._v_fp,
             slot_mapping=slot_mapping,
             state=state,
-            block_size=kv_cache.shape[2],
+            block_size=block_size,
             cache_k_qjl_sign=self._k_qjl_sign,
             cache_k_rnorm=self._k_rnorm,
         )
