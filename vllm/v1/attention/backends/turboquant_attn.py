@@ -352,15 +352,25 @@ class TurboQuantAttentionImpl(AttentionImpl):
                 sm_full = slot_mapping.detach().cpu()
                 sm_head = sm_full[:16].tolist()
                 sm_nvalid = int((sm_full >= 0).sum().item())
-                k0 = k.detach().float().cpu()[:2, 0, :4].tolist()
-                v0 = v.detach().float().cpu()[:2, 0, :4].tolist()
+                k_f = k.detach().float()
+                v_f = v.detach().float()
+                k_norms = k_f.norm(dim=-1)  # (T, H_kv)
+                v_norms = v_f.norm(dim=-1)
+                k_abs_max = float(k_f.abs().max().item())
+                v_abs_max = float(v_f.abs().max().item())
+                k0 = k_f.cpu()[:2, 0, :4].tolist()
+                v0 = v_f.cpu()[:2, 0, :4].tolist()
                 _dbg(
                     f"[store L{self._layer_seed}] num_tokens={num_tokens} "
-                    f"key.shape={tuple(key.shape)} "
-                    f"kv_cache.shape={tuple(kv_cache.shape)} "
                     f"slot_mapping.len={sm_full.numel()} nvalid={sm_nvalid} "
-                    f"slot_mapping[:16]={sm_head} "
-                    f"bypass={TURBOQUANT_BYPASS} "
+                    f"slot_mapping[:16]={sm_head} bypass={TURBOQUANT_BYPASS} "
+                    f"||k||=(min={float(k_norms.min()):.3f},"
+                    f"max={float(k_norms.max()):.3f},"
+                    f"mean={float(k_norms.mean()):.3f}) "
+                    f"||v||=(min={float(v_norms.min()):.3f},"
+                    f"max={float(v_norms.max()):.3f},"
+                    f"mean={float(v_norms.mean()):.3f}) "
+                    f"|k|max={k_abs_max:.3f} |v|max={v_abs_max:.3f} "
                     f"k[:2,0,:4]={k0} v[:2,0,:4]={v0}"
                 )
             except Exception as e:
@@ -439,17 +449,21 @@ class TurboQuantAttentionImpl(AttentionImpl):
                 sm_full = attn_metadata.slot_mapping.detach().cpu()
                 sm_head = sm_full[:16].tolist()
                 sm_nvalid = int((sm_full >= 0).sum().item())
-                q0 = q.detach().float().cpu()[:1, 0, :4].tolist()
+                q_f = q.detach().float()
+                q_norms = q_f.norm(dim=-1)  # (T, H_q)
+                q_abs_max = float(q_f.abs().max().item())
+                q0 = q_f.cpu()[:1, 0, :4].tolist()
                 out_shape = tuple(output.shape)
                 _dbg(
                     f"[fwd   L{self._layer_seed}] num_tokens={num_tokens} "
                     f"q.shape={tuple(q.shape)} out.shape={out_shape} "
-                    f"scale={self.scale:.6f} "
-                    f"sqrt(1/d)={1.0/self.head_size**0.5:.6f} "
-                    f"qsl={qsl} seq_lens={sl} block_table[:4]={bt_head} "
-                    f"slot_mapping.len={sm_full.numel()} nvalid={sm_nvalid} "
-                    f"slot_mapping[:16]={sm_head} "
-                    f"bypass={TURBOQUANT_BYPASS} q[0,0,:4]={q0}"
+                    f"qsl={qsl} seq_lens={sl} bt[:4]={bt_head} "
+                    f"slot_mapping[:16]={sm_head} nvalid={sm_nvalid} "
+                    f"||q||=(min={float(q_norms.min()):.3f},"
+                    f"max={float(q_norms.max()):.3f},"
+                    f"mean={float(q_norms.mean()):.3f}) "
+                    f"|q|max={q_abs_max:.3f} bypass={TURBOQUANT_BYPASS} "
+                    f"q[0,0,:4]={q0}"
                 )
             except Exception as e:
                 _dbg(f"[fwd L{self._layer_seed}] dbg err: {e}")
@@ -484,14 +498,20 @@ class TurboQuantAttentionImpl(AttentionImpl):
         output.copy_(attn_out.reshape_as(output))
         if _cnt_f < _DEBUG_MAX_PER_LAYER and num_tokens != 8192:
             try:
-                a0 = attn_out.detach().float().cpu().reshape(-1)[:4].tolist()
+                a_f = attn_out.detach().float()
+                a0 = a_f.cpu().reshape(-1)[:4].tolist()
                 o0 = output.detach().float().cpu().reshape(-1)[:4].tolist()
+                a_mean = float(a_f.abs().mean().item())
+                a_max = float(a_f.abs().max().item())
                 o_mean = float(output.detach().float().abs().mean().item())
-                a_mean = float(attn_out.detach().float().abs().mean().item())
+                a_nan = bool(a_f.isnan().any().item())
+                a_inf = bool(a_f.isinf().any().item())
                 _dbg(
                     f"[out   L{self._layer_seed}] call={_cnt_f} "
                     f"attn_out[:4]={a0} output[:4]={o0} "
-                    f"|attn|.mean={a_mean:.4f} |out|.mean={o_mean:.4f}"
+                    f"|attn|.mean={a_mean:.4f} |attn|.max={a_max:.4f} "
+                    f"|out|.mean={o_mean:.4f} "
+                    f"nan={a_nan} inf={a_inf}"
                 )
             except Exception as e:
                 _dbg(f"[out L{self._layer_seed}] dbg err: {e}")

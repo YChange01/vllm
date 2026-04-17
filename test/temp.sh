@@ -1,19 +1,17 @@
 #!/usr/bin/env bash
 # One-shot diagnostic scratchpad. Overwritten every time.
 #
-# Current probe: verify the "attention sink breaks mse quant" hypothesis.
-# Run BYPASS and mse b=8 with a LONG prompt (~30 tokens). If the bug is
-# attention-sink-driven, the |attn|.mean ratio should drop substantially
-# vs the short "Hello" case (which was ~22x at L1 prefill). A longer
-# prompt dilutes the sink-dominance of each query because every query
-# token now attends to many non-BOS keys.
+# Current probe: long prompt made L0 mse explode 100x (not attention sink).
+# With enhanced logging (||k||, ||v||, ||q|| min/max/mean per layer, plus
+# |attn|.max and NaN/Inf flag) we can now see whether the explosion is:
+#   - at input  (||k|| or ||v|| has outliers that mismatch codebook)
+#   - at output (|attn|.max >> bypass, or NaN/Inf in accumulation)
 
 set -u
 
 cd "$(dirname "$0")/.."
 
 GPU="${GPU:-3}"
-# ~30 Llama-3 tokens. One sentence, no BOS-specific nuances.
 PROMPT="${PROMPT:-Machine learning has transformed many fields over the past decade with deep neural networks achieving remarkable performance on natural language understanding and speech synthesis.}"
 MAX_TOKENS="${MAX_TOKENS:-4}"
 
@@ -22,40 +20,76 @@ echo "[temp] PROMPT=\"$PROMPT\""
 echo ""
 
 echo "=========================================================="
-echo "1/2  BYPASS baseline"
+echo "1/2  BYPASS (long prompt)"
 echo "=========================================================="
 bash test/diag_bypass.sh "$PROMPT" "$MAX_TOKENS" "$GPU" || true
 
 echo ""
 echo "=========================================================="
-echo "2/2  TURBOQUANT_ALGO=mse  TURBOQUANT_BITS=8"
+echo "2/2  TURBOQUANT_ALGO=mse  TURBOQUANT_BITS=8  (long prompt)"
 echo "=========================================================="
 TURBOQUANT_ALGO=mse TURBOQUANT_BITS=8 \
     bash test/baseline.sh "$PROMPT" "$MAX_TOKENS" "$GPU" || true
 
-echo ""
-echo "=========================================================="
-echo "PER-(layer,call) |attn|.mean  BYPASS vs mse b=8"
-echo "(long-prompt run; compare ratio to the short 'Hello' run)"
-echo "=========================================================="
-
 BP="logs/diag_bypass_latest/turboquant_debug.log"
 MSE="logs/baseline_latest/turboquant_debug_tq8.log"
 
+echo ""
+echo "=========================================================="
+echo "L0 / L1 / L15 / L31 store+fwd+out  BYPASS vs mse b=8"
+echo "=========================================================="
+
+for L in 0 1 15 31; do
+    echo ""
+    echo "-- Layer $L  BYPASS --"
+    grep " L$L\] " "$BP" 2>/dev/null
+    echo ""
+    echo "-- Layer $L  mse b=8 --"
+    grep " L$L\] " "$MSE" 2>/dev/null
+done
+
+echo ""
+echo "=========================================================="
+echo "Summary: per-layer ||k||/||v||/|attn| stats (call=0 only)"
+echo "=========================================================="
 python3 - "$BP" "$MSE" <<'PYEOF'
 import re, sys
 
 def parse(path):
-    rows = {}
+    rows = {}  # (layer, kind) -> dict of stats
     try:
         with open(path) as fh:
             for line in fh:
-                m = re.match(
-                    r"\[out\s+L(\d+)\]\s+call=(\d+).*?\|attn\|\.mean=([\d.]+)",
+                m_store = re.search(
+                    r"\[store L(\d+)\].*num_tokens=(\d+).*"
+                    r"\|\|k\|\|=\(min=([\d.eE+-]+),max=([\d.eE+-]+),mean=([\d.eE+-]+)\).*"
+                    r"\|\|v\|\|=\(min=([\d.eE+-]+),max=([\d.eE+-]+),mean=([\d.eE+-]+)\)",
                     line,
                 )
-                if m:
-                    rows[(int(m.group(1)), int(m.group(2)))] = float(m.group(3))
+                if m_store:
+                    L = int(m_store.group(1))
+                    key = (L, "store", int(m_store.group(2)))
+                    rows[key] = dict(
+                        k_min=float(m_store.group(3)),
+                        k_max=float(m_store.group(4)),
+                        k_mean=float(m_store.group(5)),
+                        v_min=float(m_store.group(6)),
+                        v_max=float(m_store.group(7)),
+                        v_mean=float(m_store.group(8)),
+                    )
+                m_out = re.search(
+                    r"\[out\s+L(\d+)\] call=(\d+).*"
+                    r"\|attn\|\.mean=([\d.eE+-]+) \|attn\|\.max=([\d.eE+-]+)",
+                    line,
+                )
+                if m_out:
+                    L = int(m_out.group(1))
+                    c = int(m_out.group(2))
+                    key = (L, "out", c)
+                    rows[key] = dict(
+                        attn_mean=float(m_out.group(3)),
+                        attn_max=float(m_out.group(4)),
+                    )
     except FileNotFoundError:
         print(f"MISSING: {path}")
     return rows
@@ -63,42 +97,26 @@ def parse(path):
 bp = parse(sys.argv[1])
 mse = parse(sys.argv[2])
 
-# Summary: median ratio by call (prefill vs decodes)
-from statistics import median
-by_call: dict[int, list[float]] = {}
-
-print(f"{'layer':>6} {'call':>5} {'BYPASS':>10} {'mse_b8':>10} {'ratio':>8}")
-print("-" * 44)
-for key in sorted(set(bp) | set(mse)):
-    L, c = key
-    b = bp.get(key)
-    m = mse.get(key)
-    ratio = (m / b) if (b and m is not None and b > 1e-9) else None
-    if ratio is not None:
-        by_call.setdefault(c, []).append(ratio)
-    b_s = f"{b:.4f}" if b is not None else "---"
-    m_s = f"{m:.4f}" if m is not None else "---"
-    r_s = f"{ratio:6.2f}x" if ratio is not None else "---"
-    marker = ""
-    if ratio is not None:
-        if ratio >= 10:
-            marker = "  <-- EXPLOSION"
-        elif ratio >= 2:
-            marker = "  <-- bad"
-    print(f"L{L:<5} c{c:<4} {b_s:>10} {m_s:>10} {r_s:>8}{marker}")
-
-print()
-print("=" * 44)
-print("Median ratio per call (across all 32 layers):")
-for c in sorted(by_call):
-    vals = by_call[c]
-    print(f"  call={c}  n={len(vals):<2} median={median(vals):.2f}x  max={max(vals):.2f}x")
-print()
-print("Short 'Hello' run for reference:")
-print("  call=0 (prefill=2)   median ~ 7-8x   max ~ 22x")
-print("  call=1 (decode seq_len=3)  median ~ 5x")
-print("  call=2 (decode seq_len=4)  median ~ 5-7x")
-print()
-print("If long-prompt median drops to ~1-2x -> sink hypothesis confirmed.")
-print("If long-prompt still shows large ratios -> something else is wrong.")
+# Table: per layer, show ||k|| and |attn| from both runs
+print(f"{'L':>3} "
+      f"{'BP |attn|mean':>14} {'MSE |attn|mean':>15} "
+      f"{'BP |attn|max':>13} {'MSE |attn|max':>14} "
+      f"{'BP ||k||max':>12} {'MSE ||k||max':>13}")
+print("-" * 90)
+for L in range(32):
+    bp_out = bp.get((L, "out", 0), {})
+    ms_out = mse.get((L, "out", 0), {})
+    bp_st = next((v for k, v in bp.items() if k[0] == L and k[1] == "store"), {})
+    ms_st = next((v for k, v in mse.items() if k[0] == L and k[1] == "store"), {})
+    def fmt(x, w=10, p=3):
+        return f"{x:{w}.{p}f}" if x is not None else "-" * w
+    print(
+        f"L{L:<2} "
+        f"{fmt(bp_out.get('attn_mean'), 14, 4)} "
+        f"{fmt(ms_out.get('attn_mean'), 15, 4)} "
+        f"{fmt(bp_out.get('attn_max'), 13, 3)} "
+        f"{fmt(ms_out.get('attn_max'), 14, 3)} "
+        f"{fmt(bp_st.get('k_max'), 12, 3)} "
+        f"{fmt(ms_st.get('k_max'), 13, 3)}"
+    )
 PYEOF
