@@ -13,7 +13,12 @@ GPU="${GPU:-3}"
 MODEL="${MODEL:-/mnt/nvme3n1/g00872988/models/Llama-3.1-8B-Instruct}"
 PORT="${PORT:-8009}"
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
-LOG="$ROOT_DIR/diag_which_backend.log"
+TS="$(date +%Y%m%d_%H%M%S)"
+LOG_DIR="$ROOT_DIR/logs/diag_which_backend_$TS"
+mkdir -p "$LOG_DIR"
+ln -sfn "$LOG_DIR" "$ROOT_DIR/logs/diag_which_backend_latest"
+LOG="$LOG_DIR/server.log"
+DBG_LOG="$LOG_DIR/turboquant_debug.log"
 
 CURRENT_PGID=""
 cleanup() {
@@ -32,6 +37,7 @@ echo "[which] log: $LOG"
 
 CUDA_VISIBLE_DEVICES="$GPU" \
 TURBOQUANT_BYPASS=1 \
+TURBOQUANT_DEBUG_LOG="$DBG_LOG" \
 setsid vllm serve "$MODEL" \
     --port "$PORT" \
     --enforce-eager \
@@ -61,8 +67,8 @@ unset http_proxy https_proxy all_proxy 2>/dev/null || true
 curl -s "http://localhost:${PORT}/v1/completions" \
     -H 'Content-Type: application/json' \
     -d "{\"model\":\"${MODEL}\",\"prompt\":\"Hello\",\"max_tokens\":4,\"temperature\":0}" \
-    > "$ROOT_DIR/diag_which_response.json" 2>&1 || true
-echo "[which] response saved to $ROOT_DIR/diag_which_response.json"
+    > "$LOG_DIR/response.json" 2>&1 || true
+echo "[which] response saved to $LOG_DIR/response.json"
 
 sleep 3
 
@@ -90,8 +96,8 @@ grep -na "TURBOQUANT_DBG" "$LOG" \
 
 echo ""
 echo "-- Real completion response --"
-if [ -f "$ROOT_DIR/diag_which_response.json" ]; then
-    cat "$ROOT_DIR/diag_which_response.json" | cut -c1-300
+if [ -f "$LOG_DIR/response.json" ]; then
+    cat "$LOG_DIR/response.json" | cut -c1-300
 fi
 
 echo ""

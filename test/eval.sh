@@ -41,8 +41,10 @@ FP_PORT=8010
 TQ_PORT=8009
 
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
-LOG_DIR="$ROOT_DIR/eval_logs"
+TS="$(date +%Y%m%d_%H%M%S)"
+LOG_DIR="$ROOT_DIR/logs/eval_$TS"
 mkdir -p "$LOG_DIR"
+ln -sfn "$LOG_DIR" "$ROOT_DIR/logs/eval_latest"
 
 CURRENT_PGID=""
 

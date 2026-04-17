@@ -20,7 +20,12 @@ BITS="${BITS:-${2:-8}}"
 CTX="${CTX:-${3:-64}}"
 
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
-SERVE_LOG="$ROOT_DIR/tq_debug_server.log"
+TS="$(date +%Y%m%d_%H%M%S)"
+LOG_DIR="$ROOT_DIR/logs/eval_debug_$TS"
+mkdir -p "$LOG_DIR"
+ln -sfn "$LOG_DIR" "$ROOT_DIR/logs/eval_debug_latest"
+SERVE_LOG="$LOG_DIR/server.log"
+DBG_LOG="$LOG_DIR/turboquant_debug.log"
 
 wait_healthy() {
     local port="$1" log="$2" pid="$3"
@@ -47,6 +52,7 @@ echo "[debug] server log: $SERVE_LOG"
 CUDA_VISIBLE_DEVICES="$GPU" \
 TURBOQUANT_ALGO="$ALGO" \
 TURBOQUANT_BITS="$BITS" \
+TURBOQUANT_DEBUG_LOG="$DBG_LOG" \
 setsid vllm serve "$MODEL" \
     --port "$PORT" \
     --enforce-eager \

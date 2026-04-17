@@ -65,8 +65,16 @@ TURBOQUANT_BYPASS = os.environ.get("TURBOQUANT_BYPASS", "0") == "1"
 # stdout (which gets swallowed by vllm's logger).
 import sys as _sys
 
+# Prefer the repo-local logs/ dir when the backend can find it (imported
+# from an editable install). Fall back to a few well-known paths so debug
+# output is never lost.
+_REPO_LOGS_DIR = os.path.abspath(
+    os.path.join(os.path.dirname(__file__), "..", "..", "..", "..", "logs")
+)
 _DEBUG_CANDIDATE_PATHS = [
     os.environ.get("TURBOQUANT_DEBUG_LOG", ""),
+    os.path.join(_REPO_LOGS_DIR, "turboquant_debug.log"),
+    "./logs/turboquant_debug.log",
     "/tmp/turboquant_debug.log",
     "/mnt/nvme3n1/g00872988/turboquant/turboquant_debug.log",
     "./turboquant_debug.log",

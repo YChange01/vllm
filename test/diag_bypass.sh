@@ -32,8 +32,13 @@ FP_PORT=8010
 TQ_PORT=8009
 
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
-FP_LOG="$ROOT_DIR/diag_bypass_fp.log"
-BP_LOG="$ROOT_DIR/diag_bypass_tq.log"
+TS="$(date +%Y%m%d_%H%M%S)"
+LOG_DIR="$ROOT_DIR/logs/diag_bypass_$TS"
+mkdir -p "$LOG_DIR"
+ln -sfn "$LOG_DIR" "$ROOT_DIR/logs/diag_bypass_latest"
+FP_LOG="$LOG_DIR/fp_server.log"
+BP_LOG="$LOG_DIR/tq_bypass_server.log"
+DBG_LOG="$LOG_DIR/turboquant_debug.log"
 
 CURRENT_PGID=""
 cleanup() {
@@ -116,12 +121,13 @@ run_backend() {
 
 export CUDA_VISIBLE_DEVICES="$GPU"
 echo "[bypass] model=$MODEL prompt='$PROMPT' max_tokens=$MAX_TOKENS gpu=$GPU"
+echo "[bypass] logs dir: $LOG_DIR  (symlink: $ROOT_DIR/logs/diag_bypass_latest)"
 
 FP_TEXT=""
 BP_TEXT=""
 
-run_backend "FLASH_ATTN"           "$FP_PORT" "$FP_LOG" FLASH_ATTN ""                    FP_TEXT
-run_backend "TURBOQUANT BYPASS=1"  "$TQ_PORT" "$BP_LOG" TURBOQUANT "TURBOQUANT_BYPASS=1" BP_TEXT
+run_backend "FLASH_ATTN"           "$FP_PORT" "$FP_LOG" FLASH_ATTN ""                                                          FP_TEXT
+run_backend "TURBOQUANT BYPASS=1"  "$TQ_PORT" "$BP_LOG" TURBOQUANT "TURBOQUANT_BYPASS=1 TURBOQUANT_DEBUG_LOG=$DBG_LOG"         BP_TEXT
 
 echo ""
 echo "========================== SIDE-BY-SIDE =========================="

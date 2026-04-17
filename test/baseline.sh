@@ -29,9 +29,15 @@ FP_PORT=8010
 TQ_PORT=8009
 
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
-FP_LOG="$ROOT_DIR/baseline_fp.log"
-TQ8_LOG="$ROOT_DIR/baseline_tq8.log"
-TQ4_LOG="$ROOT_DIR/baseline_tq4.log"
+TS="$(date +%Y%m%d_%H%M%S)"
+LOG_DIR="$ROOT_DIR/logs/baseline_$TS"
+mkdir -p "$LOG_DIR"
+ln -sfn "$LOG_DIR" "$ROOT_DIR/logs/baseline_latest"
+FP_LOG="$LOG_DIR/fp_server.log"
+TQ8_LOG="$LOG_DIR/tq8_server.log"
+TQ4_LOG="$LOG_DIR/tq4_server.log"
+DBG8_LOG="$LOG_DIR/turboquant_debug_tq8.log"
+DBG4_LOG="$LOG_DIR/turboquant_debug_tq4.log"
 
 # Track the running server's process-group id so cleanup can kill the
 # whole group on early exit / Ctrl-C. Empty string = nothing to kill.
@@ -136,15 +142,15 @@ run_backend() {
 # ---- main ---------------------------------------------------------------
 export CUDA_VISIBLE_DEVICES="$GPU"
 echo "[baseline] model=$MODEL prompt='$PROMPT' max_tokens=$MAX_TOKENS gpu=$GPU"
-echo "[baseline] logs: $FP_LOG  $TQ8_LOG  $TQ4_LOG"
+echo "[baseline] logs dir: $LOG_DIR  (symlink: $ROOT_DIR/logs/baseline_latest)"
 
 FP_TEXT=""
 TQ8_TEXT=""
 TQ4_TEXT=""
 
-run_backend "FLASH_ATTN"        "$FP_PORT" "$FP_LOG"  FLASH_ATTN  ""                  FP_TEXT
-run_backend "TURBOQUANT b=8"    "$TQ_PORT" "$TQ8_LOG" TURBOQUANT  "TURBOQUANT_BITS=8" TQ8_TEXT
-run_backend "TURBOQUANT b=4"    "$TQ_PORT" "$TQ4_LOG" TURBOQUANT  "TURBOQUANT_BITS=4" TQ4_TEXT
+run_backend "FLASH_ATTN"        "$FP_PORT" "$FP_LOG"  FLASH_ATTN  ""                                                        FP_TEXT
+run_backend "TURBOQUANT b=8"    "$TQ_PORT" "$TQ8_LOG" TURBOQUANT  "TURBOQUANT_BITS=8 TURBOQUANT_DEBUG_LOG=$DBG8_LOG"         TQ8_TEXT
+run_backend "TURBOQUANT b=4"    "$TQ_PORT" "$TQ4_LOG" TURBOQUANT  "TURBOQUANT_BITS=4 TURBOQUANT_DEBUG_LOG=$DBG4_LOG"         TQ4_TEXT
 
 echo ""
 echo "========================== SIDE-BY-SIDE =========================="

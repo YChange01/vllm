@@ -15,9 +15,13 @@ set -u
 GPU="${GPU:-3}"
 PROMPT="${1:-Hello}"
 MAX_TOKENS="${2:-4}"
-DEBUG_LOG="${TURBOQUANT_DEBUG_LOG:-/tmp/turboquant_debug.log}"
 
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+# This wrapper delegates to diag_bypass.sh, which creates its own
+# timestamped subdir. We only set TURBOQUANT_DEBUG_LOG if the caller
+# explicitly wants to override where the python side writes.
+LOG_DIR="$ROOT_DIR/logs"
+mkdir -p "$LOG_DIR"
 cd "$ROOT_DIR"
 
 echo "[run-bypass] repo: $ROOT_DIR"
@@ -28,43 +32,36 @@ echo "[run-bypass] HEAD:"
 git log --oneline -3
 echo ""
 
-# Clear any previous debug log so we only see this run's output.
-for p in "$DEBUG_LOG" \
-         /tmp/turboquant_debug.log \
-         /mnt/nvme3n1/g00872988/turboquant/turboquant_debug.log \
-         "$ROOT_DIR/turboquant_debug.log"; do
-    rm -f "$p" 2>/dev/null || true
-done
-echo "[run-bypass] cleared all candidate debug log paths"
-
-# Run BYPASS with debug logging on.
-echo "[run-bypass] launching diag_bypass.sh with TURBOQUANT_DEBUG=1 ..."
+# Run BYPASS; diag_bypass.sh writes into logs/diag_bypass_<ts>/ .
+echo "[run-bypass] launching diag_bypass.sh with TURBOQUANT_BYPASS=1 ..."
 CUDA_VISIBLE_DEVICES="$GPU" \
 TURBOQUANT_BYPASS=1 \
-TURBOQUANT_DEBUG=1 \
-TURBOQUANT_DEBUG_LOG="$DEBUG_LOG" \
     bash test/diag_bypass.sh "$PROMPT" "$MAX_TOKENS" "$GPU"
+
+# diag_bypass.sh points this symlink at the run it just created.
+RUN_DIR="$(readlink -f "$LOG_DIR/diag_bypass_latest" 2>/dev/null || echo "")"
 
 echo ""
 echo "==================================================================="
-echo "[run-bypass] candidate debug log paths:"
-for p in "$DEBUG_LOG" \
-         /tmp/turboquant_debug.log \
-         /mnt/nvme3n1/g00872988/turboquant/turboquant_debug.log \
-         "$ROOT_DIR/turboquant_debug.log"; do
-    if [ -s "$p" ]; then
-        echo ""
+if [ -n "$RUN_DIR" ] && [ -d "$RUN_DIR" ]; then
+    echo "[run-bypass] this run's logs:"
+    echo "  $RUN_DIR"
+    echo ""
+    for p in "$RUN_DIR"/*.log; do
+        [ -s "$p" ] || continue
         echo "--- $p ($(wc -l < "$p") lines) ---"
         head -60 "$p"
+        echo ""
+    done
+    echo "==================================================================="
+    echo "[run-bypass] grep 'TURBOQUANT_DBG' from bypass server log"
+    echo "==================================================================="
+    BP_LOG="$RUN_DIR/tq_bypass_server.log"
+    if [ -f "$BP_LOG" ]; then
+        grep -a "TURBOQUANT_DBG\|TurboQuant" "$BP_LOG" | head -40 || echo "(no match in $BP_LOG)"
+    else
+        echo "(server log $BP_LOG does not exist)"
     fi
-done
-echo ""
-echo "==================================================================="
-echo "[run-bypass] grep 'TURBOQUANT_DBG' from bypass server log"
-echo "==================================================================="
-BP_LOG="$ROOT_DIR/diag_bypass_tq.log"
-if [ -f "$BP_LOG" ]; then
-    grep -a "TURBOQUANT_DBG\|TurboQuant" "$BP_LOG" | head -40 || echo "(no match in $BP_LOG)"
 else
-    echo "(server log $BP_LOG does not exist)"
+    echo "[run-bypass] could not resolve diag_bypass_latest symlink"
 fi
