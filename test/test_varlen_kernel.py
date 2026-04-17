@@ -52,15 +52,13 @@ def reference_attention(
 
 
 def _alloc_cache(num_blocks: int, block_size: int, num_heads_kv: int,
-                 head_size: int, device, algo: str):
+                 head_size: int, device, algo: str, v_dtype: torch.dtype):
     c_k_idx = torch.zeros(num_blocks, block_size, num_heads_kv, head_size,
                           dtype=torch.uint8, device=device)
     c_k_norm = torch.zeros(num_blocks, block_size, num_heads_kv,
                            dtype=torch.float32, device=device)
-    c_v_idx = torch.zeros(num_blocks, block_size, num_heads_kv, head_size,
-                          dtype=torch.int8, device=device)
-    c_v_scale = torch.zeros(num_blocks, block_size, num_heads_kv,
-                            dtype=torch.float32, device=device)
+    c_v_fp = torch.zeros(num_blocks, block_size, num_heads_kv, head_size,
+                         dtype=v_dtype, device=device)
     if algo == "prod":
         c_k_qjl = torch.zeros(num_blocks, block_size, num_heads_kv, head_size,
                               dtype=torch.int8, device=device)
@@ -69,7 +67,7 @@ def _alloc_cache(num_blocks: int, block_size: int, num_heads_kv: int,
     else:
         c_k_qjl = None
         c_k_rnorm = None
-    return c_k_idx, c_k_norm, c_v_idx, c_v_scale, c_k_qjl, c_k_rnorm
+    return c_k_idx, c_k_norm, c_v_fp, c_k_qjl, c_k_rnorm
 
 
 def _run_algo(algo: str, num_tokens: int, bits: int, q, k, v, slot_mapping,
@@ -77,13 +75,13 @@ def _run_algo(algo: str, num_tokens: int, bits: int, q, k, v, slot_mapping,
               num_heads_kv, head_size, device, dtype) -> torch.Tensor:
     state = QuantState(algo=algo, bits=bits, head_dim=head_size,
                        seed=42, dtype=dtype, device=device)
-    (c_k_idx, c_k_norm, c_v_idx, c_v_scale, c_k_qjl, c_k_rnorm) = _alloc_cache(
-        num_blocks, block_size, num_heads_kv, head_size, device, algo,
+    (c_k_idx, c_k_norm, c_v_fp, c_k_qjl, c_k_rnorm) = _alloc_cache(
+        num_blocks, block_size, num_heads_kv, head_size, device, algo, dtype,
     )
     turboquant_store_kv(
         new_k=k, new_v=v,
         cache_k_idx=c_k_idx, cache_k_norm=c_k_norm,
-        cache_v_idx=c_v_idx, cache_v_scale=c_v_scale,
+        cache_v_fp=c_v_fp,
         slot_mapping=slot_mapping,
         state=state, block_size=block_size,
         cache_k_qjl_sign=c_k_qjl, cache_k_rnorm=c_k_rnorm,
@@ -92,7 +90,7 @@ def _run_algo(algo: str, num_tokens: int, bits: int, q, k, v, slot_mapping,
     out = turboquant_paged_attention(
         q=q,
         cache_k_idx=c_k_idx, cache_k_norm=c_k_norm,
-        cache_v_idx=c_v_idx, cache_v_scale=c_v_scale,
+        cache_v_fp=c_v_fp,
         block_table=block_table,
         seq_lens=seq_lens, query_start_loc=query_start_loc,
         state=state,

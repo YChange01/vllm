@@ -266,16 +266,18 @@ class TurboQuantAttentionImpl(AttentionImpl):
 
         self._state: QuantState | None = None
         # Paged-cache buffers (lazily allocated in _ensure_buffers).
+        #   K quantized path (non-BYPASS): _k_idx + _k_norm
+        #   V path (both BYPASS and quant): _v_fp (bf16/fp16, no quant)
+        #       Paper only compresses K; int8 V was found to break long-
+        #       prefill reconstruction (|attn|.max exceeded max|v|).
         self._k_idx: torch.Tensor | None = None
         self._k_norm: torch.Tensor | None = None
-        self._v_idx: torch.Tensor | None = None
-        self._v_scale: torch.Tensor | None = None
+        self._v_fp: torch.Tensor | None = None
         # prod-only buffers
         self._k_qjl_sign: torch.Tensor | None = None
         self._k_rnorm: torch.Tensor | None = None
         # BYPASS mode only.
         self._k_fp: torch.Tensor | None = None
-        self._v_fp: torch.Tensor | None = None
 
     # -------------------------------------------------------------------
     # Lazy state / buffer allocation
@@ -303,18 +305,18 @@ class TurboQuantAttentionImpl(AttentionImpl):
         shape_dim = (num_blocks, block_size, self.num_kv_heads, self.head_size)
         shape_meta = (num_blocks, block_size, self.num_kv_heads)
 
+        # V is always stored raw in input dtype -- used by both BYPASS and
+        # quant paths.
+        self._v_fp = torch.zeros(shape_dim, dtype=kv_cache.dtype, device=device)
+
         if TURBOQUANT_BYPASS:
-            # Parallel FP bf16 buffer. Isolates vLLM integration from quant.
+            # Parallel FP bf16 K buffer. Isolates vLLM integration from quant.
             self._k_fp = torch.zeros(shape_dim, dtype=kv_cache.dtype,
-                                     device=device)
-            self._v_fp = torch.zeros(shape_dim, dtype=kv_cache.dtype,
                                      device=device)
             return
 
         self._k_idx = torch.zeros(shape_dim, dtype=torch.uint8, device=device)
         self._k_norm = torch.zeros(shape_meta, dtype=torch.float32, device=device)
-        self._v_idx = torch.zeros(shape_dim, dtype=torch.int8, device=device)
-        self._v_scale = torch.zeros(shape_meta, dtype=torch.float32, device=device)
 
         if TURBOQUANT_ALGO == "prod":
             self._k_qjl_sign = torch.zeros(
@@ -376,8 +378,9 @@ class TurboQuantAttentionImpl(AttentionImpl):
             except Exception as e:
                 _dbg(f"[store L{self._layer_seed}] dbg err: {e}")
 
+        block_size = kv_cache.shape[2]
+
         if TURBOQUANT_BYPASS:
-            block_size = kv_cache.shape[2]
             valid = slot_mapping >= 0
             slots = slot_mapping[valid].to(torch.int64)
             if slots.numel() > 0:
@@ -393,8 +396,7 @@ class TurboQuantAttentionImpl(AttentionImpl):
             new_v=v,
             cache_k_idx=self._k_idx,
             cache_k_norm=self._k_norm,
-            cache_v_idx=self._v_idx,
-            cache_v_scale=self._v_scale,
+            cache_v_fp=self._v_fp,
             slot_mapping=slot_mapping,
             state=state,
             block_size=kv_cache.shape[2],
@@ -486,8 +488,7 @@ class TurboQuantAttentionImpl(AttentionImpl):
                 q=q,
                 cache_k_idx=self._k_idx,
                 cache_k_norm=self._k_norm,
-                cache_v_idx=self._v_idx,
-                cache_v_scale=self._v_scale,
+                cache_v_fp=self._v_fp,
                 block_table=attn_metadata.block_table,
                 seq_lens=attn_metadata.seq_lens,
                 query_start_loc=attn_metadata.query_start_loc,

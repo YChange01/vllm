@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
 # One-shot diagnostic scratchpad. Overwritten every time.
 #
-# Current probe: long prompt made L0 mse explode 100x (not attention sink).
-# With enhanced logging (||k||, ||v||, ||q|| min/max/mean per layer, plus
-# |attn|.max and NaN/Inf flag) we can now see whether the explosion is:
-#   - at input  (||k|| or ||v|| has outliers that mismatch codebook)
-#   - at output (|attn|.max >> bypass, or NaN/Inf in accumulation)
+# Current probe: verify the fix "V stored raw in bf16 (no int8 quant)"
+# resolves the long-prompt explosion. Runs BYPASS + mse b=8 on the long
+# prompt and shows per-layer BYPASS-vs-mse |attn|.mean ratios.
+#   - Before fix: L0 ratio ~100x, median ~7x, max ~123x
+#   - If fix works: ratios should drop dramatically (< 2x across all
+#     layers) and output text should match FLASH_ATTN.
 
 set -u
 
@@ -36,60 +37,26 @@ MSE="logs/baseline_latest/turboquant_debug_tq8.log"
 
 echo ""
 echo "=========================================================="
-echo "L0 / L1 / L15 / L31 store+fwd+out  BYPASS vs mse b=8"
-echo "=========================================================="
-
-for L in 0 1 15 31; do
-    echo ""
-    echo "-- Layer $L  BYPASS --"
-    grep " L$L\] " "$BP" 2>/dev/null
-    echo ""
-    echo "-- Layer $L  mse b=8 --"
-    grep " L$L\] " "$MSE" 2>/dev/null
-done
-
-echo ""
-echo "=========================================================="
-echo "Summary: per-layer ||k||/||v||/|attn| stats (call=0 only)"
+echo "Per-layer |attn|.mean/max   BYPASS vs mse b=8   call=0"
+echo "(baseline for reference: before fix L0 ratio was 100x)"
 echo "=========================================================="
 python3 - "$BP" "$MSE" <<'PYEOF'
 import re, sys
+from statistics import median
 
 def parse(path):
-    rows = {}  # (layer, kind) -> dict of stats
+    rows = {}
     try:
         with open(path) as fh:
             for line in fh:
-                m_store = re.search(
-                    r"\[store L(\d+)\].*num_tokens=(\d+).*"
-                    r"\|\|k\|\|=\(min=([\d.eE+-]+),max=([\d.eE+-]+),mean=([\d.eE+-]+)\).*"
-                    r"\|\|v\|\|=\(min=([\d.eE+-]+),max=([\d.eE+-]+),mean=([\d.eE+-]+)\)",
-                    line,
-                )
-                if m_store:
-                    L = int(m_store.group(1))
-                    key = (L, "store", int(m_store.group(2)))
-                    rows[key] = dict(
-                        k_min=float(m_store.group(3)),
-                        k_max=float(m_store.group(4)),
-                        k_mean=float(m_store.group(5)),
-                        v_min=float(m_store.group(6)),
-                        v_max=float(m_store.group(7)),
-                        v_mean=float(m_store.group(8)),
-                    )
-                m_out = re.search(
+                m = re.search(
                     r"\[out\s+L(\d+)\] call=(\d+).*"
                     r"\|attn\|\.mean=([\d.eE+-]+) \|attn\|\.max=([\d.eE+-]+)",
                     line,
                 )
-                if m_out:
-                    L = int(m_out.group(1))
-                    c = int(m_out.group(2))
-                    key = (L, "out", c)
-                    rows[key] = dict(
-                        attn_mean=float(m_out.group(3)),
-                        attn_max=float(m_out.group(4)),
-                    )
+                if m:
+                    rows[(int(m.group(1)), int(m.group(2)))] = (
+                        float(m.group(3)), float(m.group(4)))
     except FileNotFoundError:
         print(f"MISSING: {path}")
     return rows
@@ -97,26 +64,30 @@ def parse(path):
 bp = parse(sys.argv[1])
 mse = parse(sys.argv[2])
 
-# Table: per layer, show ||k|| and |attn| from both runs
-print(f"{'L':>3} "
-      f"{'BP |attn|mean':>14} {'MSE |attn|mean':>15} "
-      f"{'BP |attn|max':>13} {'MSE |attn|max':>14} "
-      f"{'BP ||k||max':>12} {'MSE ||k||max':>13}")
-print("-" * 90)
+print(f"{'L':>3}  {'BP mean':>9}  {'MSE mean':>9}  {'ratio':>7}   {'BP max':>7}  {'MSE max':>7}")
+print("-" * 62)
+ratios = {0: [], 1: [], 2: []}
 for L in range(32):
-    bp_out = bp.get((L, "out", 0), {})
-    ms_out = mse.get((L, "out", 0), {})
-    bp_st = next((v for k, v in bp.items() if k[0] == L and k[1] == "store"), {})
-    ms_st = next((v for k, v in mse.items() if k[0] == L and k[1] == "store"), {})
-    def fmt(x, w=10, p=3):
-        return f"{x:{w}.{p}f}" if x is not None else "-" * w
-    print(
-        f"L{L:<2} "
-        f"{fmt(bp_out.get('attn_mean'), 14, 4)} "
-        f"{fmt(ms_out.get('attn_mean'), 15, 4)} "
-        f"{fmt(bp_out.get('attn_max'), 13, 3)} "
-        f"{fmt(ms_out.get('attn_max'), 14, 3)} "
-        f"{fmt(bp_st.get('k_max'), 12, 3)} "
-        f"{fmt(ms_st.get('k_max'), 13, 3)}"
-    )
+    for c in (0, 1, 2):
+        bp_v = bp.get((L, c))
+        ms_v = mse.get((L, c))
+        if bp_v is None or ms_v is None:
+            continue
+        bp_m, bp_max = bp_v
+        ms_m, ms_max = ms_v
+        r = ms_m / max(bp_m, 1e-12)
+        ratios[c].append(r)
+        if c == 0:
+            tag = " EXPL" if r >= 10 else (" bad" if r >= 2 else "")
+            print(f"L{L:<2}  {bp_m:9.4f}  {ms_m:9.4f}  {r:6.2f}x  {bp_max:7.3f}  {ms_max:7.3f}{tag}")
+
+print()
+print("=" * 62)
+print("Summary across all 32 layers:")
+for c in sorted(ratios):
+    if ratios[c]:
+        print(f"  call={c}  median={median(ratios[c]):6.2f}x   "
+              f"max={max(ratios[c]):6.2f}x   n={len(ratios[c])}")
+print()
+print("Fix PASS criterion: all medians < 2x and all max < 5x")
 PYEOF

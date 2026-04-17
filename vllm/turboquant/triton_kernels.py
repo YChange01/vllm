@@ -9,12 +9,16 @@ Storage layout per (slot, head)
 Common to both algorithms:
     cache_k_idx    : uint8  (head_dim,)       -- MSE bucket index
     cache_k_norm   : fp32   ()                -- ||k||
-    cache_v_idx    : int8   (head_dim,)       -- symmetric int8 V
-    cache_v_scale  : fp32   ()                -- max(|v|) / 127
+    cache_v_fp     : fp16/bf16 (head_dim,)    -- V raw (no quant)
 
 Only for Q_prod:
     cache_k_qjl_sign : int8 (head_dim,)       -- sign(S @ r_unit)
     cache_k_rnorm    : fp32 ()                -- ||r||
+
+V rationale: paper only compresses K. int8 V with per-slot-per-head
+scale was previously used but produced outputs exceeding max|v| in
+long-prefill on Llama-3.1-8B (|attn|.max > max|v| is impossible for
+correct softmax-weighted sum of V). Keeping V raw fixed this.
 
 Attention (both algorithms work in rotated space)
 -------------------------------------------------
@@ -47,7 +51,10 @@ _NEG_LARGE = tl.constexpr(-1.0e30)
 
 
 # =========================================================================
-# Store kernel: quantize K (mse or prod) and V (symmetric int8)
+# Store kernel: quantize K (mse or prod), store V as-is in bf16/fp16
+# V is kept in the input dtype -- paper only quantizes K, and int8 V
+# produced outputs exceeding max|v| in long-prefill cases (|attn|.max >
+# max|v| is mathematically impossible for correct softmax-weighted sum).
 # =========================================================================
 @triton.jit
 def _store_kernel(
@@ -55,8 +62,7 @@ def _store_kernel(
     new_v_ptr,                      # (T, H_kv, d) fp16/bf16
     cache_k_idx_ptr,                # (num_blocks, bs, H_kv, d) uint8
     cache_k_norm_ptr,               # (num_blocks, bs, H_kv) fp32
-    cache_v_idx_ptr,                # (num_blocks, bs, H_kv, d) int8
-    cache_v_scale_ptr,              # (num_blocks, bs, H_kv) fp32
+    cache_v_fp_ptr,                 # (num_blocks, bs, H_kv, d) fp16/bf16 -- V raw
     cache_k_qjl_sign_ptr,           # int8 (prod only; unused if USE_QJL=False)
     cache_k_rnorm_ptr,              # fp32 (prod only)
     slot_mapping_ptr,               # (T,) int64
@@ -71,6 +77,7 @@ def _store_kernel(
     K_CB: tl.constexpr,
     BLOCK_D: tl.constexpr,
     USE_QJL: tl.constexpr,
+    V_DTYPE: tl.constexpr,
 ):
     """One program = one (token, kv_head) pair."""
     tok = tl.program_id(0)
@@ -143,15 +150,8 @@ def _store_kernel(
             mask=mask_d,
         )
 
-    # --- V: symmetric int8 ---
-    v_abs = tl.where(mask_d, tl.abs(v_vec), 0.0)
-    v_scale = tl.maximum(tl.max(v_abs, axis=0) / 127.0, 1e-12)
-    tl.store(cache_v_scale_ptr + meta_off, v_scale)
-    tl.store(
-        cache_v_idx_ptr + cache_off,
-        (v_vec / v_scale).to(tl.int8),
-        mask=mask_d,
-    )
+    # --- V: stored raw in input dtype (no quantization) ---
+    tl.store(cache_v_fp_ptr + cache_off, v_vec.to(V_DTYPE), mask=mask_d)
 
 
 # =========================================================================
@@ -163,8 +163,7 @@ def _attend_kernel(
     Sq_ptr,                         # (T_q, H_q, d) fp16/bf16 -- S @ q_rotated (prod only)
     cache_k_idx_ptr,                # (num_blocks, bs, H_kv, d) uint8
     cache_k_norm_ptr,               # (num_blocks, bs, H_kv) fp32
-    cache_v_idx_ptr,                # (num_blocks, bs, H_kv, d) int8
-    cache_v_scale_ptr,              # (num_blocks, bs, H_kv) fp32
+    cache_v_fp_ptr,                 # (num_blocks, bs, H_kv, d) fp16/bf16 -- V raw
     cache_k_qjl_sign_ptr,           # int8 (prod only)
     cache_k_rnorm_ptr,              # fp32 (prod only)
     block_table_ptr,                # (num_seqs, block_table_stride) int32
@@ -250,12 +249,10 @@ def _attend_kernel(
                     else:
                         logit = main_dot * k_norm * inv_d
 
-                    # V dequant + flash accumulation.
-                    v_int8 = tl.load(
-                        cache_v_idx_ptr + base + d_idx, mask=mask_d, other=0
+                    # V raw (no dequant needed) + flash accumulation.
+                    v_vec = tl.load(
+                        cache_v_fp_ptr + base + d_idx, mask=mask_d, other=0.0
                     ).to(tl.float32)
-                    v_scale = tl.load(cache_v_scale_ptr + meta)
-                    v_vec = v_int8 * v_scale
 
                     m_new = tl.maximum(m_i, logit)
                     alpha = tl.exp(m_i - m_new)
@@ -277,15 +274,14 @@ def turboquant_store_kv(
     new_v: torch.Tensor,
     cache_k_idx: torch.Tensor,
     cache_k_norm: torch.Tensor,
-    cache_v_idx: torch.Tensor,
-    cache_v_scale: torch.Tensor,
+    cache_v_fp: torch.Tensor,
     slot_mapping: torch.Tensor,
     state: "QuantState",
     block_size: int,
     cache_k_qjl_sign: torch.Tensor | None = None,
     cache_k_rnorm: torch.Tensor | None = None,
 ) -> None:
-    """Quantize one batch of (K, V) into the paged cache.
+    """Quantize K (Lloyd-Max) and copy V as-is into the paged cache.
 
     ``cache_k_qjl_sign`` and ``cache_k_rnorm`` are required when
     ``state.algo == "prod"`` and must be ``None`` for ``"mse"``.
@@ -311,8 +307,10 @@ def turboquant_store_kv(
     else:
         # Unused by kernel but must be valid pointers; reuse existing buffers.
         qjl_matrix = state.H
-        qjl_sign_buf = cache_v_idx
-        rnorm_buf = cache_v_scale
+        qjl_sign_buf = cache_k_idx
+        rnorm_buf = cache_k_norm
+
+    v_tl_dtype = tl.bfloat16 if cache_v_fp.dtype == torch.bfloat16 else tl.float16
 
     grid = (num_tokens, num_heads_kv)
     BLOCK_D = triton.next_power_of_2(head_size)
@@ -321,8 +319,7 @@ def turboquant_store_kv(
         new_v,
         cache_k_idx,
         cache_k_norm,
-        cache_v_idx,
-        cache_v_scale,
+        cache_v_fp,
         qjl_sign_buf,
         rnorm_buf,
         slot_mapping,
@@ -337,6 +334,7 @@ def turboquant_store_kv(
         K_CB=K_CB,
         BLOCK_D=BLOCK_D,
         USE_QJL=use_qjl,
+        V_DTYPE=v_tl_dtype,
     )
 
 
@@ -344,8 +342,7 @@ def turboquant_paged_attention(
     q: torch.Tensor,
     cache_k_idx: torch.Tensor,
     cache_k_norm: torch.Tensor,
-    cache_v_idx: torch.Tensor,
-    cache_v_scale: torch.Tensor,
+    cache_v_fp: torch.Tensor,
     block_table: torch.Tensor,
     seq_lens: torch.Tensor,
     query_start_loc: torch.Tensor,
@@ -356,7 +353,8 @@ def turboquant_paged_attention(
     """Paged attention with dequant-on-the-fly K cache, varlen + causal.
 
     Per-query pre-rotations happen here on-device via torch.matmul so the
-    attend kernel stays free of Hadamard multiplies.
+    attend kernel stays free of Hadamard multiplies. V is stored raw in
+    ``cache_v_fp`` (bf16/fp16) and loaded directly without dequant.
     """
     num_query_tokens, num_heads_q, head_size = q.shape
     _, block_size, num_heads_kv, _ = cache_k_idx.shape
@@ -417,16 +415,15 @@ def turboquant_paged_attention(
     actual_max_blocks = (actual_max_seq + block_size - 1) // block_size
     block_table_stride = int(block_table.shape[1])
 
-    qjl_sign_buf = cache_k_qjl_sign if use_qjl else cache_v_idx
-    rnorm_buf = cache_k_rnorm if use_qjl else cache_v_scale
+    qjl_sign_buf = cache_k_qjl_sign if use_qjl else cache_k_idx
+    rnorm_buf = cache_k_rnorm if use_qjl else cache_k_norm
 
     _attend_kernel[grid](
         q_rotated_k,
         Sq_k,
         cache_k_idx,
         cache_k_norm,
-        cache_v_idx,
-        cache_v_scale,
+        cache_v_fp,
         qjl_sign_buf,
         rnorm_buf,
         block_table,
