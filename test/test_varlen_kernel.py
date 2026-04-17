@@ -22,11 +22,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import torch
 
+from vllm.turboquant.attend import turboquant_paged_attention
 from vllm.turboquant.codebook import QuantState
-from vllm.turboquant.triton_kernels import (
-    turboquant_paged_attention,
-    turboquant_store_kv,
-)
+from vllm.turboquant.store import turboquant_store_kv
 
 
 def reference_attention(
@@ -57,7 +55,7 @@ def _alloc_cache(num_blocks: int, block_size: int, num_heads_kv: int,
                           dtype=torch.uint8, device=device)
     c_k_norm = torch.zeros(num_blocks, block_size, num_heads_kv,
                            dtype=torch.float32, device=device)
-    c_v_fp = torch.zeros(num_blocks, block_size, num_heads_kv, head_size,
+    c_v = torch.zeros(num_blocks, block_size, num_heads_kv, head_size,
                          dtype=v_dtype, device=device)
     if algo == "prod":
         c_k_qjl = torch.zeros(num_blocks, block_size, num_heads_kv, head_size,
@@ -67,7 +65,7 @@ def _alloc_cache(num_blocks: int, block_size: int, num_heads_kv: int,
     else:
         c_k_qjl = None
         c_k_rnorm = None
-    return c_k_idx, c_k_norm, c_v_fp, c_k_qjl, c_k_rnorm
+    return c_k_idx, c_k_norm, c_v, c_k_qjl, c_k_rnorm
 
 
 def _run_algo(algo: str, num_tokens: int, bits: int, q, k, v, slot_mapping,
@@ -75,7 +73,7 @@ def _run_algo(algo: str, num_tokens: int, bits: int, q, k, v, slot_mapping,
               num_heads_kv, head_size, device, dtype) -> torch.Tensor:
     state = QuantState(algo=algo, bits=bits, head_dim=head_size,
                        seed=42, dtype=dtype, device=device)
-    (c_k_idx, c_k_norm, c_v_fp, c_k_qjl, c_k_rnorm) = _alloc_cache(
+    (c_k_idx, c_k_norm, c_v, c_k_qjl, c_k_rnorm) = _alloc_cache(
         num_blocks, block_size, num_heads_kv, head_size, device, algo, dtype,
     )
     turboquant_store_kv(
@@ -91,12 +89,12 @@ def _run_algo(algo: str, num_tokens: int, bits: int, q, k, v, slot_mapping,
     if slots.numel() > 0:
         b_idx = slots // block_size
         off = slots % block_size
-        c_v_fp[b_idx, off] = v[valid]
+        c_v[b_idx, off] = v[valid]
     torch.cuda.synchronize()
     out = turboquant_paged_attention(
         q=q,
         cache_k_idx=c_k_idx, cache_k_norm=c_k_norm,
-        cache_v_fp=c_v_fp,
+        cache_v=c_v,
         block_table=block_table,
         seq_lens=seq_lens, query_start_loc=query_start_loc,
         state=state,
