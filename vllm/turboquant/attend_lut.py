@@ -22,6 +22,10 @@ via ``TURBOQUANT_USE_LUT=1``.
 V path is unchanged -- V is reconstructed as a d-dim vector per slot
 (not an inner product with Q), so a LUT gives no benefit there. QJL
 path (prod) is also unchanged.
+
+Scope: b=4 only (K_CB <= 16). K/V idx are always 4-bit nibble-packed.
+b=8 is intentionally dropped in this branch -- the kernel asserts at
+launch that the cache layout matches the packed form.
 """
 
 from __future__ import annotations
@@ -70,7 +74,6 @@ def _attend_kernel_lut(
     BLOCK_BS: tl.constexpr,
     K_CB: tl.constexpr,
     USE_QJL: tl.constexpr,
-    USE_4BIT_PACK: tl.constexpr,
 ):
     q_idx = tl.program_id(0)
     qh_idx = tl.program_id(1)
@@ -103,9 +106,9 @@ def _attend_kernel_lut(
     l_i = tl.zeros((), dtype=tl.float32)
     acc = tl.zeros((BLOCK_D,), dtype=tl.float32)
 
-    if USE_4BIT_PACK:
-        d_pack = d_idx // 2
-        is_high = (d_idx % 2) == 1
+    # b=4 only: K and V idx are always 4-bit nibble-packed.
+    d_pack = d_idx // 2
+    is_high = (d_idx % 2) == 1
 
     for block_i in range(0, max_blocks_per_seq):
         if block_i < num_blocks_q:
@@ -126,20 +129,14 @@ def _attend_kernel_lut(
                         + kvh_idx
                     )
 
-                    # K idx load (packed or unpacked).
-                    if USE_4BIT_PACK:
-                        packed_k = tl.load(
-                            cache_k_idx_ptr + base_idx + d_pack,
-                            mask=mask_d, other=0,
-                        ).to(tl.uint8)
-                        k_low = packed_k & 0xF
-                        k_high = (packed_k >> 4) & 0xF
-                        k_idx_u8 = tl.where(is_high, k_high, k_low).to(tl.int32)
-                    else:
-                        k_idx_u8 = tl.load(
-                            cache_k_idx_ptr + base_idx + d_idx,
-                            mask=mask_d, other=0,
-                        ).to(tl.int32)
+                    # K idx load: 4-bit nibble-packed.
+                    packed_k = tl.load(
+                        cache_k_idx_ptr + base_idx + d_pack,
+                        mask=mask_d, other=0,
+                    ).to(tl.uint8)
+                    k_low = packed_k & 0xF
+                    k_high = (packed_k >> 4) & 0xF
+                    k_idx_u8 = tl.where(is_high, k_high, k_low).to(tl.int32)
 
                     # ===== LUT gather via mask-sum =====
                     # one_hot[j, c] = (k_idx_u8[j] == c), one 1 per row.
@@ -169,20 +166,14 @@ def _attend_kernel_lut(
                     else:
                         logit = main_dot * k_norm * inv_d
 
-                    # V dequant: per-slot codebook lookup (unchanged).
-                    if USE_4BIT_PACK:
-                        packed_v = tl.load(
-                            cache_v_idx_ptr + base_idx + d_pack,
-                            mask=mask_d, other=0,
-                        ).to(tl.uint8)
-                        v_low = packed_v & 0xF
-                        v_high = (packed_v >> 4) & 0xF
-                        v_idx_u8 = tl.where(is_high, v_high, v_low).to(tl.int32)
-                    else:
-                        v_idx_u8 = tl.load(
-                            cache_v_idx_ptr + base_idx + d_idx,
-                            mask=mask_d, other=0,
-                        ).to(tl.int32)
+                    # V dequant: per-slot codebook lookup (4-bit packed).
+                    packed_v = tl.load(
+                        cache_v_idx_ptr + base_idx + d_pack,
+                        mask=mask_d, other=0,
+                    ).to(tl.uint8)
+                    v_low = packed_v & 0xF
+                    v_high = (packed_v >> 4) & 0xF
+                    v_idx_u8 = tl.where(is_high, v_high, v_low).to(tl.int32)
 
                     rv = tl.load(codebook_ptr + v_idx_u8).to(tl.float32)
                     v_norm = tl.load(cache_v_norm_ptr + meta)
@@ -232,11 +223,14 @@ def turboquant_paged_attention_lut(
 
     codebook_f = state.codebook.to(torch.float32)
     K_CB = int(codebook_f.shape[0])
-    use_4bit_pack = K_CB <= 16
-    expected_idx_dim = head_size // 2 if use_4bit_pack else head_size
+    assert K_CB <= 16, (
+        f"LUT kernel is b=4 only (K_CB <= 16); got K_CB={K_CB}. "
+        f"Set TURBOQUANT_BITS=4 for mse or TURBOQUANT_BITS=5 for prod."
+    )
+    expected_idx_dim = head_size // 2
     assert idx_dim == expected_idx_dim, (
         f"cache_k_idx last dim {idx_dim} != expected {expected_idx_dim} "
-        f"(K_CB={K_CB}, head_size={head_size})"
+        f"(head_size={head_size}); LUT kernel requires 4-bit nibble pack"
     )
 
     dev = q.device
@@ -318,7 +312,6 @@ def turboquant_paged_attention_lut(
         BLOCK_BS=BLOCK_BS,
         K_CB=K_CB,
         USE_QJL=use_qjl,
-        USE_4BIT_PACK=use_4bit_pack,
     )
 
     out_f = out.float()

@@ -30,8 +30,8 @@ REQUEST_RATE="${REQUEST_RATE:-inf}"
 NUM_WARMUPS="${NUM_WARMUPS:-5}"
 SEED="${SEED:-42}"
 
-# Which stages to run. Space-separated tags; set SKIP_* to drop specific ones.
-STAGES="${STAGES:-FLASH_ATTN TURBOQUANT_mse_b8 TURBOQUANT_mse_b4 TURBOQUANT_prod_b8 TURBOQUANT_prod_b4}"
+# Which stages to run. Space-separated tags. b=4 only on this branch.
+STAGES="${STAGES:-FLASH_ATTN TURBOQUANT_mse_b4 TURBOQUANT_prod_b4}"
 
 FP_PORT=8010
 TQ_PORT=8009
@@ -138,10 +138,10 @@ stage_args() {
     # echo "backend env" for a given tag
     case "$1" in
         FLASH_ATTN)             echo "FLASH_ATTN  " ;;
-        TURBOQUANT_mse_b8)      echo "TURBOQUANT  TURBOQUANT_ALGO=mse TURBOQUANT_BITS=8" ;;
         TURBOQUANT_mse_b4)      echo "TURBOQUANT  TURBOQUANT_ALGO=mse TURBOQUANT_BITS=4" ;;
-        TURBOQUANT_prod_b8)     echo "TURBOQUANT  TURBOQUANT_ALGO=prod TURBOQUANT_BITS=8" ;;
         TURBOQUANT_prod_b4)     echo "TURBOQUANT  TURBOQUANT_ALGO=prod TURBOQUANT_BITS=4" ;;
+        TURBOQUANT_mse_b4_lut)  echo "TURBOQUANT  TURBOQUANT_ALGO=mse TURBOQUANT_BITS=4 TURBOQUANT_USE_LUT=1" ;;
+        TURBOQUANT_prod_b4_lut) echo "TURBOQUANT  TURBOQUANT_ALGO=prod TURBOQUANT_BITS=4 TURBOQUANT_USE_LUT=1" ;;
         *) echo "[bench] unknown stage tag: $1" >&2; return 1 ;;
     esac
 }

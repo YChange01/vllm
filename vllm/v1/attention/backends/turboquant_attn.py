@@ -74,15 +74,24 @@ set_kv_cache_layout("NHD")
 logger = init_logger(__name__)
 
 TURBOQUANT_ALGO = os.environ.get("TURBOQUANT_ALGO", "prod").lower()
-TURBOQUANT_BITS = int(os.environ.get("TURBOQUANT_BITS", "8"))
+TURBOQUANT_BITS = int(os.environ.get("TURBOQUANT_BITS", "4"))
 # Experimental LUT kernel (turboquant_paged_attention_lut) -- builds
 # per-(query, head) q_rot x codebook table in registers and gathers via
-# mask-sum. Toggle via TURBOQUANT_USE_LUT=1.
+# mask-sum. Toggle via TURBOQUANT_USE_LUT=1. LUT kernel is b=4 only.
 TURBOQUANT_USE_LUT = os.environ.get("TURBOQUANT_USE_LUT", "0") == "1"
 
 if TURBOQUANT_ALGO not in ("mse", "prod"):
     raise ValueError(
         f"TURBOQUANT_ALGO must be 'mse' or 'prod', got {TURBOQUANT_ALGO!r}"
+    )
+# b=4 only on this branch. mse b=4 -> K_CB=16; prod b=4 -> K_CB=8.
+# Both satisfy K_CB <= 16 (4-bit nibble pack + LUT kernel).
+_K_CB = 1 << (TURBOQUANT_BITS - 1 if TURBOQUANT_ALGO == "prod" else TURBOQUANT_BITS)
+if _K_CB > 16:
+    raise ValueError(
+        f"turboquant-lut branch is b=4 only (K_CB <= 16); got "
+        f"algo={TURBOQUANT_ALGO} bits={TURBOQUANT_BITS} -> K_CB={_K_CB}. "
+        f"Use TURBOQUANT_BITS=4 (mse) or TURBOQUANT_BITS=4/5 (prod)."
     )
 
 logger.info(
