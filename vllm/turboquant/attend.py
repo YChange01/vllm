@@ -2,12 +2,13 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Triton attend kernel for TurboQuant (paper arXiv:2504.19874).
 
-Reads the paged K cache populated by ``vllm.turboquant.store`` and the
-raw V cache, runs causal varlen flash-style attention with on-the-fly K
-dequantization. One Triton program per (query_token, q_head) -- this
-is the hot path on every decode step.
+Reads the paged K cache populated by ``vllm.turboquant.store`` (K idx +
+||k||, optionally K QJL sign + ||r||) and the V cache (V idx + ||v||).
+Runs causal varlen flash-style attention with on-the-fly K and V
+dequantization. One Triton program per (query_token, q_head) -- this is
+the hot path on every decode step.
 
-Key reconstruction (per slot, per head):
+Logit (attention score) per (q, k):
 
     Algorithm 1 (mse):
         k_rot ≈ codebook[idx]
@@ -15,11 +16,18 @@ Key reconstruction (per slot, per head):
 
     Algorithm 2 (prod): + 1-bit QJL on the residual
         k_rot ≈ codebook[idx] + ||r|| * sqrt(pi/2)/d * S^T @ qjl_sign
-        logit = <q_rot, k_rot> * ||k|| / d
-              = (<q_rot, codebook[idx]> +
+        logit = (<q_rot, codebook[idx]> +
                  sqrt(pi/2)/d * ||r|| * <S @ q_rot, qjl_sign>) * ||k|| / d
 
-V is loaded as raw bf16/fp16 (no dequant).
+V dequant (always Q_mse):
+
+    v_rot ≈ codebook[v_idx] * ||v||
+    v     ≈ signs * (H @ v_rot) / sqrt(d)
+
+The kernel accumulates ``acc = sum_i w_i * v_rot_i`` in rotated /
+||·||=sqrt(d)-scaled space; the final inverse-Hadamard + signs +
+1/sqrt(d) is applied once per (query, head) in the Python wrapper
+(small matmul on top of the kernel output).
 """
 
 from __future__ import annotations
@@ -44,14 +52,15 @@ def _attend_kernel(
     Sq_ptr,                         # (T_q, H_q, d)  fp16/bf16  S @ q_rotated  (prod only)
     cache_k_idx_ptr,                # (num_blocks, bs, H_kv, d) uint8
     cache_k_norm_ptr,               # (num_blocks, bs, H_kv)    fp32
-    cache_v_ptr,                    # (num_blocks, bs, H_kv, d) fp16/bf16
+    cache_v_idx_ptr,                # (num_blocks, bs, H_kv, d) uint8
+    cache_v_norm_ptr,               # (num_blocks, bs, H_kv)    fp32
     cache_k_qjl_sign_ptr,           # (num_blocks, bs, H_kv, d) int8 (prod only)
     cache_k_rnorm_ptr,              # (num_blocks, bs, H_kv)    fp32 (prod only)
     block_table_ptr,                # (num_seqs, block_table_stride) int32
     seq_id_per_query_ptr,           # (T_q,) int32
     kv_end_per_query_ptr,           # (T_q,) int32  one-past-last attended kv pos
-    codebook_ptr,                   # (K_CB,) fp32
-    out_ptr,                        # (T_q, H_q, d) fp16/bf16
+    codebook_ptr,                   # (K_CB,) fp32  shared by K and V
+    out_ptr,                        # (T_q, H_q, d) fp16/bf16  in rotated V space
     inv_d,                          # 1/d
     qjl_coef,                       # sqrt(pi/2)/d  (prod only)
     max_blocks_per_seq,             # int loop bound
@@ -106,7 +115,7 @@ def _attend_kernel(
                         + kvh_idx
                     )
 
-                    # MSE main term: <q_rot, codebook[idx]> * ||k|| / d
+                    # K dequant + logit.
                     k_idx_u8 = tl.load(
                         cache_k_idx_ptr + base + d_idx, mask=mask_d, other=0
                     ).to(tl.int32)
@@ -126,9 +135,15 @@ def _attend_kernel(
                     else:
                         logit = main_dot * k_norm * inv_d
 
-                    v_vec = tl.load(
-                        cache_v_ptr + base + d_idx, mask=mask_d, other=0.0
-                    ).to(tl.float32)
+                    # V dequant in rotated space (||·|| = sqrt(d) per slot).
+                    # The post-rotation is applied once per (query, head)
+                    # in the Python wrapper, not per slot here.
+                    v_idx_u8 = tl.load(
+                        cache_v_idx_ptr + base + d_idx, mask=mask_d, other=0
+                    ).to(tl.int32)
+                    rv = tl.load(codebook_ptr + v_idx_u8).to(tl.float32)
+                    v_norm = tl.load(cache_v_norm_ptr + meta)
+                    v_vec = rv * v_norm
 
                     # Flash softmax accumulation.
                     m_new = tl.maximum(m_i, logit)
@@ -147,7 +162,8 @@ def turboquant_paged_attention(
     q: torch.Tensor,
     cache_k_idx: torch.Tensor,
     cache_k_norm: torch.Tensor,
-    cache_v: torch.Tensor,
+    cache_v_idx: torch.Tensor,
+    cache_v_norm: torch.Tensor,
     block_table: torch.Tensor,
     seq_lens: torch.Tensor,
     query_start_loc: torch.Tensor,
@@ -155,11 +171,14 @@ def turboquant_paged_attention(
     cache_k_qjl_sign: torch.Tensor | None = None,
     cache_k_rnorm: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Paged attention with on-the-fly K dequantization, varlen + causal.
+    """Paged attention with on-the-fly K and V dequantization.
 
     Pre-rotates Q (and Sq for prod) on-device via torch.matmul so the
-    Triton kernel itself stays free of Hadamard multiplies. V is read
-    from ``cache_v`` as raw bf16/fp16 (no dequant).
+    Triton kernel itself stays free of Hadamard multiplies. The kernel
+    accumulates V in the rotated/sqrt(d)-normalized space; this wrapper
+    applies the inverse rotation + signs + 1/sqrt(d) once per
+    (query, head) on the kernel's output to recover the true
+    softmax-weighted V sum.
     """
     num_query_tokens, num_heads_q, head_size = q.shape
     _, block_size, num_heads_kv, _ = cache_k_idx.shape
@@ -173,7 +192,7 @@ def turboquant_paged_attention(
 
     codebook_f = state.codebook.to(torch.float32)
 
-    # Per-query metadata on-device (vectorized, no Python loop).
+    # Per-query metadata on-device (vectorized).
     dev = q.device
     qsl = query_start_loc.to(device=dev, dtype=torch.int64)
     query_lens = qsl[1:] - qsl[:-1]
@@ -190,9 +209,7 @@ def turboquant_paged_attention(
     seq_id_per_query = seq_id_per_query_i64.to(torch.int32).contiguous()
     kv_end_per_query = kv_end_per_query_i64.to(torch.int32).contiguous()
 
-    # Pre-rotate Q (and Sq for prod). H is symmetric (Walsh-Hadamard) so
-    # H.T @ x == H @ x; using .T here mirrors the store-side formula
-    # rotated = (k_normed * signs) @ H.T.
+    # Pre-rotate Q (and Sq for prod). H is symmetric, so H.T == H.
     H_f = state.H.to(torch.float32)
     signs_f = state.signs.to(torch.float32)
     q_f = q.float()
@@ -204,7 +221,9 @@ def turboquant_paged_attention(
         Sq = q_rotated @ S_f.T
         Sq_k = Sq.to(q.dtype).contiguous()
     else:
-        Sq_k = q_rotated_k  # unused but the kernel still needs a valid pointer
+        # Unused when USE_QJL=False, but the kernel still needs a valid
+        # pointer of the right dtype.
+        Sq_k = q_rotated_k
 
     out = torch.empty_like(q)
     grid = (num_query_tokens, num_heads_q)
@@ -218,8 +237,6 @@ def turboquant_paged_attention(
     actual_max_blocks = (int(seq_lens.max().item()) + block_size - 1) // block_size
     block_table_stride = int(block_table.shape[1])
 
-    # When USE_QJL is False the kernel never dereferences these pointers,
-    # but Triton still needs them to be valid tensors.
     qjl_sign_buf = cache_k_qjl_sign if use_qjl else cache_k_idx
     rnorm_buf = cache_k_rnorm if use_qjl else cache_k_norm
 
@@ -228,7 +245,8 @@ def turboquant_paged_attention(
         Sq_k,
         cache_k_idx,
         cache_k_norm,
-        cache_v,
+        cache_v_idx,
+        cache_v_norm,
         qjl_sign_buf,
         rnorm_buf,
         block_table,
@@ -249,4 +267,10 @@ def turboquant_paged_attention(
         BLOCK_BS=BLOCK_BS,
         USE_QJL=use_qjl,
     )
-    return out
+
+    # Post-rotate V back to original space:
+    #   output[d] = signs[d] * (H @ acc)[d] / sqrt(d)
+    #            = signs[d] * (acc @ H.T)[d] / sqrt(d)        (H symmetric)
+    out_f = out.float()
+    output_f = (out_f @ H_f.T) * signs_f / math.sqrt(float(head_size))
+    return output_f.to(out.dtype)

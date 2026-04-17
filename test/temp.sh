@@ -1,10 +1,8 @@
 #!/usr/bin/env bash
-# Quick correctness probe after the K-store-in-Python rewrite.
-# Compares baseline.sh outputs (FLASH_ATTN vs TURBOQUANT mse b=8 vs
-# TURBOQUANT mse b=4) on a 26-token prompt.
+# Verify K + V quantization (mse and prod) all still produce correct
+# greedy text after V was switched from raw to Q_mse quantization.
 
 set -u
-
 cd "$(dirname "$0")/.."
 
 GPU="${GPU:-3}"
@@ -12,14 +10,14 @@ PROMPT="${PROMPT:-Machine learning has transformed many fields over the past dec
 MAX_TOKENS="${MAX_TOKENS:-4}"
 
 echo "=========================================================="
-echo "1) mse  b=8 vs b=4"
+echo "1) mse  K+V  b=8 vs b=4"
 echo "=========================================================="
 TURBOQUANT_ALGO=mse TURBOQUANT_BITS=8 \
     bash test/baseline.sh "$PROMPT" "$MAX_TOKENS" "$GPU" || true
 
 echo ""
 echo "=========================================================="
-echo "2) prod b=8 vs b=4"
+echo "2) prod K, mse V  b=8 vs b=4"
 echo "=========================================================="
 TURBOQUANT_ALGO=prod TURBOQUANT_BITS=8 \
     bash test/baseline.sh "$PROMPT" "$MAX_TOKENS" "$GPU" || true

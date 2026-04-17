@@ -15,21 +15,18 @@ Environment variables
 
 Storage layout per layer (allocated lazily on first forward):
 
-    _k_idx       : (num_blocks, bs, H_kv, d)  uint8    Lloyd-Max bucket
+    _k_idx       : (num_blocks, bs, H_kv, d)  uint8    K Lloyd-Max bucket
     _k_norm      : (num_blocks, bs, H_kv)     fp32     ||k||
-    _v           : (num_blocks, bs, H_kv, d)  bf16/fp16  V raw
-    _k_qjl_sign  : (num_blocks, bs, H_kv, d)  int8     prod only
-    _k_rnorm     : (num_blocks, bs, H_kv)     fp32     prod only
+    _v_idx       : (num_blocks, bs, H_kv, d)  uint8    V Lloyd-Max bucket
+    _v_norm      : (num_blocks, bs, H_kv)     fp32     ||v||
+    _k_qjl_sign  : (num_blocks, bs, H_kv, d)  int8     K QJL sign  (prod only)
+    _k_rnorm     : (num_blocks, bs, H_kv)     fp32     K residual ||r|| (prod only)
 
-V rationale
------------
-Paper compresses both K and V; an int8 V quant was attempted here but
-produced ``|attn|.max > max|v|`` on Llama prefill -- mathematically
-impossible for a correct softmax-weighted sum -- which traced to a
-Triton multi-program write corrupting the V cache. Keeping V raw
-removed the bug. K still gives the bulk of the memory savings (8x at
-b=8) and is the harder part to quantize accurately for the inner
-product with Q.
+V is quantized via Q_mse only (no QJL on V). K and V share the same
+``QuantState`` (H, signs, codebook). V reconstruction in the attend
+kernel is done in rotated/sqrt(d)-normalized space; the inverse
+Hadamard + signs + 1/sqrt(d) is applied once per (query, head) in the
+attend wrapper, not per attended KV slot.
 
 vLLM integration
 ----------------
@@ -53,7 +50,7 @@ from vllm.config.cache import CacheDType
 from vllm.logger import init_logger
 from vllm.turboquant.attend import turboquant_paged_attention
 from vllm.turboquant.codebook import QuantState
-from vllm.turboquant.store import turboquant_store_kv
+from vllm.turboquant.store import turboquant_store_kv, turboquant_store_v
 from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionCGSupport,
@@ -226,7 +223,8 @@ class TurboQuantAttentionImpl(AttentionImpl):
         # Lazily allocated in _ensure_buffers.
         self._k_idx: torch.Tensor | None = None
         self._k_norm: torch.Tensor | None = None
-        self._v: torch.Tensor | None = None
+        self._v_idx: torch.Tensor | None = None
+        self._v_norm: torch.Tensor | None = None
         self._k_qjl_sign: torch.Tensor | None = None  # prod only
         self._k_rnorm: torch.Tensor | None = None     # prod only
 
@@ -259,7 +257,8 @@ class TurboQuantAttentionImpl(AttentionImpl):
 
         self._k_idx = torch.zeros(shape_dim, dtype=torch.uint8, device=device)
         self._k_norm = torch.zeros(shape_meta, dtype=torch.float32, device=device)
-        self._v = torch.zeros(shape_dim, dtype=kv_cache.dtype, device=device)
+        self._v_idx = torch.zeros(shape_dim, dtype=torch.uint8, device=device)
+        self._v_norm = torch.zeros(shape_meta, dtype=torch.float32, device=device)
 
         if TURBOQUANT_ALGO == "prod":
             self._k_qjl_sign = torch.zeros(
@@ -289,17 +288,9 @@ class TurboQuantAttentionImpl(AttentionImpl):
 
         self._ensure_buffers(kv_cache)
         block_size = kv_cache.shape[2]
-
-        # V: scatter raw into _v via slot_mapping (no quant).
-        valid = slot_mapping >= 0
-        slots = slot_mapping[valid].to(torch.int64)
-        if slots.numel() > 0:
-            b_idx = slots // block_size
-            off = slots % block_size
-            self._v[b_idx, off] = v[valid]
-
-        # K: Lloyd-Max + Hadamard via PyTorch ops on GPU.
         state = self._ensure_state(key.dtype, key.device)
+
+        # K quant: Lloyd-Max + Hadamard (+ QJL residual if prod).
         turboquant_store_kv(
             new_k=k,
             cache_k_idx=self._k_idx,
@@ -309,6 +300,15 @@ class TurboQuantAttentionImpl(AttentionImpl):
             block_size=block_size,
             cache_k_qjl_sign=self._k_qjl_sign,
             cache_k_rnorm=self._k_rnorm,
+        )
+        # V quant: Q_mse only (no QJL).
+        turboquant_store_v(
+            new_v=v,
+            cache_v_idx=self._v_idx,
+            cache_v_norm=self._v_norm,
+            slot_mapping=slot_mapping,
+            state=state,
+            block_size=block_size,
         )
 
     def forward(
@@ -348,7 +348,8 @@ class TurboQuantAttentionImpl(AttentionImpl):
             q=q,
             cache_k_idx=self._k_idx,
             cache_k_norm=self._k_norm,
-            cache_v=self._v,
+            cache_v_idx=self._v_idx,
+            cache_v_norm=self._v_norm,
             block_table=attn_metadata.block_table,
             seq_lens=attn_metadata.seq_lens,
             query_start_loc=attn_metadata.query_start_loc,

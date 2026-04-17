@@ -24,7 +24,7 @@ import torch
 
 from vllm.turboquant.attend import turboquant_paged_attention
 from vllm.turboquant.codebook import QuantState
-from vllm.turboquant.store import turboquant_store_kv
+from vllm.turboquant.store import turboquant_store_kv, turboquant_store_v
 
 
 def reference_attention(
@@ -50,13 +50,15 @@ def reference_attention(
 
 
 def _alloc_cache(num_blocks: int, block_size: int, num_heads_kv: int,
-                 head_size: int, device, algo: str, v_dtype: torch.dtype):
+                 head_size: int, device, algo: str):
     c_k_idx = torch.zeros(num_blocks, block_size, num_heads_kv, head_size,
                           dtype=torch.uint8, device=device)
     c_k_norm = torch.zeros(num_blocks, block_size, num_heads_kv,
                            dtype=torch.float32, device=device)
-    c_v = torch.zeros(num_blocks, block_size, num_heads_kv, head_size,
-                         dtype=v_dtype, device=device)
+    c_v_idx = torch.zeros(num_blocks, block_size, num_heads_kv, head_size,
+                          dtype=torch.uint8, device=device)
+    c_v_norm = torch.zeros(num_blocks, block_size, num_heads_kv,
+                           dtype=torch.float32, device=device)
     if algo == "prod":
         c_k_qjl = torch.zeros(num_blocks, block_size, num_heads_kv, head_size,
                               dtype=torch.int8, device=device)
@@ -65,7 +67,7 @@ def _alloc_cache(num_blocks: int, block_size: int, num_heads_kv: int,
     else:
         c_k_qjl = None
         c_k_rnorm = None
-    return c_k_idx, c_k_norm, c_v, c_k_qjl, c_k_rnorm
+    return c_k_idx, c_k_norm, c_v_idx, c_v_norm, c_k_qjl, c_k_rnorm
 
 
 def _run_algo(algo: str, num_tokens: int, bits: int, q, k, v, slot_mapping,
@@ -73,8 +75,9 @@ def _run_algo(algo: str, num_tokens: int, bits: int, q, k, v, slot_mapping,
               num_heads_kv, head_size, device, dtype) -> torch.Tensor:
     state = QuantState(algo=algo, bits=bits, head_dim=head_size,
                        seed=42, dtype=dtype, device=device)
-    (c_k_idx, c_k_norm, c_v, c_k_qjl, c_k_rnorm) = _alloc_cache(
-        num_blocks, block_size, num_heads_kv, head_size, device, algo, dtype,
+    (c_k_idx, c_k_norm, c_v_idx, c_v_norm,
+     c_k_qjl, c_k_rnorm) = _alloc_cache(
+        num_blocks, block_size, num_heads_kv, head_size, device, algo,
     )
     turboquant_store_kv(
         new_k=k,
@@ -83,18 +86,17 @@ def _run_algo(algo: str, num_tokens: int, bits: int, q, k, v, slot_mapping,
         state=state, block_size=block_size,
         cache_k_qjl_sign=c_k_qjl, cache_k_rnorm=c_k_rnorm,
     )
-    # V is stored in Python now (mirrors backend's do_kv_cache_update).
-    valid = slot_mapping >= 0
-    slots = slot_mapping[valid].to(torch.int64)
-    if slots.numel() > 0:
-        b_idx = slots // block_size
-        off = slots % block_size
-        c_v[b_idx, off] = v[valid]
+    turboquant_store_v(
+        new_v=v,
+        cache_v_idx=c_v_idx, cache_v_norm=c_v_norm,
+        slot_mapping=slot_mapping,
+        state=state, block_size=block_size,
+    )
     torch.cuda.synchronize()
     out = turboquant_paged_attention(
         q=q,
         cache_k_idx=c_k_idx, cache_k_norm=c_k_norm,
-        cache_v=c_v,
+        cache_v_idx=c_v_idx, cache_v_norm=c_v_norm,
         block_table=block_table,
         seq_lens=seq_lens, query_start_loc=query_start_loc,
         state=state,

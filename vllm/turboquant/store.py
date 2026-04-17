@@ -1,19 +1,29 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""K quantization store for TurboQuant.
+"""K/V quantization store for TurboQuant.
 
 Pure PyTorch on the same device as the input. Implements the storage
 side of paper arXiv:2504.19874 (Zandieh et al.):
 
-    Algorithm 1 (Q_mse):  rotated = H @ diag(signs) @ k_normed
-                          idx     = Lloyd-Max bucket of rotated
-                          stored  = (idx, ||k||)
+    Algorithm 1 (Q_mse)  : rotated = H @ diag(signs) @ x_normed
+                           idx     = Lloyd-Max bucket of rotated
+                           stored  = (idx, ||x||)
 
-    Algorithm 2 (Q_prod): on top of Q_mse, also store the 1-bit QJL
-                          sign of the per-coord residual:
-                          r        = rotated - codebook[idx]
-                          qjl_sign = sign(S @ r_unit)
-                          stored   = (idx, ||k||, qjl_sign, ||r||)
+    Algorithm 2 (Q_prod) : on top of Q_mse, also store the 1-bit QJL
+                           sign of the per-coord residual:
+                               r        = rotated - codebook[idx]
+                               qjl_sign = sign(S @ r_unit)
+                               stored   = (idx, ||x||, qjl_sign, ||r||)
+
+K is quantized via the chosen algorithm (mse or prod). V is always
+quantized via Q_mse only -- QJL targets unbiased inner-product
+estimates, but attention's V step is a weighted sum where direct
+reconstruction matters and the extra QJL bit doesn't help.
+
+K and V share the same ``QuantState`` (same H, signs, codebook). This
+saves memory and keeps reconstruction symmetric; per-vector Lloyd-Max
+quantization decorrelates the noise within each layer regardless of
+whether K and V share the rotation.
 
 Why pure PyTorch and not Triton: a Triton store kernel was previously
 used here, but on B200 multi-token grids it silently corrupted the V
@@ -32,6 +42,58 @@ import torch
 
 if TYPE_CHECKING:
     from vllm.turboquant.codebook import QuantState
+
+
+def _quantize_lloyd_max(
+    x: torch.Tensor, state: "QuantState"
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Run Q_mse on ``x``: norm + Hadamard + Lloyd-Max bucket.
+
+    Returns
+    -------
+    idx_uint8 : (..., d) uint8     Lloyd-Max bucket per coord
+    x_norm    : (...,)   fp32      ||x|| per (token, head)
+    rotated   : (..., d) fp32      H @ (signs * x_normed)
+    idx32     : (..., d) int64     same as idx_uint8 but int64 (for
+                                   downstream codebook gather, e.g. QJL)
+    """
+    d = x.shape[-1]
+    K_CB = int(state.codebook.shape[0])
+
+    x_f = x.float()
+    H_f = state.H.to(torch.float32)
+    signs_f = state.signs.to(torch.float32)
+    boundaries_f = state.boundaries.to(torch.float32).contiguous()
+
+    x_norm = x_f.norm(dim=-1).clamp_min(1e-6)
+    x_normed = x_f * (math.sqrt(float(d)) / x_norm.unsqueeze(-1))
+    rotated = (x_normed * signs_f) @ H_f.T
+
+    idx32 = torch.searchsorted(boundaries_f, rotated.contiguous())
+    idx32 = idx32.clamp(0, K_CB - 1)
+    idx_uint8 = idx32.to(torch.uint8)
+    return idx_uint8, x_norm, rotated, idx32
+
+
+def _scatter_paged(
+    cache: torch.Tensor,
+    values: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    block_size: int,
+) -> None:
+    """Scatter ``values`` into ``cache`` via paged ``slot_mapping``.
+
+    ``cache``  : (num_blocks, block_size, ...) tensor.
+    ``values`` : (T, ...) where T == slot_mapping.shape[0].
+    Skips ``slot_mapping[i] < 0`` (padding).
+    """
+    valid = slot_mapping >= 0
+    if not bool(valid.any()):
+        return
+    slots = slot_mapping[valid].to(torch.int64)
+    b_idx = slots // block_size
+    off = slots % block_size
+    cache[b_idx, off] = values[valid]
 
 
 def turboquant_store_kv(
@@ -72,58 +134,46 @@ def turboquant_store_kv(
             "prod requires cache_k_qjl_sign and cache_k_rnorm"
         )
 
-    T, H_kv, d = new_k.shape
-    K_CB = int(state.codebook.shape[0])
-
-    # Compute in fp32 for numerical safety, on the K device.
-    k_f = new_k.float()
-    H_f = state.H.to(torch.float32)
-    signs_f = state.signs.to(torch.float32)
-    boundaries_f = state.boundaries.to(torch.float32).contiguous()
-
-    # ||k|| per (token, head); clamp away the singular case.
-    k_norm = k_f.norm(dim=-1).clamp_min(1e-6)              # (T, H_kv)
-
-    # k_normed has ||.|| == sqrt(d) per (token, head). The codebook is
-    # trained on N(0, 1) per coord, which matches per-coord variance ≈ 1
-    # of a sqrt(d)-norm vector after Hadamard rotation.
-    k_normed = k_f * (math.sqrt(float(d)) / k_norm.unsqueeze(-1))
-
-    # rotated[..., i] = sum_j H[i, j] * (signs * k_normed)[..., j]
-    #                 = (H @ (signs * k_normed))[..., i]
-    # In row-vec form on the last dim: (k_normed * signs) @ H.T
-    rotated = (k_normed * signs_f) @ H_f.T                  # (T, H_kv, d)
-
-    # Lloyd-Max bucket: idx = #(boundaries < rotated). Equivalent to
-    # torch.searchsorted with default right=False on a sorted sequence.
-    idx32 = torch.searchsorted(boundaries_f, rotated.contiguous())
-    idx_uint8 = idx32.clamp(0, K_CB - 1).to(torch.uint8)    # (T, H_kv, d)
+    idx_uint8, k_norm, rotated, idx32 = _quantize_lloyd_max(new_k, state)
+    _scatter_paged(cache_k_idx, idx_uint8, slot_mapping, block_size)
+    _scatter_paged(cache_k_norm, k_norm, slot_mapping, block_size)
 
     if use_qjl:
         codebook_f = state.codebook.to(torch.float32)
         S_f = state.S.to(torch.float32)
-        rk = codebook_f[idx32.clamp(0, K_CB - 1)]           # (T, H_kv, d)
+        rk = codebook_f[idx32]                                  # (T, H_kv, d)
         r = rotated - rk
-        r_norm = r.norm(dim=-1).clamp_min(1e-6)             # (T, H_kv)
+        r_norm = r.norm(dim=-1).clamp_min(1e-6)
         r_unit = r / r_norm.unsqueeze(-1)
         # qjl_raw[..., i] = sum_j S[i, j] * r_unit[..., j] = (S @ r_unit)[..., i]
-        qjl_raw = r_unit @ S_f.T                            # (T, H_kv, d)
+        qjl_raw = r_unit @ S_f.T
         qjl_sign = torch.where(
             qjl_raw >= 0,
             qjl_raw.new_ones(()),
             -qjl_raw.new_ones(()),
-        ).to(torch.int8)                                    # (T, H_kv, d)
+        ).to(torch.int8)
+        _scatter_paged(cache_k_qjl_sign, qjl_sign, slot_mapping, block_size)
+        _scatter_paged(cache_k_rnorm, r_norm, slot_mapping, block_size)
 
-    # Scatter into paged caches via slot_mapping. Skip padded (-1) slots.
-    valid = slot_mapping >= 0
-    if not bool(valid.any()):
+
+def turboquant_store_v(
+    new_v: torch.Tensor,
+    cache_v_idx: torch.Tensor,
+    cache_v_norm: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    state: "QuantState",
+    block_size: int,
+) -> None:
+    """Quantize one batch of V vectors via Q_mse only (no QJL).
+
+    Same H/signs/codebook as K (shared ``state``). Stored per-coord
+    Lloyd-Max bucket + per (token, head) ||v||. Reconstruction in attend:
+    ``v ≈ signs * (H @ codebook[idx]) * ||v|| / sqrt(d)`` -- the post-
+    rotation is applied once per (query, head) in the attend wrapper,
+    not per attended KV slot in the kernel.
+    """
+    if new_v.shape[0] == 0:
         return
-    slots = slot_mapping[valid].to(torch.int64)
-    b_idx = slots // block_size
-    off = slots % block_size
-
-    cache_k_idx[b_idx, off] = idx_uint8[valid]
-    cache_k_norm[b_idx, off] = k_norm[valid]
-    if use_qjl:
-        cache_k_qjl_sign[b_idx, off] = qjl_sign[valid]
-        cache_k_rnorm[b_idx, off] = r_norm[valid]
+    idx_uint8, v_norm, _rotated, _idx32 = _quantize_lloyd_max(new_v, state)
+    _scatter_paged(cache_v_idx, idx_uint8, slot_mapping, block_size)
+    _scatter_paged(cache_v_norm, v_norm, slot_mapping, block_size)
