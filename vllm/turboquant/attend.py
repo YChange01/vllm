@@ -54,7 +54,8 @@ def _attend_kernel(
     cache_k_norm_ptr,               # (num_blocks, bs, H_kv)          fp32
     cache_v_idx_ptr,                # (num_blocks, bs, H_kv, idx_dim) uint8
     cache_v_norm_ptr,               # (num_blocks, bs, H_kv)          fp32
-    cache_k_qjl_sign_ptr,           # (num_blocks, bs, H_kv, d) int8 (prod only)
+    cache_k_qjl_sign_ptr,           # (num_blocks, bs, H_kv, d/8) uint8 (prod only)
+                                    # 8 sign bits per byte, bit_j = (sign_j < 0)
     cache_k_rnorm_ptr,              # (num_blocks, bs, H_kv)    fp32 (prod only)
     block_table_ptr,                # (num_seqs, block_table_stride) int32
     seq_id_per_query_ptr,           # (T_q,) int32
@@ -72,6 +73,8 @@ def _attend_kernel(
     idx_dim: tl.constexpr,          # physical last-dim of cache_k_idx /
                                     # cache_v_idx (head_size if unpacked,
                                     # head_size // 2 if 4-bit packed)
+    qjl_dim: tl.constexpr,          # physical last-dim of cache_k_qjl_sign
+                                    # (head_size // 8 when prod, else unused)
     block_size: tl.constexpr,
     BLOCK_D: tl.constexpr,
     BLOCK_BS: tl.constexpr,
@@ -145,17 +148,21 @@ def _attend_kernel(
                     k_norm = tl.load(cache_k_norm_ptr + meta)
 
                     if USE_QJL:
-                        # QJL sign cache is unpacked int8 -- uses the
-                        # logical head_size stride, not idx_dim.
-                        base_full = (
-                            phys_block * block_size * num_heads_kv * head_size
-                            + tok_in_block * num_heads_kv * head_size
-                            + kvh_idx * head_size
+                        # QJL sign cache is bit-packed uint8 (8 signs/byte).
+                        # bit_j = (sign_j < 0); inverse: sign = 1 - 2 * bit.
+                        base_qjl = (
+                            phys_block * block_size * num_heads_kv * qjl_dim
+                            + tok_in_block * num_heads_kv * qjl_dim
+                            + kvh_idx * qjl_dim
                         )
-                        qjl_sign = tl.load(
-                            cache_k_qjl_sign_ptr + base_full + d_idx,
+                        bit_pos = d_idx % 8
+                        byte_pos = d_idx // 8
+                        qjl_byte = tl.load(
+                            cache_k_qjl_sign_ptr + base_qjl + byte_pos,
                             mask=mask_d, other=0,
-                        ).to(tl.float32)
+                        ).to(tl.int32)
+                        bit = ((qjl_byte >> bit_pos) & 1).to(tl.float32)
+                        qjl_sign = 1.0 - 2.0 * bit
                         qjl_dot = tl.sum(sq * qjl_sign)
                         r_norm = tl.load(cache_k_rnorm_ptr + meta)
                         logit = (main_dot + qjl_coef * r_norm * qjl_dot) \
@@ -283,7 +290,21 @@ def turboquant_paged_attention(
     actual_max_blocks = (int(seq_lens.max().item()) + block_size - 1) // block_size
     block_table_stride = int(block_table.shape[1])
 
-    qjl_sign_buf = cache_k_qjl_sign if use_qjl else cache_k_idx
+    qjl_dim = head_size // 8 if use_qjl else 1
+    if use_qjl:
+        qjl_sign_buf = cache_k_qjl_sign
+        assert qjl_sign_buf.dtype == torch.uint8, (
+            f"cache_k_qjl_sign must be uint8 (bit-packed), "
+            f"got {qjl_sign_buf.dtype}"
+        )
+        assert qjl_sign_buf.shape[-1] == qjl_dim, (
+            f"cache_k_qjl_sign last dim {qjl_sign_buf.shape[-1]} != "
+            f"expected {qjl_dim} (head_size // 8)"
+        )
+    else:
+        # Kernel still needs a valid uint8 pointer even when USE_QJL=False.
+        # Reuse cache_k_idx which is already uint8.
+        qjl_sign_buf = cache_k_idx
     rnorm_buf = cache_k_rnorm if use_qjl else cache_k_norm
 
     _attend_kernel[grid](
@@ -309,6 +330,7 @@ def turboquant_paged_attention(
         num_heads_kv=num_heads_kv,
         head_size=head_size,
         idx_dim=idx_dim,
+        qjl_dim=qjl_dim,
         block_size=block_size,
         BLOCK_D=BLOCK_D,
         BLOCK_BS=BLOCK_BS,

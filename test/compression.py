@@ -38,8 +38,10 @@ def static_layer_bytes(
     K_CB = 1 << (bits - 1 if algo == "prod" else bits)
     pack_4bit = K_CB <= 16
     idx_last = head_size // 2 if pack_4bit else head_size
-    dim_elems = num_blocks * block_size * num_kv_heads * head_size
+    qjl_last = head_size // 8  # bit-packed: 8 signs per byte
+    dim_elems = num_blocks * block_size * num_kv_heads * head_size  # noqa: F841
     idx_elems = num_blocks * block_size * num_kv_heads * idx_last
+    qjl_elems = num_blocks * block_size * num_kv_heads * qjl_last
     meta_elems = num_blocks * block_size * num_kv_heads
     out = {
         "k_idx (uint8)": idx_elems * 1,
@@ -48,8 +50,8 @@ def static_layer_bytes(
         "v_norm (fp32)": meta_elems * 4,
     }
     if algo == "prod":
-        # QJL sign stays unpacked int8 for now.
-        out["k_qjl_sign (int8)"] = dim_elems * 1
+        # QJL sign is bit-packed uint8: 8 signs / byte.
+        out["k_qjl_sign (1bit pack)"] = qjl_elems * 1
         out["k_rnorm (fp32)"] = meta_elems * 4
     return out
 
@@ -110,8 +112,7 @@ def report(num_blocks, block_size, num_kv_heads, head_size, num_layers):
     print("  - bits=4 packs two 4-bit indices per byte (head_size//2 "
           "storage).")
     print("  - bits=8 stores one index per byte (full head_size).")
-    print("  - QJL sign for prod is still int8 unpacked (could become a "
-          "1-bit bitfield for further savings).")
+    print("  - QJL sign for prod is bit-packed (8 signs per byte).")
     print("  - vLLM still allocates its own bf16 kv_cache that we ignore;"
           " that's separate wasted memory.")
 

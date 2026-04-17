@@ -15,12 +15,15 @@ Environment variables
 
 Storage layout per layer (allocated lazily on first forward):
 
-    _k_idx       : (num_blocks, bs, H_kv, d)  uint8    K Lloyd-Max bucket
-    _k_norm      : (num_blocks, bs, H_kv)     fp32     ||k||
-    _v_idx       : (num_blocks, bs, H_kv, d)  uint8    V Lloyd-Max bucket
-    _v_norm      : (num_blocks, bs, H_kv)     fp32     ||v||
-    _k_qjl_sign  : (num_blocks, bs, H_kv, d)  int8     K QJL sign  (prod only)
-    _k_rnorm     : (num_blocks, bs, H_kv)     fp32     K residual ||r|| (prod only)
+    _k_idx       : (num_blocks, bs, H_kv, idx_d)  uint8  K Lloyd-Max bucket
+                   idx_d = d // 2 when K_CB <= 16 (4-bit nibble pack), else d
+    _k_norm      : (num_blocks, bs, H_kv)         fp32   ||k||
+    _v_idx       : (num_blocks, bs, H_kv, idx_d)  uint8  V Lloyd-Max bucket
+    _v_norm      : (num_blocks, bs, H_kv)         fp32   ||v||
+    _k_qjl_sign  : (num_blocks, bs, H_kv, d/8)    uint8  K QJL 1-bit sign
+                                                         (prod only, 8 signs/byte)
+    _k_rnorm     : (num_blocks, bs, H_kv)         fp32   K residual ||r||
+                                                         (prod only)
 
 V is quantized via Q_mse only (no QJL on V). K and V share the same
 ``QuantState`` (H, signs, codebook). V reconstruction in the attend
@@ -262,7 +265,6 @@ class TurboQuantAttentionImpl(AttentionImpl):
         )
 
         shape_idx = (num_blocks, block_size, self.num_kv_heads, idx_last_dim)
-        shape_full = (num_blocks, block_size, self.num_kv_heads, self.head_size)
         shape_meta = (num_blocks, block_size, self.num_kv_heads)
 
         self._k_idx = torch.zeros(shape_idx, dtype=torch.uint8, device=device)
@@ -271,11 +273,15 @@ class TurboQuantAttentionImpl(AttentionImpl):
         self._v_norm = torch.zeros(shape_meta, dtype=torch.float32, device=device)
 
         if TURBOQUANT_ALGO == "prod":
-            # QJL sign stays unpacked int8 for now (-1 / +1 per coord).
-            # Could pack to a 1-bit bitfield (8x further saving on this
-            # buffer) -- left as a follow-up.
+            # QJL sign is bit-packed: 8 +/-1 signs per byte, bit_j = (sign_j < 0).
+            assert self.head_size % 8 == 0, (
+                f"head_size {self.head_size} must be divisible by 8 for "
+                f"QJL bit-packing"
+            )
+            shape_qjl = (num_blocks, block_size, self.num_kv_heads,
+                         self.head_size // 8)
             self._k_qjl_sign = torch.zeros(
-                shape_full, dtype=torch.int8, device=device
+                shape_qjl, dtype=torch.uint8, device=device
             )
             self._k_rnorm = torch.zeros(
                 shape_meta, dtype=torch.float32, device=device

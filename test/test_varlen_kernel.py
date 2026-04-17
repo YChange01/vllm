@@ -62,8 +62,9 @@ def _alloc_cache(num_blocks: int, block_size: int, num_heads_kv: int,
     c_v_norm = torch.zeros(num_blocks, block_size, num_heads_kv,
                            dtype=torch.float32, device=device)
     if algo == "prod":
-        c_k_qjl = torch.zeros(num_blocks, block_size, num_heads_kv, head_size,
-                              dtype=torch.int8, device=device)
+        assert head_size % 8 == 0, "head_size must be divisible by 8 for QJL bit-pack"
+        c_k_qjl = torch.zeros(num_blocks, block_size, num_heads_kv, head_size // 8,
+                              dtype=torch.uint8, device=device)
         c_k_rnorm = torch.zeros(num_blocks, block_size, num_heads_kv,
                                 dtype=torch.float32, device=device)
     else:

@@ -115,6 +115,23 @@ def _maybe_pack_4bit(idx_uint8: torch.Tensor, K_CB: int) -> torch.Tensor:
     return (low | (high << 4)).to(torch.uint8)
 
 
+def _pack_qjl_sign(qjl_sign: torch.Tensor) -> torch.Tensor:
+    """Pack 8 QJL sign bits per byte along the last dim.
+
+    Encoding: bit_j = (sign_j < 0). So +1 -> 0, -1 -> 1. Inverse in attend:
+    ``sign = 1 - 2 * bit``. Last dim must be divisible by 8.
+
+    Returns a (..., d / 8) uint8 tensor.
+    """
+    d = qjl_sign.shape[-1]
+    assert d % 8 == 0, f"last dim {d} must be divisible by 8 for QJL bit-pack"
+    bits = (qjl_sign < 0).to(torch.int32)
+    prefix = bits.shape[:-1]
+    bits = bits.view(*prefix, d // 8, 8)
+    weights = 1 << torch.arange(8, device=bits.device, dtype=torch.int32)
+    return (bits * weights).sum(dim=-1).to(torch.uint8)
+
+
 def turboquant_store_kv(
     new_k: torch.Tensor,
     cache_k_idx: torch.Tensor,
@@ -175,7 +192,8 @@ def turboquant_store_kv(
             qjl_raw.new_ones(()),
             -qjl_raw.new_ones(()),
         ).to(torch.int8)
-        _scatter_paged(cache_k_qjl_sign, qjl_sign, slot_mapping, block_size)
+        qjl_packed = _pack_qjl_sign(qjl_sign)
+        _scatter_paged(cache_k_qjl_sign, qjl_packed, slot_mapping, block_size)
         _scatter_paged(cache_k_rnorm, r_norm, slot_mapping, block_size)
 
 
