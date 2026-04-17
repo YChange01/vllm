@@ -50,104 +50,15 @@ if TYPE_CHECKING:
 _NEG_LARGE = tl.constexpr(-1.0e30)
 
 
-# =========================================================================
-# Store kernel: quantize K (mse or prod) only.
-# V is now stored in Python (do_kv_cache_update) -- multi-token grids of
-# this kernel produced corrupted V (stored_v|.|max == |k|max instead of
-# |v|max) on B200, even when V was stored as the very first op after
-# load. Decode (single-token grid) was fine. The Python copy bypasses
-# whatever Triton multi-program issue triggers it.
-# =========================================================================
-@triton.jit
-def _store_kernel(
-    new_k_ptr,                      # (T, H_kv, d) fp16/bf16
-    cache_k_idx_ptr,                # (num_blocks, bs, H_kv, d) uint8
-    cache_k_norm_ptr,               # (num_blocks, bs, H_kv) fp32
-    cache_k_qjl_sign_ptr,           # int8 (prod only; unused if USE_QJL=False)
-    cache_k_rnorm_ptr,              # fp32 (prod only)
-    slot_mapping_ptr,               # (T,) int64
-    codebook_ptr,                   # (K_CB,) fp32
-    boundaries_ptr,                 # (K_CB - 1,) fp32
-    hadamard_ptr,                   # (d, d) fp16/bf16
-    signs_ptr,                      # (d,) fp16/bf16
-    qjl_matrix_ptr,                 # (d, d) fp16/bf16 (prod only)
-    num_heads_kv: tl.constexpr,
-    head_size: tl.constexpr,
-    block_size: tl.constexpr,
-    K_CB: tl.constexpr,
-    BLOCK_D: tl.constexpr,
-    USE_QJL: tl.constexpr,
-):
-    """One program = one (token, kv_head) pair."""
-    tok = tl.program_id(0)
-    head = tl.program_id(1)
-
-    slot = tl.load(slot_mapping_ptr + tok)
-    if slot < 0:
-        return
-
-    block_idx = slot // block_size
-    off_in_block = slot % block_size
-
-    d_idx = tl.arange(0, BLOCK_D)
-    mask_d = d_idx < head_size
-
-    # Per-dim and scalar-meta offsets into the paged cache.
-    cache_off = (
-        block_idx * block_size * num_heads_kv * head_size
-        + off_in_block * num_heads_kv * head_size
-        + head * head_size
-        + d_idx
-    )
-    meta_off = (
-        block_idx * block_size * num_heads_kv
-        + off_in_block * num_heads_kv
-        + head
-    )
-
-    # --- K: load + rotation primitives ---
-    # V is stored separately in Python (see do_kv_cache_update).
-    kv_off = (tok * num_heads_kv + head) * head_size + d_idx
-    k_vec = tl.load(new_k_ptr + kv_off, mask=mask_d, other=0.0).to(tl.float32)
-
-    signs = tl.load(signs_ptr + d_idx, mask=mask_d, other=1.0).to(tl.float32)
-    row = d_idx[:, None]
-    col = d_idx[None, :]
-    mat_mask = (row < head_size) & (col < head_size)
-    H_tile = tl.load(
-        hadamard_ptr + row * head_size + col, mask=mat_mask, other=0.0
-    ).to(tl.float32)
-
-    # --- K: norm + rotation ---
-    k_norm = tl.sqrt(tl.maximum(tl.sum(k_vec * k_vec), 1e-12))
-    tl.store(cache_k_norm_ptr + meta_off, k_norm)
-    k_normed = k_vec * (tl.sqrt(float(head_size)) / k_norm)
-    rotated = tl.sum(H_tile * (k_normed * signs)[None, :], axis=1)
-
-    # --- K: Lloyd-Max MSE quantization ---
-    idx = tl.zeros((BLOCK_D,), dtype=tl.int32)
-    for i in tl.static_range(K_CB - 1):
-        b = tl.load(boundaries_ptr + i).to(tl.float32)
-        idx += (rotated > b).to(tl.int32)
-    tl.store(cache_k_idx_ptr + cache_off, idx.to(tl.uint8), mask=mask_d)
-
-    # --- K: QJL residual (Algorithm 2 only) ---
-    if USE_QJL:
-        rk_dq = tl.load(codebook_ptr + idx).to(tl.float32)
-        r = tl.where(mask_d, rotated - rk_dq, 0.0)
-        r_norm = tl.sqrt(tl.maximum(tl.sum(r * r), 1e-12))
-        r_unit = r / r_norm
-        S_tile = tl.load(
-            qjl_matrix_ptr + row * head_size + col, mask=mat_mask, other=0.0
-        ).to(tl.float32)
-        qjl_raw = tl.sum(S_tile * r_unit[None, :], axis=1)
-        qjl_sign = tl.where(qjl_raw >= 0.0, 1.0, -1.0)
-        tl.store(cache_k_rnorm_ptr + meta_off, r_norm)
-        tl.store(
-            cache_k_qjl_sign_ptr + cache_off,
-            qjl_sign.to(tl.int8),
-            mask=mask_d,
-        )
+# Note: the previous Triton store kernel (_store_kernel) was removed.
+# Multi-token grids on B200 produced corrupted V (and apparently QJL)
+# writes -- mse and prod gave bit-identical |attn|.mean across layers,
+# which was a tell that the QJL residual writes were also garbage.
+# The Python store implementation below uses standard PyTorch ops on
+# the GPU (cuBLAS-backed matmul, fused element-wise, scatter via
+# advanced indexing); no custom Triton kernel for store at all.
+# Triton is still used for the attend kernel, which is the hot path
+# during decode and has not shown the same multi-program issue.
 
 
 # =========================================================================
@@ -275,59 +186,78 @@ def turboquant_store_kv(
     cache_k_qjl_sign: torch.Tensor | None = None,
     cache_k_rnorm: torch.Tensor | None = None,
 ) -> None:
-    """Quantize K (Lloyd-Max) into the paged cache.
+    """Quantize K (Lloyd-Max + Hadamard) into the paged cache.
 
-    V is stored separately in Python (caller's responsibility) -- a
-    multi-token Triton grid corrupted V even when V was the first store.
+    Pure PyTorch implementation. Runs on the same device as ``new_k``
+    via standard tensor ops (matmul -> cuBLAS, searchsorted, scatter).
+    V is stored separately in Python by the caller (do_kv_cache_update).
 
     ``cache_k_qjl_sign`` and ``cache_k_rnorm`` are required when
     ``state.algo == "prod"`` and must be ``None`` for ``"mse"``.
     """
-    num_tokens, num_heads_kv, head_size = new_k.shape
+    if new_k.shape[0] == 0:
+        return
+
+    T, H_kv, d = new_k.shape
     K_CB = int(state.codebook.shape[0])
-
-    boundaries = state.boundaries
-    if boundaries.dtype != torch.float32:
-        boundaries = boundaries.to(torch.float32)
-    codebook = state.codebook
-    if codebook.dtype != torch.float32:
-        codebook = codebook.to(torch.float32)
-
     use_qjl = state.algo == "prod"
     if use_qjl:
         assert cache_k_qjl_sign is not None and cache_k_rnorm is not None, (
             "prod requires cache_k_qjl_sign and cache_k_rnorm"
         )
-        qjl_matrix = state.S
-        qjl_sign_buf = cache_k_qjl_sign
-        rnorm_buf = cache_k_rnorm
-    else:
-        # Unused by kernel but must be valid pointers; reuse existing buffers.
-        qjl_matrix = state.H
-        qjl_sign_buf = cache_k_idx
-        rnorm_buf = cache_k_norm
 
-    grid = (num_tokens, num_heads_kv)
-    BLOCK_D = triton.next_power_of_2(head_size)
-    _store_kernel[grid](
-        new_k,
-        cache_k_idx,
-        cache_k_norm,
-        qjl_sign_buf,
-        rnorm_buf,
-        slot_mapping,
-        codebook,
-        boundaries,
-        state.H,
-        state.signs,
-        qjl_matrix,
-        num_heads_kv=num_heads_kv,
-        head_size=head_size,
-        block_size=block_size,
-        K_CB=K_CB,
-        BLOCK_D=BLOCK_D,
-        USE_QJL=use_qjl,
-    )
+    # All compute in fp32 on GPU for numerical safety.
+    k_f = new_k.float()
+    H_f = state.H.to(torch.float32)
+    signs_f = state.signs.to(torch.float32)
+    boundaries_f = state.boundaries.to(torch.float32)
+
+    # ||k|| per (token, head); clamp away the singular case.
+    k_norm = k_f.norm(dim=-1).clamp_min(1e-6)            # (T, H_kv)
+
+    # k_normed has ||.|| == sqrt(d) per (token, head).
+    inv_norm = (math.sqrt(float(d)) / k_norm).unsqueeze(-1)  # (T, H_kv, 1)
+    k_normed = k_f * inv_norm                             # (T, H_kv, d)
+
+    # rotated[..., i] = sum_j H[i, j] * (signs * k_normed)[..., j]
+    #                 = (H @ (signs * k_normed))[..., i]
+    # In row-vec form on the last dim: (k_normed * signs) @ H.T
+    rotated = (k_normed * signs_f) @ H_f.T                # (T, H_kv, d)
+
+    # Lloyd-Max bucket via binary search; matches Triton's
+    # idx = sum((rotated > b) for b in boundaries).
+    idx32 = torch.searchsorted(boundaries_f.contiguous(),
+                               rotated.contiguous())      # (T, H_kv, d) int64
+    idx_uint8 = idx32.clamp(0, K_CB - 1).to(torch.uint8)  # (T, H_kv, d)
+
+    if use_qjl:
+        codebook_f = state.codebook.to(torch.float32)
+        S_f = state.S.to(torch.float32)
+        rk = codebook_f[idx32.clamp(0, K_CB - 1)]         # (T, H_kv, d)
+        r = rotated - rk                                  # (T, H_kv, d)
+        r_norm = r.norm(dim=-1).clamp_min(1e-6)           # (T, H_kv)
+        r_unit = r / r_norm.unsqueeze(-1)                 # (T, H_kv, d)
+        # qjl_raw[..., i] = sum_j S[i, j] * r_unit[..., j]
+        qjl_raw = r_unit @ S_f.T                          # (T, H_kv, d)
+        qjl_sign = torch.where(
+            qjl_raw >= 0,
+            torch.ones((), dtype=torch.float32, device=qjl_raw.device),
+            -torch.ones((), dtype=torch.float32, device=qjl_raw.device),
+        ).to(torch.int8)                                  # (T, H_kv, d)
+
+    # Scatter into paged cache via slot_mapping. Skip padded (-1) tokens.
+    valid = slot_mapping >= 0
+    if not bool(valid.any()):
+        return
+    slots = slot_mapping[valid].to(torch.int64)
+    b_idx = slots // block_size
+    off = slots % block_size
+
+    cache_k_idx[b_idx, off] = idx_uint8[valid]
+    cache_k_norm[b_idx, off] = k_norm[valid]
+    if use_qjl:
+        cache_k_qjl_sign[b_idx, off] = qjl_sign[valid]
+        cache_k_rnorm[b_idx, off] = r_norm[valid]
 
 
 def turboquant_paged_attention(

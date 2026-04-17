@@ -1,18 +1,17 @@
 #!/usr/bin/env bash
 # One-shot diagnostic scratchpad. Overwritten every time.
 #
-# Current probe: V cache is now correct (V copied in Python, not Triton).
-# mse b=8 still gives gibberish ("AAAA..."), with |attn|.max < max|v|
-# (math is sound) but K quant noise still distorts attention sink and
-# topples the softmax ordering.
+# K store rewritten in pure PyTorch (no Triton kernel) -- multi-token
+# Triton writes were corrupting the cache. Triton attend kernel is
+# unchanged (single-program-per-query, never showed the bug).
 #
-# Try paper's Algorithm 2 (Q_prod = b-1 bit MSE + 1-bit QJL on the
-# residual). The QJL part gives an unbiased inner-product estimator
-# (Lemma 4) and should be more precise than raw MSE.
+# Run mse b=8 first (algorithm 1: Lloyd-Max only). If the text comes
+# out reasonable, prod (algorithm 2: + QJL residual) should give an
+# even more accurate output.
 #
-# Expectation: if prod text approaches "However, the field", TurboQuant
-# K-only quant works on Llama. If still gibberish, attention sink needs
-# explicit protection (a separate fix).
+# Expectation: text close to FLASH_ATTN's "However, the field".
+# If still gibberish: K Lloyd-Max accuracy on real Llama K is the
+# limit and we'd need attention-sink protection or stronger algo.
 
 set -u
 
@@ -22,13 +21,13 @@ GPU="${GPU:-3}"
 PROMPT="${PROMPT:-Machine learning has transformed many fields over the past decade with deep neural networks achieving remarkable performance on natural language understanding and speech synthesis.}"
 MAX_TOKENS="${MAX_TOKENS:-4}"
 
-echo "[temp] GPU=$GPU MAX_TOKENS=$MAX_TOKENS  algo=prod"
+echo "[temp] GPU=$GPU MAX_TOKENS=$MAX_TOKENS  algo=mse  store=python"
 echo ""
 
 echo "=========================================================="
-echo "Run prod b=8 baseline (Algorithm 2: 7-bit MSE + 1-bit QJL)"
+echo "Run mse b=8 baseline (Python K store + Triton attend)"
 echo "=========================================================="
-TURBOQUANT_ALGO=prod TURBOQUANT_BITS=8 \
+TURBOQUANT_ALGO=mse TURBOQUANT_BITS=8 \
     bash test/baseline.sh "$PROMPT" "$MAX_TOKENS" "$GPU" || true
 
 echo ""
@@ -37,18 +36,25 @@ echo "[verify L0..L4]  V should still match exactly (max_abs_diff=0)"
 echo "=========================================================="
 DBG="logs/baseline_latest/turboquant_debug_tq8.log"
 if [ -f "$DBG" ]; then
-    grep "^\[verify L[0-4]\]" "$DBG" | head -10
+    grep "^\[verify L[0-4]\]" "$DBG" | head -5
 else
     echo "(missing $DBG)"
 fi
 
 echo ""
 echo "=========================================================="
-echo "[out L0..L4 call=0]   |attn|.mean / |attn|.max"
-echo "Reference -- BYPASS L0 c0 = 0.0040 / 0.248"
-echo "             BYPASS L1 c0 = 0.0066 / 0.309"
-echo "             FLASH_ATTN text = ', However, the field'"
+echo "[verifyK L0..L4]  stored k_norm should equal input ||k||"
 echo "=========================================================="
 if [ -f "$DBG" ]; then
-    grep "^\[out   L[0-4]\] call=0" "$DBG" | head -10
+    grep "^\[verifyK L[0-4]\]" "$DBG" | head -5
+fi
+
+echo ""
+echo "=========================================================="
+echo "[out L0..L4 call=0]   |attn|.mean / |attn|.max"
+echo "Reference -- BYPASS L0 c0 = 0.0040 / 0.248"
+echo "             FLASH_ATTN text = ' However, the field'"
+echo "=========================================================="
+if [ -f "$DBG" ]; then
+    grep "^\[out   L[0-4]\] call=0" "$DBG" | head -5
 fi
