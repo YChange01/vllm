@@ -2,9 +2,16 @@
 """Numerical equivalence smoke test: turboquant_paged_attention vs _lut.
 
 Drives both kernels on the same quantized KV cache and the same query,
-compares outputs element-wise. They should be *bitwise close* (same fp32
-arithmetic, same accumulation order). Use to validate that the LUT
-kernel didn't drift before benchmarking throughput.
+compares outputs element-wise. Expected:
+
+  * ``max_abs_diff`` <= 1e-3 (fp32 accumulation order differs between
+    base and LUT-flash-decoding variants; online softmax is
+    mathematically associative but fp rounding differs when the KV
+    dimension is split across programs).
+  * ``mean_rel_diff`` <= 1%.
+
+If diffs blow up beyond these, the LUT kernel drifted -- fix before
+benchmarking throughput.
 
 Usage::
     python3 test/test_lut_vs_base.py
