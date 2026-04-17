@@ -106,10 +106,22 @@ def _store_kernel(
         + head
     )
 
-    # Load K, V and rotation primitives.
+    # --- V FIRST ---
+    # Store V immediately after load. Empirically, leaving the V store
+    # at the end of the kernel (after the 255-iteration K Lloyd-Max
+    # boundary loop and the H_tile (BLOCK_D x BLOCK_D) reduction) caused
+    # cache_v_fp to be partially overwritten with K-derived values --
+    # max stored V matched per-layer |k|max instead of input |v|max,
+    # producing |attn|.max > max|v| at decode (mathematically impossible
+    # for correct softmax-weighted sum). Suspected register-pressure /
+    # spill issue in Triton -- moving the store before any K work
+    # eliminates the window in which v_vec can be clobbered.
     kv_off = (tok * num_heads_kv + head) * head_size + d_idx
-    k_vec = tl.load(new_k_ptr + kv_off, mask=mask_d, other=0.0).to(tl.float32)
     v_vec = tl.load(new_v_ptr + kv_off, mask=mask_d, other=0.0).to(tl.float32)
+    tl.store(cache_v_fp_ptr + cache_off, v_vec.to(V_DTYPE), mask=mask_d)
+
+    # --- K: load + rotation primitives ---
+    k_vec = tl.load(new_k_ptr + kv_off, mask=mask_d, other=0.0).to(tl.float32)
 
     signs = tl.load(signs_ptr + d_idx, mask=mask_d, other=1.0).to(tl.float32)
     row = d_idx[:, None]
@@ -149,9 +161,6 @@ def _store_kernel(
             qjl_sign.to(tl.int8),
             mask=mask_d,
         )
-
-    # --- V: stored raw in input dtype (no quantization) ---
-    tl.store(cache_v_fp_ptr + cache_off, v_vec.to(V_DTYPE), mask=mask_d)
 
 
 # =========================================================================
