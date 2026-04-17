@@ -445,3 +445,112 @@ def turboquant_paged_attention(
         USE_QJL=use_qjl,
     )
     return out
+
+
+# =========================================================================
+# Pure PyTorch reference for `turboquant_paged_attention`.
+# Same algorithm as the Triton kernel, but in fp32 with no flash trick.
+# Used to localize bugs: if this gives correct output but the Triton
+# kernel does not, the bug is in the kernel (memory layout, accumulation,
+# static_range gating). If both give the same wrong output, the bug is
+# in the algorithm (reconstruction math, inv_d, rotations).
+#
+# Eats the SAME cache buffers populated by `turboquant_store_kv`.
+# Algorithm 2 (USE_QJL=True) is supported via the same Sq/qjl_sign/r_norm
+# fields. Slow (Python loops); intended for diagnostic A/B only.
+# =========================================================================
+def python_paged_attention(
+    q: torch.Tensor,
+    cache_k_idx: torch.Tensor,
+    cache_k_norm: torch.Tensor,
+    cache_v_fp: torch.Tensor,
+    block_table: torch.Tensor,
+    seq_lens: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    state: "QuantState",
+    cache_k_qjl_sign: torch.Tensor | None = None,
+    cache_k_rnorm: torch.Tensor | None = None,
+) -> torch.Tensor:
+    T_q, H_q, d = q.shape
+    num_blocks, block_size, H_kv, _ = cache_k_idx.shape
+    num_seqs = int(seq_lens.shape[0])
+    gqa = H_q // H_kv
+    use_qjl = state.algo == "prod"
+    dev = q.device
+
+    # Per-query metadata (mirrors the wrapper above).
+    qsl = query_start_loc.to(device=dev, dtype=torch.int64)
+    query_lens = qsl[1:] - qsl[:-1]
+    seq_ids = torch.arange(num_seqs, dtype=torch.int64, device=dev)
+    seq_id_per_q = torch.repeat_interleave(seq_ids, query_lens)
+    q_pos = (
+        torch.arange(T_q, dtype=torch.int64, device=dev)
+        - qsl[:-1][seq_id_per_q]
+    )
+    prefix_len = seq_lens.to(device=dev, dtype=torch.int64) - query_lens
+    kv_end_per_q = prefix_len[seq_id_per_q] + q_pos + 1
+
+    # Pre-rotate Q (and Sq for prod) -- same as Triton wrapper.
+    H_f = state.H.to(torch.float32)
+    signs_f = state.signs.to(torch.float32)
+    q_f = q.float()
+    q_rot = (q_f * signs_f) @ H_f.T              # (T_q, H_q, d)
+    if use_qjl:
+        S_f = state.S.to(torch.float32)
+        sq_full = q_rot @ S_f.T                  # (T_q, H_q, d)
+    codebook = state.codebook.to(torch.float32)  # (K_CB,)
+
+    inv_d = 1.0 / float(d)
+    qjl_coef = math.sqrt(math.pi / 2.0) / float(d)
+
+    out = torch.empty_like(q)
+    for qi in range(T_q):
+        seq = int(seq_id_per_q[qi].item())
+        end = int(kv_end_per_q[qi].item())
+        # Gather (end, H_kv, d) reconstructed K and raw V for the prefix.
+        rk_seq = []
+        knorm_seq = []
+        v_seq = []
+        if use_qjl:
+            qjl_sign_seq = []
+            rnorm_seq = []
+        for pos in range(end):
+            blk_local = pos // block_size
+            tok = pos % block_size
+            phys = int(block_table[seq, blk_local].item())
+            k_idx = cache_k_idx[phys, tok].long()  # (H_kv, d)
+            rk = codebook[k_idx]                   # (H_kv, d) fp32
+            rk_seq.append(rk)
+            knorm_seq.append(cache_k_norm[phys, tok].float())   # (H_kv,)
+            v_seq.append(cache_v_fp[phys, tok].float())         # (H_kv, d)
+            if use_qjl:
+                qjl_sign_seq.append(
+                    cache_k_qjl_sign[phys, tok].float()         # (H_kv, d)
+                )
+                rnorm_seq.append(
+                    cache_k_rnorm[phys, tok].float()            # (H_kv,)
+                )
+        rk_t = torch.stack(rk_seq, dim=0)        # (end, H_kv, d)
+        knorm_t = torch.stack(knorm_seq, dim=0)  # (end, H_kv)
+        v_t = torch.stack(v_seq, dim=0)          # (end, H_kv, d)
+        if use_qjl:
+            qjl_sign_t = torch.stack(qjl_sign_seq, dim=0)   # (end, H_kv, d)
+            rnorm_t = torch.stack(rnorm_seq, dim=0)         # (end, H_kv)
+
+        for h in range(H_q):
+            kh = h // gqa
+            qh = q_rot[qi, h]                             # (d,)
+            main_dot = (qh.unsqueeze(0) * rk_t[:, kh]).sum(dim=-1)  # (end,)
+            if use_qjl:
+                sqh = sq_full[qi, h]                      # (d,)
+                qjl_dot = (sqh.unsqueeze(0) * qjl_sign_t[:, kh]).sum(dim=-1)
+                logits = (
+                    main_dot + qjl_coef * rnorm_t[:, kh] * qjl_dot
+                ) * knorm_t[:, kh] * inv_d
+            else:
+                logits = main_dot * knorm_t[:, kh] * inv_d  # (end,)
+            weights = torch.softmax(logits, dim=-1)         # (end,)
+            out[qi, h] = (
+                weights.unsqueeze(-1) * v_t[:, kh]          # (end, d)
+            ).sum(dim=0).to(q.dtype)
+    return out

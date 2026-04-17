@@ -29,6 +29,7 @@ from vllm.config.cache import CacheDType
 from vllm.logger import init_logger
 from vllm.turboquant.codebook import QuantState
 from vllm.turboquant.triton_kernels import (
+    python_paged_attention,
     turboquant_paged_attention,
     turboquant_store_kv,
 )
@@ -58,6 +59,11 @@ TURBOQUANT_BITS = int(os.environ.get("TURBOQUANT_BITS", "8"))
 # broken with BYPASS=1, the bug is NOT in the quant kernel but in how the
 # backend plugs into vLLM (output tensor, slot semantics, etc).
 TURBOQUANT_BYPASS = os.environ.get("TURBOQUANT_BYPASS", "0") == "1"
+# Diagnostic: bypass the Triton attend kernel and use a pure PyTorch fp32
+# reference that consumes the SAME quantized cache. Localizes whether a
+# wrong output comes from the Triton kernel implementation (PYREF correct,
+# kernel wrong) or from the algorithm itself (both wrong identically).
+TURBOQUANT_PYREF = os.environ.get("TURBOQUANT_PYREF", "0") == "1"
 # ALWAYS-ON diagnostic: log the FIRST do_kv_cache_update and FIRST forward()
 # payload for every distinct layer, the first time each is seen. No env
 # gate -- vllm serve spawns subprocesses and env vars don't propagate
@@ -114,7 +120,8 @@ def _dbg(msg: str) -> None:
 # Module-load marker so we can confirm the module was imported and by which pid.
 _dbg_write(
     f"# module load pid={os.getpid()} algo={TURBOQUANT_ALGO} "
-    f"bits={TURBOQUANT_BITS} bypass={TURBOQUANT_BYPASS}"
+    f"bits={TURBOQUANT_BITS} bypass={TURBOQUANT_BYPASS} "
+    f"pyref={TURBOQUANT_PYREF}"
 )
 
 if TURBOQUANT_ALGO not in ("mse", "prod"):
@@ -484,7 +491,11 @@ class TurboQuantAttentionImpl(AttentionImpl):
             )
         else:
             state = self._ensure_state(query.dtype, query.device)
-            attn_out = turboquant_paged_attention(
+            attend_fn = (
+                python_paged_attention if TURBOQUANT_PYREF
+                else turboquant_paged_attention
+            )
+            attn_out = attend_fn(
                 q=q,
                 cache_k_idx=self._k_idx,
                 cache_k_norm=self._k_norm,
