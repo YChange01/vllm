@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Verify K + V quantization (mse and prod) all still produce correct
-# greedy text after V was switched from raw to Q_mse quantization.
+# Quick greedy-text sanity for the turboquant-lut branch:
+# run baseline.sh twice, once with algo=mse and once with algo=prod.
+# Each invocation compares FLASH_ATTN vs base-kernel b=4 vs LUT-kernel b=4.
 
 set -u
 cd "$(dirname "$0")/.."
@@ -10,14 +11,14 @@ PROMPT="${PROMPT:-Machine learning has transformed many fields over the past dec
 MAX_TOKENS="${MAX_TOKENS:-4}"
 
 echo "=========================================================="
-echo "1) mse  K+V  b=8 vs b=4"
+echo "1) mse b=4:  FLASH_ATTN  vs  base kernel  vs  LUT kernel"
 echo "=========================================================="
-TURBOQUANT_ALGO=mse TURBOQUANT_BITS=8 \
+TURBOQUANT_ALGO=mse \
     bash test/baseline.sh "$PROMPT" "$MAX_TOKENS" "$GPU" || true
 
 echo ""
 echo "=========================================================="
-echo "2) prod K, mse V  b=8 vs b=4"
+echo "2) prod b=4:  FLASH_ATTN  vs  base kernel  vs  LUT kernel"
 echo "=========================================================="
-TURBOQUANT_ALGO=prod TURBOQUANT_BITS=8 \
+TURBOQUANT_ALGO=prod \
     bash test/baseline.sh "$PROMPT" "$MAX_TOKENS" "$GPU" || true

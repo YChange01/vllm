@@ -86,32 +86,31 @@ def report(num_blocks, block_size, num_kv_heads, head_size, num_layers):
     coords_per_layer = num_blocks * block_size * num_kv_heads * head_size
 
     for algo in ("mse", "prod"):
-        for bits in (4, 8):
-            sizes = static_layer_bytes(
-                num_blocks, block_size, num_kv_heads, head_size, algo, bits)
-            layer_total = sum(sizes.values())
-            full_total = layer_total * num_layers
-            b_per_coord = layer_total / (2 * coords_per_layer)
-            ratio = bf16_total / full_total
-            print(f"{algo:<6} {bits:>5} {fmt_bytes(layer_total):>14} "
-                  f"{fmt_bytes(full_total):>14} "
-                  f"{fmt_bytes(bf16_total):>16} "
-                  f"{b_per_coord:>9.3f}  {ratio:>7.2f}x")
+        bits = 4
+        sizes = static_layer_bytes(
+            num_blocks, block_size, num_kv_heads, head_size, algo, bits)
+        layer_total = sum(sizes.values())
+        full_total = layer_total * num_layers
+        b_per_coord = layer_total / (2 * coords_per_layer)
+        ratio = bf16_total / full_total
+        print(f"{algo:<6} {bits:>5} {fmt_bytes(layer_total):>14} "
+              f"{fmt_bytes(full_total):>14} "
+              f"{fmt_bytes(bf16_total):>16} "
+              f"{b_per_coord:>9.3f}  {ratio:>7.2f}x")
 
     print()
     print("Per-buffer breakdown:")
     for algo in ("mse", "prod"):
-        for bits in (4, 8):
-            print(f"  algo={algo}  bits={bits}:")
-            for name, b in static_layer_bytes(
-                    num_blocks, block_size, num_kv_heads, head_size,
-                    algo, bits).items():
-                print(f"    {name:<20} {fmt_bytes(b)}")
+        bits = 4
+        print(f"  algo={algo}  bits={bits}:")
+        for name, b in static_layer_bytes(
+                num_blocks, block_size, num_kv_heads, head_size,
+                algo, bits).items():
+            print(f"    {name:<20} {fmt_bytes(b)}")
     print()
     print("NOTES:")
     print("  - bits=4 packs two 4-bit indices per byte (head_size//2 "
           "storage).")
-    print("  - bits=8 stores one index per byte (full head_size).")
     print("  - QJL sign for prod is bit-packed (8 signs per byte).")
     print("  - vLLM still allocates its own bf16 kv_cache that we ignore;"
           " that's separate wasted memory.")
@@ -130,7 +129,7 @@ def runtime_check(gpu: int):
     print("Runtime allocation check on CUDA device:")
     for algo in ("mse", "prod"):
         os.environ["TURBOQUANT_ALGO"] = algo
-        os.environ["TURBOQUANT_BITS"] = "8"
+        os.environ["TURBOQUANT_BITS"] = "4"
 
         # Force re-import so the module-level ALGO constant is re-read.
         for m in list(sys.modules):

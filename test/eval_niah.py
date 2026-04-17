@@ -16,7 +16,7 @@ Usage:
         --ctx-lens 512,2048,4096 \
         --positions 0.1,0.5,0.9 \
         --trials 3 \
-        --tag TQ_b8
+        --tag TQ_b4
 """
 
 from __future__ import annotations

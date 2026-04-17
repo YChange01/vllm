@@ -7,8 +7,7 @@ the UNQUANTIZED vectors. Reports separate numbers for Algorithm 1 (Q_mse)
 and Algorithm 2 (Q_prod).
 
 Usage::
-    python3 test/test_varlen_kernel.py                 # default bits=8
-    python3 test/test_varlen_kernel.py --bits 4        # lower bit budget
+    python3 test/test_varlen_kernel.py                 # default bits=4
     python3 test/test_varlen_kernel.py --num-tokens 61 # single size
 """
 
@@ -168,7 +167,7 @@ def run_one_case(num_tokens: int, bits: int = 8, num_heads_q: int = 16,
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--num-tokens", type=int, default=None)
-    ap.add_argument("--bits", type=int, default=8)
+    ap.add_argument("--bits", type=int, default=4)
     ap.add_argument("--num-heads-q", type=int, default=16)
     ap.add_argument("--num-heads-kv", type=int, default=8)
     ap.add_argument("--head-size", type=int, default=128)

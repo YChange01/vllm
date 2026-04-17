@@ -1,8 +1,7 @@
 #!/usr/bin/env bash
-# NIAH (Needle-in-a-Haystack) eval across three backends:
+# NIAH (Needle-in-a-Haystack) eval across two backends:
 #   - FLASH_ATTN       (fp reference)
-#   - TURBOQUANT b=8
-#   - TURBOQUANT b=4
+#   - TURBOQUANT b=4   (LUT branch is b=4 only)
 #
 # Same prompt set, temperature=0, so any accuracy drop is attributable to the
 # quantization path. Each server is started via setsid in its own process
@@ -137,12 +136,11 @@ echo "[eval] model=$MODEL gpu=$GPU"
 echo "[eval] ctx=$CTX positions=$POSITIONS trials=$TRIALS max_tokens=$MAX_TOKENS seed=$SEED"
 
 run_stage "FLASH_ATTN"     "$FP_PORT" "$LOG_DIR/fp_server.log"   "$LOG_DIR/fp_eval.log"   FLASH_ATTN  ""
-run_stage "TURBOQUANT_b8"  "$TQ_PORT" "$LOG_DIR/tq8_server.log"  "$LOG_DIR/tq8_eval.log"  TURBOQUANT  "TURBOQUANT_BITS=8"
 run_stage "TURBOQUANT_b4"  "$TQ_PORT" "$LOG_DIR/tq4_server.log"  "$LOG_DIR/tq4_eval.log"  TURBOQUANT  "TURBOQUANT_BITS=4"
 
 echo ""
 echo "=========================== AGGREGATE ============================"
-for tag in FLASH_ATTN TURBOQUANT_b8 TURBOQUANT_b4; do
+for tag in FLASH_ATTN TURBOQUANT_b4; do
     f="$LOG_DIR/$(echo "$tag" | tr '[:upper:]' '[:lower:]' | sed 's/turboquant/tq/')_eval.log"
     if [ -f "$f" ]; then
         grep -E '=== NIAH grid|ctx|pos=|overall' "$f" | tail -n 20 || true
