@@ -411,6 +411,51 @@ class TurboQuantAttentionImpl(AttentionImpl):
             cache_k_rnorm=self._k_rnorm,
         )
 
+        # POST-STORE VERIFICATION: read back V from cache_v_fp at the slots
+        # we just wrote and confirm it matches the input. If they differ,
+        # the Triton store kernel is corrupting V (which is the only way
+        # PYREF can produce |attn|.max > max|v|).
+        if _cnt < _DEBUG_MAX_PER_LAYER and num_tokens != 8192:
+            try:
+                valid = slot_mapping >= 0
+                slots = slot_mapping[valid].to(torch.int64)
+                if slots.numel() > 0:
+                    b_idx = slots // block_size
+                    off = slots % block_size
+                    stored_v = self._v_fp[b_idx, off]              # (n, H_kv, d)
+                    stored_v_f = stored_v.detach().float()
+                    in_v_f = v[valid].detach().float()
+                    diff = (stored_v_f - in_v_f).abs()
+                    _dbg(
+                        f"[verify L{self._layer_seed}] "
+                        f"kv_cache.dtype={kv_cache.dtype} "
+                        f"v_fp.dtype={self._v_fp.dtype} "
+                        f"k_idx.dtype={self._k_idx.dtype} "
+                        f"k_norm.dtype={self._k_norm.dtype} "
+                        f"input_v|.|max={float(in_v_f.abs().max()):.4f} "
+                        f"stored_v|.|max={float(stored_v_f.abs().max()):.4f} "
+                        f"max_abs_diff={float(diff.max()):.6f} "
+                        f"mean_abs_diff={float(diff.mean()):.6f} "
+                        f"first_input_slot_v[0,0,:4]={in_v_f.cpu()[0,0,:4].tolist()} "
+                        f"first_stored_slot_v[0,0,:4]={stored_v_f.cpu()[0,0,:4].tolist()}"
+                    )
+                    # Also check K cache: read back k_norm at first slot
+                    stored_k_idx = self._k_idx[b_idx[0], off[0]]
+                    stored_k_norm = self._k_norm[b_idx[0], off[0]]
+                    in_k_norm = in_v_f.new_tensor([
+                        float(k[valid][0, h].float().norm())
+                        for h in range(self.num_kv_heads)
+                    ])
+                    _dbg(
+                        f"[verifyK L{self._layer_seed}] "
+                        f"first_slot k_idx.dtype={stored_k_idx.dtype} "
+                        f"k_idx min={int(stored_k_idx.min())} max={int(stored_k_idx.max())} "
+                        f"stored k_norm={stored_k_norm.cpu().tolist()} "
+                        f"input ||k||={in_k_norm.cpu().tolist()}"
+                    )
+            except Exception as e:
+                _dbg(f"[verify L{self._layer_seed}] err: {e}")
+
     def forward(
         self,
         layer: AttentionLayer,
