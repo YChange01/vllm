@@ -52,6 +52,7 @@ from vllm.config import VllmConfig
 from vllm.config.cache import CacheDType
 from vllm.logger import init_logger
 from vllm.turboquant.attend import turboquant_paged_attention
+from vllm.turboquant.attend_lut import turboquant_paged_attention_lut
 from vllm.turboquant.codebook import QuantState
 from vllm.turboquant.store import turboquant_store_kv, turboquant_store_v
 from vllm.v1.attention.backend import (
@@ -74,6 +75,10 @@ logger = init_logger(__name__)
 
 TURBOQUANT_ALGO = os.environ.get("TURBOQUANT_ALGO", "prod").lower()
 TURBOQUANT_BITS = int(os.environ.get("TURBOQUANT_BITS", "8"))
+# Experimental LUT kernel (turboquant_paged_attention_lut) -- builds
+# per-(query, head) q_rot x codebook table in registers and gathers via
+# mask-sum. Toggle via TURBOQUANT_USE_LUT=1.
+TURBOQUANT_USE_LUT = os.environ.get("TURBOQUANT_USE_LUT", "0") == "1"
 
 if TURBOQUANT_ALGO not in ("mse", "prod"):
     raise ValueError(
@@ -81,7 +86,8 @@ if TURBOQUANT_ALGO not in ("mse", "prod"):
     )
 
 logger.info(
-    "TurboQuant backend: algo=%s bits=%d", TURBOQUANT_ALGO, TURBOQUANT_BITS,
+    "TurboQuant backend: algo=%s bits=%d use_lut=%s",
+    TURBOQUANT_ALGO, TURBOQUANT_BITS, TURBOQUANT_USE_LUT,
 )
 
 
@@ -363,7 +369,12 @@ class TurboQuantAttentionImpl(AttentionImpl):
         self._ensure_buffers(kv_cache)
         state = self._ensure_state(query.dtype, query.device)
 
-        attn_out = turboquant_paged_attention(
+        attend_fn = (
+            turboquant_paged_attention_lut
+            if TURBOQUANT_USE_LUT
+            else turboquant_paged_attention
+        )
+        attn_out = attend_fn(
             q=q,
             cache_k_idx=self._k_idx,
             cache_k_norm=self._k_norm,
