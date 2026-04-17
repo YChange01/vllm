@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
-# Baseline comparison: same prompt through three configurations.
+# Baseline comparison (turboquant-lut branch -- b=4 only).
 #
-#   1. FLASH_ATTN           (fp reference)
-#   2. TURBOQUANT  b=8      (8-bit Lloyd-Max, default)
-#   3. TURBOQUANT  b=4      (4-bit Lloyd-Max, TURBOQUANT_BITS=4)
+# Runs the same prompt through three configurations:
+#   1. FLASH_ATTN                   (fp reference)
+#   2. TURBOQUANT b=4   (base Triton attend kernel from attend.py)
+#   3. TURBOQUANT b=4 + LUT   (flash-decoding + LUT kernel from attend_lut.py,
+#                              TURBOQUANT_USE_LUT=1)
 #
 # Each server is started with setsid so it has its own process group; at
 # the end of that stage we kill the WHOLE group (signal -TERM to -PGID)
@@ -14,16 +16,19 @@
 #   - any prior zombies must be cleaned up already
 #
 # Usage:
-#   bash test/baseline.sh                         # defaults
-#   bash test/baseline.sh "Hello" 4 3             # prompt, max_tokens, gpu
+#   bash test/baseline.sh                              # defaults
+#   bash test/baseline.sh "Hello" 4 3                  # prompt, max_tokens, gpu
+#   GPU=2 bash test/baseline.sh                        # via env
+#   TURBOQUANT_ALGO=prod bash test/baseline.sh         # flip algo for TQ stages
 
 set -u
 
 MODEL="${MODEL:-/mnt/nvme3n1/g00872988/models/Llama-3.1-8B-Instruct}"
 PROMPT="${1:-Hello}"
 MAX_TOKENS="${2:-4}"
-GPU="${3:-3}"
+GPU="${GPU:-${3:-3}}"
 MAX_LEN="${MAX_LEN:-4096}"
+ALGO="${TURBOQUANT_ALGO:-mse}"
 
 FP_PORT=8010
 TQ_PORT=8009
@@ -34,13 +39,9 @@ LOG_DIR="$ROOT_DIR/logs/baseline_$TS"
 mkdir -p "$LOG_DIR"
 ln -sfn "$LOG_DIR" "$ROOT_DIR/logs/baseline_latest"
 FP_LOG="$LOG_DIR/fp_server.log"
-TQ8_LOG="$LOG_DIR/tq8_server.log"
-TQ4_LOG="$LOG_DIR/tq4_server.log"
-DBG8_LOG="$LOG_DIR/turboquant_debug_tq8.log"
-DBG4_LOG="$LOG_DIR/turboquant_debug_tq4.log"
+TQ_BASE_LOG="$LOG_DIR/tq_base_server.log"
+TQ_LUT_LOG="$LOG_DIR/tq_lut_server.log"
 
-# Track the running server's process-group id so cleanup can kill the
-# whole group on early exit / Ctrl-C. Empty string = nothing to kill.
 CURRENT_PGID=""
 
 cleanup() {
@@ -54,7 +55,6 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-# ---- wait for /health, using ps to probe liveness (no signals) ----------
 wait_healthy() {
     local port="$1" log="$2" pid="$3"
     for _ in $(seq 1 72); do   # up to 6 minutes
@@ -73,7 +73,6 @@ wait_healthy() {
     return 1
 }
 
-# ---- POST one completion ------------------------------------------------
 query_completion() {
     local port="$1"
     curl -s "http://localhost:${port}/v1/completions" \
@@ -86,10 +85,7 @@ parse_text() {
         || echo "<parse failed>"
 }
 
-# ---- run one backend end-to-end -----------------------------------------
-# Globals read:  MODEL MAX_LEN CURRENT_PGID
-# Globals written: CURRENT_PGID, <OUT_VAR>
-# $1 label, $2 port, $3 log, $4 backend, $5 extra env (e.g. TURBOQUANT_BITS=4), $6 out-var name
+# $1 label, $2 port, $3 log, $4 backend, $5 extra env, $6 out-var
 run_backend() {
     local label="$1" port="$2" log="$3" backend="$4" extra_env="$5" out_var="$6"
 
@@ -97,8 +93,6 @@ run_backend() {
     echo "[baseline] starting $label on port $port ..."
     : > "$log"
 
-    # setsid makes the subprocess a new session leader (PID == PGID), so
-    # killing -PGID later reliably takes out the EngineCore children too.
     if [ -n "$extra_env" ]; then
         env $extra_env setsid vllm serve "$MODEL" \
             --port "$port" \
@@ -119,7 +113,6 @@ run_backend() {
     CURRENT_PGID=$!
 
     if ! wait_healthy "$port" "$log" "$CURRENT_PGID"; then
-        # trap cleanup will kill the group on exit
         exit 1
     fi
 
@@ -130,34 +123,36 @@ run_backend() {
     echo "[baseline] $label text: $text"
     printf -v "$out_var" '%s' "$text"
 
-    # Stop this server's entire process group so the next stage starts clean.
     echo "[baseline] stopping $label process group $CURRENT_PGID"
     kill -TERM -"$CURRENT_PGID" 2>/dev/null || true
     wait "$CURRENT_PGID" 2>/dev/null || true
     CURRENT_PGID=""
-    # Give the driver a moment to free KV cache / allocator state.
     sleep 3
 }
 
 # ---- main ---------------------------------------------------------------
 export CUDA_VISIBLE_DEVICES="$GPU"
 echo "[baseline] model=$MODEL prompt='$PROMPT' max_tokens=$MAX_TOKENS gpu=$GPU"
+echo "[baseline] algo=$ALGO (bits=4, LUT branch)"
 echo "[baseline] logs dir: $LOG_DIR  (symlink: $ROOT_DIR/logs/baseline_latest)"
 
 FP_TEXT=""
-TQ8_TEXT=""
-TQ4_TEXT=""
+TQ_BASE_TEXT=""
+TQ_LUT_TEXT=""
 
-run_backend "FLASH_ATTN"        "$FP_PORT" "$FP_LOG"  FLASH_ATTN  ""                                                        FP_TEXT
-run_backend "TURBOQUANT b=8"    "$TQ_PORT" "$TQ8_LOG" TURBOQUANT  "TURBOQUANT_BITS=8 TURBOQUANT_DEBUG_LOG=$DBG8_LOG"         TQ8_TEXT
-run_backend "TURBOQUANT b=4"    "$TQ_PORT" "$TQ4_LOG" TURBOQUANT  "TURBOQUANT_BITS=4 TURBOQUANT_DEBUG_LOG=$DBG4_LOG"         TQ4_TEXT
+run_backend "FLASH_ATTN" "$FP_PORT" "$FP_LOG" FLASH_ATTN "" FP_TEXT
+run_backend "TURBOQUANT b=4 (base)" "$TQ_PORT" "$TQ_BASE_LOG" TURBOQUANT \
+    "TURBOQUANT_ALGO=$ALGO TURBOQUANT_BITS=4" TQ_BASE_TEXT
+run_backend "TURBOQUANT b=4 (LUT)" "$TQ_PORT" "$TQ_LUT_LOG" TURBOQUANT \
+    "TURBOQUANT_ALGO=$ALGO TURBOQUANT_BITS=4 TURBOQUANT_USE_LUT=1" TQ_LUT_TEXT
 
 echo ""
 echo "========================== SIDE-BY-SIDE =========================="
-echo "prompt:          ${PROMPT}"
-echo "max_tokens:      ${MAX_TOKENS}  (temperature=0, greedy decoding)"
-echo "FLASH_ATTN:      ${FP_TEXT}"
-echo "TURBOQUANT b=8:  ${TQ8_TEXT}"
-echo "TURBOQUANT b=4:  ${TQ4_TEXT}"
+echo "prompt:                    ${PROMPT}"
+echo "max_tokens:                ${MAX_TOKENS}  (temperature=0, greedy)"
+echo "algo:                      ${ALGO}"
+echo "FLASH_ATTN:                ${FP_TEXT}"
+echo "TURBOQUANT b=4 (base):     ${TQ_BASE_TEXT}"
+echo "TURBOQUANT b=4 (LUT):      ${TQ_LUT_TEXT}"
 echo "=================================================================="
 echo "[baseline] done; all three servers have been stopped."
