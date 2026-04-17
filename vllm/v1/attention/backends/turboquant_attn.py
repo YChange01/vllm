@@ -333,6 +333,39 @@ class TurboQuantAttentionImpl(AttentionImpl):
                 shape_meta, dtype=torch.float32, device=device
             )
 
+        # ONE-TIME ptr / overlap dump per layer. Catches the case where
+        # PyTorch caching allocator returns aliased / overlapping memory
+        # for our independent torch.zeros() calls (which would explain
+        # cache_v_fp containing K-derived values).
+        if self._layer_seed < 2:
+            def _bp(name, t):
+                if t is None:
+                    return None
+                p = t.data_ptr()
+                nb = t.numel() * t.element_size()
+                return (name, p, nb, p + nb)
+            entries = [
+                _bp("k_idx",   self._k_idx),
+                _bp("k_norm",  self._k_norm),
+                _bp("v_fp",    self._v_fp),
+                _bp("k_qjl_sign", self._k_qjl_sign),
+                _bp("k_rnorm", self._k_rnorm),
+            ]
+            entries = [e for e in entries if e is not None]
+            for n, p, nb, pe in entries:
+                _dbg(
+                    f"[ptr L{self._layer_seed}] {n} ptr=0x{p:x} "
+                    f"nbytes={nb} end=0x{pe:x}"
+                )
+            # pairwise overlap check
+            import itertools
+            for (a, b) in itertools.combinations(entries, 2):
+                an, ap, anb, ape = a
+                bn, bp, bnb, bpe = b
+                overlap = max(ap, bp) < min(ape, bpe)
+                if overlap:
+                    _dbg(f"[ptr L{self._layer_seed}] OVERLAP {an} vs {bn} !!!")
+
     # -------------------------------------------------------------------
     # vLLM hooks
     # -------------------------------------------------------------------

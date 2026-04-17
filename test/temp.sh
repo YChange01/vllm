@@ -1,55 +1,77 @@
 #!/usr/bin/env bash
 # One-shot diagnostic scratchpad. Overwritten every time.
 #
-# Current probe: PYREF |attn|.max=5.25 > max|v|=0.482 is mathematically
-# only possible if cache_v_fp contains values larger than the input V
-# bound. Triton store kernel must be writing wrong values to cache_v_fp
-# (BYPASS works because it skips Triton store and uses direct python copy).
-#
-# Added [verify L*] post-store debug log that compares stored cache_v_fp
-# against input V at the just-written slots, plus dtype info for
-# kv_cache, _v_fp, _k_idx, _k_norm. This run launches mse b=8 (TRITON
-# attend, NOT pyref -- we don't need pyref because the corruption is
-# in the store path) and shows the first verify entries.
+# Two checks while user runs the v_vec-store-first fix:
+#   (A) Standalone PyTorch test: do the three torch.zeros() calls in
+#       _ensure_buffers actually return non-overlapping CUDA memory?
+#       If they overlap, the K-write to cache_k_idx would corrupt
+#       cache_v_fp regardless of any kernel reordering.
+#   (B) Once `bash test/temp.sh` is re-run after the fix, [verify L*]
+#       lines below will show stored_v|.|max ≈ input_v|.|max if the
+#       fix worked. Also pulls [ptr L*] lines from the new debug.
 
 set -u
 
 cd "$(dirname "$0")/.."
 
 GPU="${GPU:-3}"
-PROMPT="${PROMPT:-Machine learning has transformed many fields over the past decade with deep neural networks achieving remarkable performance on natural language understanding and speech synthesis.}"
-MAX_TOKENS="${MAX_TOKENS:-4}"
 
-echo "[temp] GPU=$GPU MAX_TOKENS=$MAX_TOKENS"
+echo "=========================================================="
+echo "(A) Standalone test: torch.zeros buffers don't alias"
+echo "=========================================================="
+CUDA_VISIBLE_DEVICES="$GPU" python3 - <<'PYEOF'
+import torch, itertools
+
+device = "cuda"
+num_blocks = 18645
+block_size = 16
+num_kv_heads = 8
+head_size = 128
+shape_dim = (num_blocks, block_size, num_kv_heads, head_size)
+shape_meta = (num_blocks, block_size, num_kv_heads)
+
+# Mimic _ensure_buffers allocation order.
+v_fp   = torch.zeros(shape_dim,  dtype=torch.bfloat16, device=device)
+k_idx  = torch.zeros(shape_dim,  dtype=torch.uint8,    device=device)
+k_norm = torch.zeros(shape_meta, dtype=torch.float32,  device=device)
+
+bufs = {"v_fp": v_fp, "k_idx": k_idx, "k_norm": k_norm}
+for n, t in bufs.items():
+    p = t.data_ptr()
+    nb = t.numel() * t.element_size()
+    print(f"  {n:<8} ptr=0x{p:x}  nbytes={nb:>13,}  end=0x{p+nb:x}")
+
+print()
+print("  pairwise overlap check (any True = aliased):")
+for (n1, t1), (n2, t2) in itertools.combinations(bufs.items(), 2):
+    p1, nb1 = t1.data_ptr(), t1.numel() * t1.element_size()
+    p2, nb2 = t2.data_ptr(), t2.numel() * t2.element_size()
+    overlap = max(p1, p2) < min(p1 + nb1, p2 + nb2)
+    print(f"    {n1} vs {n2}: overlap = {overlap}")
+
+# Sanity: also write to k_idx and read back v_fp -- if they alias,
+# v_fp would now contain non-zero data. Allocate fresh and test.
+v_fp.zero_()
+k_idx.zero_()
+k_idx.fill_(0xff)  # all 255s in k_idx
+print()
+print(f"  after k_idx.fill_(0xff): v_fp.abs().max() = {v_fp.abs().max().item()}")
+print(f"  (should be 0.0 if buffers are independent)")
+PYEOF
+
 echo ""
-
 echo "=========================================================="
-echo "Run mse b=8 (Triton, NOT pyref) just to populate cache and log [verify L*]"
-echo "=========================================================="
-TURBOQUANT_ALGO=mse TURBOQUANT_BITS=8 \
-    bash test/baseline.sh "$PROMPT" "$MAX_TOKENS" "$GPU" || true
-
-echo ""
-echo "=========================================================="
-echo "[verify L*] entries  (one per layer per call, up to 3 each)"
-echo "----------------------------------------------------------"
-echo "Look for max_abs_diff. If 0 -> store works, bug elsewhere."
-echo "If non-zero -> Triton store corrupting V."
-echo "Also check input_v|.|max vs stored_v|.|max."
+echo "(B) Latest [verify L*] from baseline_latest"
+echo "    (re-run baseline.sh after pulling the v_vec-first fix"
+echo "     to populate this; otherwise it's stale)"
 echo "=========================================================="
 DBG="logs/baseline_latest/turboquant_debug_tq8.log"
 if [ -f "$DBG" ]; then
-    grep "^\[verify L" "$DBG" | head -10
+    echo "----- [ptr L*] (allocation pointers) -----"
+    grep "^\[ptr L" "$DBG" | head -20
     echo ""
-    echo "----- [verifyK L*] (K cache sanity) -----"
-    grep "^\[verifyK L" "$DBG" | head -10
+    echo "----- [verify L0..L4] -----"
+    grep "^\[verify L[0-4]\]" "$DBG"
 else
-    echo "(missing $DBG)"
+    echo "(missing $DBG -- run baseline.sh first)"
 fi
-
-echo ""
-echo "=========================================================="
-echo "Reminder: full V layout for first written slot of L0"
-echo "=========================================================="
-echo "Look at the first L0 [verify] entry's stored_v[0,0,:4] vs"
-echo "first_input_slot_v[0,0,:4] -- they must match exactly."
