@@ -55,21 +55,34 @@ TURBOQUANT_CUDA_VERBOSE=1 \
 
 echo ""
 echo "=========================================================="
-echo "2) vLLM text-level agreement: FLASH vs Triton TC vs CUDA"
-echo "   mse path only (CUDA raises NotImplementedError on prod)"
+echo "2) vLLM text-level agreement: FLASH vs Triton TC vs CUDA (mse)"
 echo "=========================================================="
 GPU="$GPU" TURBOQUANT_USE_CUDA=1 \
     bash test/baseline.sh 2>&1 | tee "$LOG_DIR/baseline_cuda.log"
 
 echo ""
 echo "=========================================================="
-echo "3) Throughput A/B: FLASH, Triton TC (default), CUDA (WMMA)"
-echo "   FLASH_ATTN is the reference; TURBOQUANT_mse_b4 runs with the"
-echo "   default Triton TC kernel; TURBOQUANT_mse_b4_cuda uses CUDA."
+echo "3) Throughput A/B: FLASH, Triton TC (default), CUDA (WMMA+cp.async)"
 echo "=========================================================="
 GPU="$GPU" \
     STAGES="FLASH_ATTN TURBOQUANT_mse_b4 TURBOQUANT_mse_b4_cuda" \
     bash test/throughput.sh 2>&1 | tee "$LOG_DIR/throughput.log" || true
+
+echo ""
+echo "=========================================================="
+echo "4) Kernel-level profile (mse, CUDA path) -- directly drives"
+echo "   store + attend with synthetic tensors; 32 layers × BATCH=16."
+echo "=========================================================="
+GPU="$GPU" TURBOQUANT_USE_CUDA=1 TURBOQUANT_ALGO=mse \
+    python3 test/profile_attend.py 2>&1 | tee "$LOG_DIR/profile_mse.log"
+
+echo ""
+echo "=========================================================="
+echo "5) Kernel-level profile (prod, CUDA path) -- same harness,"
+echo "   prod path adds Sq matmul + QJL wmma + 1-bit decode."
+echo "=========================================================="
+GPU="$GPU" TURBOQUANT_USE_CUDA=1 TURBOQUANT_ALGO=prod \
+    python3 test/profile_attend.py 2>&1 | tee "$LOG_DIR/profile_prod.log"
 
 echo ""
 echo "[temp] done. Per-stage logs under $LOG_DIR/"
