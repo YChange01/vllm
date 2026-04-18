@@ -55,6 +55,18 @@ from vllm.turboquant.attend import turboquant_paged_attention
 from vllm.turboquant.attend_lut import turboquant_paged_attention_lut
 from vllm.turboquant.codebook import QuantState
 from vllm.turboquant.store import turboquant_store_kv, turboquant_store_v
+
+# CUDA extension is imported lazily -- JIT compile takes ~30 seconds on
+# first call, so we defer until TURBOQUANT_USE_CUDA=1 is actually chosen.
+_turboquant_paged_attention_cuda = None
+
+
+def _get_cuda_attend():
+    global _turboquant_paged_attention_cuda
+    if _turboquant_paged_attention_cuda is None:
+        from vllm.turboquant.attend_cuda import turboquant_paged_attention_cuda
+        _turboquant_paged_attention_cuda = turboquant_paged_attention_cuda
+    return _turboquant_paged_attention_cuda
 from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionCGSupport,
@@ -75,10 +87,12 @@ logger = init_logger(__name__)
 
 TURBOQUANT_ALGO = os.environ.get("TURBOQUANT_ALGO", "prod").lower()
 TURBOQUANT_BITS = int(os.environ.get("TURBOQUANT_BITS", "4"))
-# Experimental LUT kernel (turboquant_paged_attention_lut) -- builds
-# per-(query, head) q_rot x codebook table in registers and gathers via
-# mask-sum. Toggle via TURBOQUANT_USE_LUT=1. LUT kernel is b=4 only.
+# Experimental LUT (Triton + tensor core) attend kernel. Toggle with
+# TURBOQUANT_USE_LUT=1.
 TURBOQUANT_USE_LUT = os.environ.get("TURBOQUANT_USE_LUT", "0") == "1"
+# Experimental raw-CUDA attend kernel (scalar fp32 baseline for now;
+# wmma/wgmma to come). Takes precedence over TURBOQUANT_USE_LUT when set.
+TURBOQUANT_USE_CUDA = os.environ.get("TURBOQUANT_USE_CUDA", "0") == "1"
 
 if TURBOQUANT_ALGO not in ("mse", "prod"):
     raise ValueError(
@@ -95,8 +109,8 @@ if _K_CB > 16:
     )
 
 logger.info(
-    "TurboQuant backend: algo=%s bits=%d use_lut=%s",
-    TURBOQUANT_ALGO, TURBOQUANT_BITS, TURBOQUANT_USE_LUT,
+    "TurboQuant backend: algo=%s bits=%d use_lut=%s use_cuda=%s",
+    TURBOQUANT_ALGO, TURBOQUANT_BITS, TURBOQUANT_USE_LUT, TURBOQUANT_USE_CUDA,
 )
 
 
@@ -378,11 +392,12 @@ class TurboQuantAttentionImpl(AttentionImpl):
         self._ensure_buffers(kv_cache)
         state = self._ensure_state(query.dtype, query.device)
 
-        attend_fn = (
-            turboquant_paged_attention_lut
-            if TURBOQUANT_USE_LUT
-            else turboquant_paged_attention
-        )
+        if TURBOQUANT_USE_CUDA:
+            attend_fn = _get_cuda_attend()
+        elif TURBOQUANT_USE_LUT:
+            attend_fn = turboquant_paged_attention_lut
+        else:
+            attend_fn = turboquant_paged_attention
         attn_out = attend_fn(
             q=q,
             cache_k_idx=self._k_idx,
