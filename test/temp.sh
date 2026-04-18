@@ -32,13 +32,12 @@ GPU="$GPU" TURBOQUANT_USE_CUDA=1 \
 
 echo ""
 echo "=========================================================="
-echo "3) Throughput A/B: FLASH, Triton base, Triton LUT, CUDA"
-echo "   CUDA (Stage 1, scalar fp32) is expected ~same as Triton base."
-echo "   WMMA tensor cores land in Stage 1.5."
+echo "3) Throughput A/B: FLASH, Triton LUT, CUDA (WMMA)"
+echo "   FLASH_ATTN is the reference; LUT is the previous milestone"
+echo "   (ITL ~44 ms); CUDA WMMA is the new contender."
 echo "=========================================================="
-# Extend throughput.sh stage_args to include a CUDA variant.
 GPU="$GPU" \
-    STAGES="FLASH_ATTN TURBOQUANT_mse_b4 TURBOQUANT_mse_b4_lut TURBOQUANT_mse_b4_cuda" \
+    STAGES="FLASH_ATTN TURBOQUANT_mse_b4_lut TURBOQUANT_mse_b4_cuda" \
     bash test/throughput.sh 2>&1 | tee "$LOG_DIR/throughput.log" || true
 
 echo ""
