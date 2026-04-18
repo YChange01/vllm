@@ -159,13 +159,6 @@ void issue_prefetch(
 
 // ---------------------------------------------------------------------------
 // Main attend kernel (WMMA tensor cores for both QK and PV matmuls).
-//
-// Flash-decoding split-KV: grid.z enumerates KV splits of `split_len` tokens
-// each. Each block processes slots [split_idx*split_len, split_idx*split_len
-// + split_len) intersected with [0, kv_end). Output is a per-split partial
-// (acc, m, l) in fp32 workspace; a second reduce kernel merges them into
-// the final bf16 output. num_splits=1 degenerates to full-range computation
-// with a trivial reduce.
 // ---------------------------------------------------------------------------
 __launch_bounds__(THREADS, 2)
 __global__ void attend_mse_tc_kernel(
@@ -178,9 +171,7 @@ __global__ void attend_mse_tc_kernel(
     const int32_t* __restrict__ seq_id_per_query,
     const int32_t* __restrict__ kv_end_per_query,
     const bf16*    __restrict__ codebook,
-    float* __restrict__ O_partial,            // [T_q, num_heads_q, num_splits, HEAD_SIZE]
-    float* __restrict__ m_partial,            // [T_q, num_heads_q, num_splits]
-    float* __restrict__ l_partial,            // [T_q, num_heads_q, num_splits]
+    bf16* __restrict__ out,
     const float inv_d,
     const int block_size,
     const int num_heads_q,
@@ -188,40 +179,16 @@ __global__ void attend_mse_tc_kernel(
     const int gqa_group,
     const int idx_dim,
     const int bt_stride,
-    const int K_CB,
-    const int split_len,
-    const int num_splits
+    const int K_CB
 ) {
-    const int q_idx     = blockIdx.x;
-    const int kvh_idx   = blockIdx.y;
-    const int split_idx = blockIdx.z;
-    const int tid       = threadIdx.x;
-    const int warp_id   = tid / 32;
+    const int q_idx   = blockIdx.x;
+    const int kvh_idx = blockIdx.y;
+    const int tid     = threadIdx.x;
+    const int warp_id = tid / 32;
     const int q_head_start = kvh_idx * gqa_group;
 
     const int32_t seq_idx = seq_id_per_query[q_idx];
-    const int32_t kv_end_full = kv_end_per_query[q_idx];
-    const int kv_start = split_idx * split_len;
-    const int kv_end   = min(kv_start + split_len, (int)kv_end_full);
-
-    // Empty-split fast path: write sentinels so the reduce treats it as 0.
-    if (kv_start >= kv_end) {
-        for (int cell = tid; cell < gqa_group * HEAD_SIZE; cell += THREADS) {
-            const int m = cell / HEAD_SIZE;
-            const int d = cell % HEAD_SIZE;
-            const int q_head = q_head_start + m;
-            const int op_off =
-                ((q_idx * num_heads_q + q_head) * num_splits + split_idx) * HEAD_SIZE + d;
-            O_partial[op_off] = 0.f;
-        }
-        if (tid < gqa_group) {
-            const int q_head = q_head_start + tid;
-            const int p_off = (q_idx * num_heads_q + q_head) * num_splits + split_idx;
-            m_partial[p_off] = -INFINITY;
-            l_partial[p_off] = 0.f;
-        }
-        return;
-    }
+    const int32_t kv_end  = kv_end_per_query[q_idx];
 
     // --- Shared memory (16-byte aligned for WMMA / cp.async) ---
     __shared__ __align__(16) bf16  Q_sh    [BLOCK_M_PAD][HEAD_SIZE];       // (16, 128)
@@ -271,14 +238,13 @@ __global__ void attend_mse_tc_kernel(
     __syncthreads();
 
     // ========================= KV LOOP =========================
-    // Iterate tiles within [kv_start, kv_end) for this split only.
-    const int num_tiles = (kv_end - kv_start + BLOCK_N - 1) / BLOCK_N;
+    const int num_tiles = (kv_end + BLOCK_N - 1) / BLOCK_N;
 
     // --- Prefetch tile 0 into stage 0 ---
     if (num_tiles > 0) {
         compute_slot_meta(block_table, seq_idx, kvh_idx,
-                          /*kv_base=*/kv_start, kv_end, block_size,
-                          num_heads_kv, idx_dim, bt_stride,
+                          /*kv_base=*/0, kv_end, block_size, num_heads_kv,
+                          idx_dim, bt_stride,
                           slot_base_stg[0], meta_stg[0]);
         __syncthreads();
         issue_prefetch(cache_k_idx, cache_v_idx, cache_k_norm, cache_v_norm,
@@ -289,7 +255,7 @@ __global__ void attend_mse_tc_kernel(
     }
 
     for (int tile = 0; tile < num_tiles; ++tile) {
-        const int kv_base = kv_start + tile * BLOCK_N;
+        const int kv_base = tile * BLOCK_N;
         const int n_valid = min(BLOCK_N, kv_end - kv_base);
         const int s       = tile & 1;
 
@@ -298,9 +264,8 @@ __global__ void attend_mse_tc_kernel(
         if (has_next) {
             const int next_s  = (tile + 1) & 1;
             compute_slot_meta(block_table, seq_idx, kvh_idx,
-                              /*kv_base=*/kv_start + (tile + 1) * BLOCK_N,
-                              kv_end, block_size, num_heads_kv,
-                              idx_dim, bt_stride,
+                              /*kv_base=*/(tile + 1) * BLOCK_N, kv_end,
+                              block_size, num_heads_kv, idx_dim, bt_stride,
                               slot_base_stg[next_s], meta_stg[next_s]);
             __syncthreads();
             issue_prefetch(cache_k_idx, cache_v_idx,
@@ -427,89 +392,16 @@ __global__ void attend_mse_tc_kernel(
         __syncthreads();
     }
 
-    // ========================= WRITE PARTIAL (O, m, l) =========================
-    // Partials are merged across splits by attend_reduce_kernel. We write
-    // raw acc_sh (not divided by l), l_sh, m_sh. See reduce kernel for math.
+    // ========================= FINAL NORMALIZE + STORE =========================
     for (int cell = tid; cell < BLOCK_M_PAD * HEAD_SIZE; cell += THREADS) {
         const int m = cell / HEAD_SIZE;
         const int d = cell % HEAD_SIZE;
         if (m < gqa_group) {
-            const int q_head = q_head_start + m;
-            const int op_off =
-                ((q_idx * num_heads_q + q_head) * num_splits + split_idx) * HEAD_SIZE + d;
-            O_partial[op_off] = acc_sh[m][d];
+            const int q_head  = q_head_start + m;
+            const int out_off = (q_idx * num_heads_q + q_head) * HEAD_SIZE + d;
+            const float denom = fmaxf(l_sh[m], 1e-12f);
+            out[out_off] = __float2bfloat16(acc_sh[m][d] / denom);
         }
-    }
-    if (tid < gqa_group) {
-        const int q_head = q_head_start + tid;
-        const int p_off = (q_idx * num_heads_q + q_head) * num_splits + split_idx;
-        m_partial[p_off] = m_sh[tid];
-        l_partial[p_off] = l_sh[tid];
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Reduce kernel: merge per-split partials into final bf16 output.
-//
-// Standard flash-decoding log-sum-exp merge for one (q_token, q_head):
-//   m_max  = max_s m_s
-//   Z      = sum_s exp(m_s - m_max) * l_s
-//   out[d] = (sum_s exp(m_s - m_max) * O_partial_s[d]) / Z
-//
-// Grid: (T_q, num_heads_q). Block: HEAD_SIZE threads. One block per
-// output row. num_splits <= 64 in practice so the split sums fit in smem.
-// ---------------------------------------------------------------------------
-constexpr int MAX_SPLITS = 64;
-
-__global__ void attend_reduce_kernel(
-    const float* __restrict__ O_partial,  // [T_q, num_heads_q, num_splits, HEAD_SIZE]
-    const float* __restrict__ m_partial,  // [T_q, num_heads_q, num_splits]
-    const float* __restrict__ l_partial,  // [T_q, num_heads_q, num_splits]
-    bf16* __restrict__ out,               // [T_q, num_heads_q, HEAD_SIZE]
-    const int num_heads_q,
-    const int num_splits
-) {
-    const int q_idx  = blockIdx.x;
-    const int qh_idx = blockIdx.y;
-    const int tid    = threadIdx.x;
-
-    __shared__ float rescale_sh[MAX_SPLITS];   // exp(m_s - m_max)
-    __shared__ float Z_sh;
-
-    const int p_base = (q_idx * num_heads_q + qh_idx) * num_splits;
-
-    // Load m_s, find m_max (single thread; num_splits small).
-    if (tid == 0) {
-        float mx = -INFINITY;
-        #pragma unroll 8
-        for (int s = 0; s < num_splits; ++s) {
-            const float m_s = m_partial[p_base + s];
-            if (m_s > mx) mx = m_s;
-        }
-        float Z = 0.f;
-        #pragma unroll 8
-        for (int s = 0; s < num_splits; ++s) {
-            const float m_s = m_partial[p_base + s];
-            const float l_s = l_partial[p_base + s];
-            const float r   = (m_s > -1e30f) ? __expf(m_s - mx) : 0.f;
-            rescale_sh[s] = r;
-            Z += r * l_s;
-        }
-        Z_sh = fmaxf(Z, 1e-12f);
-    }
-    __syncthreads();
-
-    // Accumulate rescaled O_partial across splits.
-    const float Z = Z_sh;
-    for (int d = tid; d < HEAD_SIZE; d += blockDim.x) {
-        float acc = 0.f;
-        #pragma unroll 8
-        for (int s = 0; s < num_splits; ++s) {
-            const int op_off = (p_base + s) * HEAD_SIZE + d;
-            acc += rescale_sh[s] * O_partial[op_off];
-        }
-        const int out_off = (q_idx * num_heads_q + qh_idx) * HEAD_SIZE + d;
-        out[out_off] = __float2bfloat16(acc / Z);
     }
 }
 
@@ -528,9 +420,7 @@ void attend_mse_launch(
     at::Tensor codebook,
     at::Tensor out,
     int block_size,
-    int gqa_group,
-    int split_len,
-    int num_splits
+    int gqa_group
 ) {
     TORCH_CHECK(q_rot.is_cuda() && q_rot.scalar_type() == at::kBFloat16,
                 "q_rot must be bf16 CUDA");
@@ -554,20 +444,10 @@ void attend_mse_launch(
     TORCH_CHECK(idx_dim == IDX_BYTES,
                 "idx_dim must equal HEAD_SIZE/2 (4-bit nibble packing); "
                 "cp.async prefetch is hard-wired to 16-byte transfers");
-    TORCH_CHECK(num_splits >= 1 && num_splits <= MAX_SPLITS,
-                "num_splits must be in [1, MAX_SPLITS=64]");
-    TORCH_CHECK(split_len > 0 && (split_len % BLOCK_N == 0),
-                "split_len must be a positive multiple of BLOCK_N=32");
 
     const float inv_d = 1.0f / static_cast<float>(head_size);
 
-    // Workspace for per-split partials.
-    auto opts_f = q_rot.options().dtype(at::kFloat);
-    auto O_partial = at::empty({T_q, num_heads_q, num_splits, HEAD_SIZE}, opts_f);
-    auto m_partial = at::empty({T_q, num_heads_q, num_splits}, opts_f);
-    auto l_partial = at::empty({T_q, num_heads_q, num_splits}, opts_f);
-
-    dim3 grid(T_q, num_heads_kv, num_splits);
+    dim3 grid(T_q, num_heads_kv);
     dim3 block(THREADS);
 
     attend_mse_tc_kernel<<<grid, block>>>(
@@ -580,9 +460,7 @@ void attend_mse_launch(
         seq_id_per_query.data_ptr<int32_t>(),
         kv_end_per_query.data_ptr<int32_t>(),
         reinterpret_cast<const bf16*>(codebook.data_ptr<at::BFloat16>()),
-        O_partial.data_ptr<float>(),
-        m_partial.data_ptr<float>(),
-        l_partial.data_ptr<float>(),
+        reinterpret_cast<bf16*>(out.data_ptr<at::BFloat16>()),
         inv_d,
         block_size,
         num_heads_q,
@@ -590,21 +468,7 @@ void attend_mse_launch(
         gqa_group,
         idx_dim,
         bt_stride,
-        K_CB,
-        split_len,
-        num_splits
-    );
-
-    // Reduce partials -> final bf16 output.
-    dim3 red_grid(T_q, num_heads_q);
-    dim3 red_block(HEAD_SIZE);  // one thread per output channel
-    attend_reduce_kernel<<<red_grid, red_block>>>(
-        O_partial.data_ptr<float>(),
-        m_partial.data_ptr<float>(),
-        l_partial.data_ptr<float>(),
-        reinterpret_cast<bf16*>(out.data_ptr<at::BFloat16>()),
-        num_heads_q,
-        num_splits
+        K_CB
     );
 }
 
