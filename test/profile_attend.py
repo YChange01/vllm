@@ -20,13 +20,13 @@ Usage
     # Switch algorithm
     GPU=2 TURBOQUANT_ALGO=prod TURBOQUANT_USE_LUT=1 python3 test/profile_attend.py
 
-    # Compare against FLASH_ATTN (no turboquant)
-    GPU=2 ATTN_BACKEND=FLASH_ATTN python3 test/profile_attend.py
+Only profiles the TURBOQUANT backend -- FLASH_ATTN reference is already
+in throughput.sh. Selecting a non-TURBOQUANT backend from the LLM()
+constructor across vLLM versions is unreliable.
 
 Required env:
     GPU                 : CUDA device id (default 0)
     MODEL               : model path
-    ATTN_BACKEND        : FLASH_ATTN | TURBOQUANT  (default TURBOQUANT)
     TURBOQUANT_ALGO     : mse | prod (default mse)
     TURBOQUANT_BITS     : 4 (only 4 supported on this branch)
     TURBOQUANT_USE_LUT  : 0 | 1 (default 0)
@@ -62,7 +62,6 @@ from vllm import LLM, SamplingParams
 MODEL = os.environ.get(
     "MODEL", "/mnt/nvme3n1/g00872988/models/Llama-3.1-8B-Instruct"
 )
-BACKEND = os.environ.get("ATTN_BACKEND", "TURBOQUANT").upper()
 PROMPT_TOKENS = int(os.environ.get("PROMPT_TOKENS", "1024"))
 OUTPUT_TOKENS = int(os.environ.get("OUTPUT_TOKENS", "64"))
 WARMUP_CALLS = int(os.environ.get("WARMUP_CALLS", "2"))
@@ -78,8 +77,6 @@ def _make_prompt(target_tokens: int) -> str:
 
 
 def _tag() -> str:
-    if BACKEND == "FLASH_ATTN":
-        return "flash_attn"
     algo = os.environ.get("TURBOQUANT_ALGO", "mse")
     kernel = "lut" if os.environ.get("TURBOQUANT_USE_LUT") == "1" else "base"
     return f"{algo}_b4_{kernel}"
@@ -120,7 +117,7 @@ def _categorize(name: str) -> str:
 
 def run():
     tag = _tag()
-    print(f"# tag={tag} backend={BACKEND} gpu={GPU}")
+    print(f"# tag={tag} backend=TURBOQUANT gpu={GPU}")
     print(f"# prompt_tokens≈{PROMPT_TOKENS} output_tokens={OUTPUT_TOKENS}")
 
     llm_kwargs = dict(
@@ -129,11 +126,11 @@ def run():
         gpu_memory_utilization=0.3,
         max_model_len=max(4096, PROMPT_TOKENS + OUTPUT_TOKENS + 128),
         tensor_parallel_size=1,
+        # Force TURBOQUANT backend -- the auto-selector does not include
+        # it in the default search pool, so we pass it explicitly. Same
+        # mechanism as ``vllm serve --attention-backend TURBOQUANT``.
+        attention_backend="TURBOQUANT",
     )
-    if BACKEND != "TURBOQUANT":
-        # vLLM selects backend via env var for FLASH_ATTN at import time.
-        # For a flat comparison, users should set ATTN_BACKEND and restart.
-        os.environ["VLLM_ATTENTION_BACKEND"] = BACKEND
 
     print("Loading model...")
     llm = LLM(**llm_kwargs)
