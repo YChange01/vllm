@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
-# Validate the Stage 1 CUDA attend kernel on turboquant-cuda branch.
-# First invocation triggers a JIT compile (~30-60s nvcc). Subsequent
-# runs hit the torch extension cache.
+# Validate the CUDA attend kernel on turboquant-cuda branch.
+# First invocation triggers a JIT compile (~30-60s nvcc). The torch
+# extension cache key is based on source checksum, but it has been
+# known to hold onto stale artifacts when e.g. a prior compile failed,
+# so we nuke the build dir up front. If that matters to you (you're
+# iterating on the same code without changes), comment the rm out.
 
 set -u
 cd "$(dirname "$0")/.."
@@ -11,6 +14,9 @@ TS="$(date +%Y%m%d_%H%M%S)"
 LOG_DIR="logs/cuda_$TS"
 mkdir -p "$LOG_DIR"
 ln -sfn "cuda_$TS" "logs/cuda_latest"
+
+# Clear any stale JIT build artifacts.
+rm -rf "${TURBOQUANT_CUDA_BUILD_DIR:-$HOME/.cache/torch_extensions/turboquant_cuda}"
 
 export CUDA_VISIBLE_DEVICES="$GPU"
 export PYTHONPATH="$PWD:${PYTHONPATH:-}"
