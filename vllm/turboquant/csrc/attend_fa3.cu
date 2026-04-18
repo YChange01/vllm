@@ -15,17 +15,18 @@
 
 #include <cutlass/cutlass.h>
 #include <cutlass/arch/arch.h>
+#include <cutlass/version.h>
 #include <cute/tensor.hpp>
 
 namespace turboquant {
 namespace fa3 {
 
-// Probe: returns the CUTLASS version as a uint64 so the Python side can
-// assert the extension actually compiled against CUTLASS.
+// Probe: returns the CUTLASS version so the Python side can assert the
+// extension actually compiled against CUTLASS.
 int64_t cutlass_version_probe() {
-  return static_cast<int64_t>(cutlass::getVersionMajor()) * 10000 +
-         static_cast<int64_t>(cutlass::getVersionMinor()) * 100 +
-         static_cast<int64_t>(cutlass::getVersionPatch());
+  return static_cast<int64_t>(CUTLASS_MAJOR) * 10000 +
+         static_cast<int64_t>(CUTLASS_MINOR) * 100 +
+         static_cast<int64_t>(CUTLASS_PATCH);
 }
 
 void attend_mse_fa3_launch(
