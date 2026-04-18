@@ -16,8 +16,9 @@ Usage:
 
 Selected by setting ``TURBOQUANT_USE_CUDA=1`` in the attention backend.
 
-Scope: mse path only. prod / QJL is a follow-up. Future work will
-replace WMMA with wgmma + TMA + warp specialization (true FA3 shape).
+Supports both mse (Algorithm 1) and prod (Algorithm 2 with QJL residual)
+paths; selected via `state.algo`. Future work will replace WMMA with
+wgmma + TMA + warp specialization (true FA3 shape).
 """
 
 from __future__ import annotations
@@ -149,12 +150,11 @@ def turboquant_paged_attention_cuda(
     cache_k_qjl_sign: torch.Tensor | None = None,
     cache_k_rnorm: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """CUDA-backed paged attention (WMMA tensor cores). mse only for now."""
+    """CUDA-backed paged attention (WMMA + cp.async). Supports mse and prod."""
     use_qjl = state.algo == "prod"
     if use_qjl:
-        raise NotImplementedError(
-            "turboquant_paged_attention_cuda only supports mse path for now "
-            "prod/QJL will come in a follow-up PR."
+        assert cache_k_qjl_sign is not None and cache_k_rnorm is not None, (
+            "prod path requires cache_k_qjl_sign and cache_k_rnorm"
         )
 
     num_query_tokens, num_heads_q, head_size = q.shape
@@ -177,22 +177,36 @@ def turboquant_paged_attention_cuda(
     seq_id_per_query = seq_id_per_query_i64.to(torch.int32).contiguous()
     kv_end_per_query = kv_end_per_query_i64.to(torch.int32).contiguous()
 
-    # Pre-rotate Q in Python (bf16 tensor core via cuBLAS). Same as the
-    # TC path -- fusing into the kernel is deferred.
+    # Pre-rotate Q in Python (bf16 tensor core via cuBLAS). H is symmetric
+    # so H.T == H. Fusing into the kernel is deferred (see
+    # `TURBOQUANT.md`'s weight-fold plan).
     q_signed = q * state.signs
     q_rotated = (
         q_signed.reshape(-1, head_size) @ state.H
     ).view(num_query_tokens, num_heads_q, head_size).contiguous()
 
+    if use_qjl:
+        # prod path: also need Sq = Q_rot @ S^T for the QJL correction
+        # Sq @ qjl_sign^T inside the kernel. Matches attend_tc.py.
+        Sq = (
+            q_rotated.reshape(-1, head_size) @ state.S.T
+        ).view(num_query_tokens, num_heads_q, head_size).contiguous()
+    else:
+        Sq = None
+
     out = torch.empty_like(q)
     gqa_group = num_heads_q // num_heads_kv
+    algo_id = 1 if use_qjl else 0
 
-    _ext().attend_mse(
+    _ext().attend(
         q_rotated,
+        Sq,
         cache_k_idx,
         cache_k_norm,
         cache_v_idx,
         cache_v_norm,
+        cache_k_qjl_sign if use_qjl else None,
+        cache_k_rnorm if use_qjl else None,
         block_table,
         seq_id_per_query,
         kv_end_per_query,
@@ -200,6 +214,7 @@ def turboquant_paged_attention_cuda(
         out,
         int(block_size),
         int(gqa_group),
+        int(algo_id),
     )
 
     # Post-rotate V back to original space.

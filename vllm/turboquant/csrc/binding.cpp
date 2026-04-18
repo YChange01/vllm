@@ -8,19 +8,23 @@
 namespace turboquant {
 namespace cuda {
 
-void attend_mse_launch(
+void attend_launch(
     at::Tensor q_rot,
+    c10::optional<at::Tensor> Sq_opt,
     at::Tensor cache_k_idx,
     at::Tensor cache_k_norm,
     at::Tensor cache_v_idx,
     at::Tensor cache_v_norm,
+    c10::optional<at::Tensor> cache_k_qjl_sign_opt,
+    c10::optional<at::Tensor> cache_k_rnorm_opt,
     at::Tensor block_table,
     at::Tensor seq_id_per_query,
     at::Tensor kv_end_per_query,
     at::Tensor codebook,
     at::Tensor out,
     int block_size,
-    int gqa_group
+    int gqa_group,
+    int algo
 );
 
 } // namespace cuda
@@ -49,21 +53,25 @@ void attend_mse_fa3_launch(
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def(
-        "attend_mse",
-        &turboquant::cuda::attend_mse_launch,
-        "TurboQuant mse attend kernel (CUDA, WMMA tensor cores)",
+        "attend",
+        &turboquant::cuda::attend_launch,
+        "TurboQuant attend kernel (CUDA, WMMA + cp.async; mse/prod via algo)",
         py::arg("q_rot"),
+        py::arg("Sq") = py::none(),
         py::arg("cache_k_idx"),
         py::arg("cache_k_norm"),
         py::arg("cache_v_idx"),
         py::arg("cache_v_norm"),
+        py::arg("cache_k_qjl_sign") = py::none(),
+        py::arg("cache_k_rnorm") = py::none(),
         py::arg("block_table"),
         py::arg("seq_id_per_query"),
         py::arg("kv_end_per_query"),
         py::arg("codebook"),
         py::arg("out"),
         py::arg("block_size"),
-        py::arg("gqa_group")
+        py::arg("gqa_group"),
+        py::arg("algo")
     );
     m.def(
         "cutlass_version_probe",

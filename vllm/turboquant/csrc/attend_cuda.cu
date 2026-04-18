@@ -20,7 +20,13 @@
 // Uses nvcuda::wmma (mma.m16n8k16) for matmuls, cp.async for overlapping
 // tile t+1's gmem load with tile t's compute. Requires sm_80+.
 //
-// Scope: mse path only. prod/QJL is a follow-up.
+// Supports both algorithms:
+//   mse  (Algorithm 1, TurboQuant paper): K_tile = codebook[idx] * k_norm.
+//   prod (Algorithm 2): K_tile_mse + qjl_coef * r_norm * (Sq @ qjl_sign^T)
+//                       where qjl_coef = sqrt(pi/2) / head_size and
+//                       qjl_sign is 1-bit-packed {+1,-1} per coord.
+// Selected at compile time via the USE_QJL template parameter; both
+// specializations are instantiated and dispatched by the launcher.
 
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
@@ -46,6 +52,7 @@ constexpr int WMMA_K    = 16;
 constexpr int K_CB_MAX  = 16;
 constexpr int THREADS   = 128;              // 4 warps
 constexpr int IDX_BYTES = HEAD_SIZE / 2;    // 4-bit packed -> 64 bytes/slot
+constexpr int QJL_BYTES = HEAD_SIZE / 8;    // 1-bit packed -> 16 bytes/slot (prod)
 constexpr int STAGES    = 2;                // cp.async double buffer
 
 // ---------------------------------------------------------------------------
@@ -116,22 +123,28 @@ void compute_slot_meta(
 
 // ---------------------------------------------------------------------------
 // Issue cp.async loads of raw K/V idx + norm for one tile into smem stage.
-// Caller must __pipeline_commit() after. 128 threads each issue one 16-byte
-// cp.async for K idx, one for V idx; 32 threads also issue one 4-byte cp.async
-// for K norm and one for V norm.
+// If USE_QJL, also prefetch K QJL-sign (16B per slot, one 16B cp.async per
+// slot -> 32 transfers distributed across threads) and K r_norm (one fp32).
+// Caller must __pipeline_commit() after.
 // ---------------------------------------------------------------------------
+template<bool USE_QJL>
 __device__ __forceinline__
 void issue_prefetch(
     const uint8_t* __restrict__ cache_k_idx_g,
     const uint8_t* __restrict__ cache_v_idx_g,
     const float*   __restrict__ cache_k_norm_g,
     const float*   __restrict__ cache_v_norm_g,
-    const int32_t* __restrict__ slot_base_stg_row,  // smem, BLOCK_N
-    const int32_t* __restrict__ meta_stg_row,       // smem, BLOCK_N
-    uint8_t* __restrict__ k_idx_stg_row,            // smem, BLOCK_N*IDX_BYTES
+    const uint8_t* __restrict__ cache_k_qjl_g,        // iff USE_QJL
+    const float*   __restrict__ cache_k_rnorm_g,      // iff USE_QJL
+    const int qjl_dim,                                // iff USE_QJL (bytes/slot)
+    const int32_t* __restrict__ slot_base_stg_row,
+    const int32_t* __restrict__ meta_stg_row,
+    uint8_t* __restrict__ k_idx_stg_row,
     uint8_t* __restrict__ v_idx_stg_row,
-    float*   __restrict__ k_norm_stg_row,           // smem, BLOCK_N
-    float*   __restrict__ v_norm_stg_row
+    float*   __restrict__ k_norm_stg_row,
+    float*   __restrict__ v_norm_stg_row,
+    uint8_t* __restrict__ k_qjl_stg_row,              // iff USE_QJL
+    float*   __restrict__ k_rnorm_stg_row             // iff USE_QJL
 ) {
     const int tid = threadIdx.x;
     // 32 slots × 64 bytes / 16-byte cp.async = 128 transfers, one per thread.
@@ -155,29 +168,77 @@ void issue_prefetch(
             &v_norm_stg_row[tid],
             &cache_v_norm_g[meta_stg_row[tid]], 4);
     }
+    if constexpr (USE_QJL) {
+        // QJL sign: 16 bytes per slot × 32 slots = 32 16-byte transfers.
+        // Threads 0..31 each issue one 16B cp.async (leaving 96 idle here).
+        if (tid < BLOCK_N) {
+            const int qjl_base = meta_stg_row[tid] * qjl_dim;
+            __pipeline_memcpy_async(
+                &k_qjl_stg_row[tid * QJL_BYTES],
+                &cache_k_qjl_g[qjl_base], 16);
+            __pipeline_memcpy_async(
+                &k_rnorm_stg_row[tid],
+                &cache_k_rnorm_g[meta_stg_row[tid]], 4);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Decode 1-bit packed QJL signs into a bf16 {+1,-1} tile (for WMMA Sq @ sign^T).
+// Bit=0 -> +1, bit=1 -> -1 (matches Triton _tc_attend_kernel).
+// ---------------------------------------------------------------------------
+__device__ __forceinline__
+void dequant_qjl_sign_tile(
+    const uint8_t* __restrict__ qjl_stg,    // smem: BLOCK_N * QJL_BYTES
+    bf16* __restrict__ tile_sh,             // smem: BLOCK_N * HEAD_SIZE
+    const int n_valid
+) {
+    const int tid = threadIdx.x;
+    #pragma unroll 8
+    for (int cell = tid; cell < BLOCK_N * HEAD_SIZE; cell += THREADS) {
+        const int n = cell / HEAD_SIZE;
+        const int d = cell % HEAD_SIZE;
+        if (n >= n_valid) {
+            tile_sh[n * HEAD_SIZE + d] = __float2bfloat16(0.f);
+            continue;
+        }
+        const int byte_pos = d >> 3;   // d / 8
+        const int bit_pos  = d & 7;    // d % 8
+        const uint8_t byte = qjl_stg[n * QJL_BYTES + byte_pos];
+        const int bit = (byte >> bit_pos) & 1;
+        tile_sh[n * HEAD_SIZE + d] = __float2bfloat16(bit ? -1.f : 1.f);
+    }
 }
 
 // ---------------------------------------------------------------------------
 // Main attend kernel (WMMA tensor cores for both QK and PV matmuls).
+// Templated on USE_QJL: prod path adds Sq, k_qjl_sign, k_rnorm and an extra
+// Sq @ qjl_sign^T tensor-core dot that gets folded into the logit.
 // ---------------------------------------------------------------------------
+template<bool USE_QJL>
 __launch_bounds__(THREADS, 2)
-__global__ void attend_mse_tc_kernel(
+__global__ void attend_tc_kernel(
     const bf16* __restrict__ q_rot,
+    const bf16* __restrict__ Sq,                        // iff USE_QJL
     const uint8_t* __restrict__ cache_k_idx,
     const float*   __restrict__ cache_k_norm,
     const uint8_t* __restrict__ cache_v_idx,
     const float*   __restrict__ cache_v_norm,
+    const uint8_t* __restrict__ cache_k_qjl_sign,       // iff USE_QJL
+    const float*   __restrict__ cache_k_rnorm,          // iff USE_QJL
     const int32_t* __restrict__ block_table,
     const int32_t* __restrict__ seq_id_per_query,
     const int32_t* __restrict__ kv_end_per_query,
     const bf16*    __restrict__ codebook,
     bf16* __restrict__ out,
     const float inv_d,
+    const float qjl_coef,                               // sqrt(pi/2)/d, iff USE_QJL
     const int block_size,
     const int num_heads_q,
     const int num_heads_kv,
     const int gqa_group,
     const int idx_dim,
+    const int qjl_dim,                                  // bytes/slot, iff USE_QJL
     const int bt_stride,
     const int K_CB
 ) {
@@ -211,10 +272,19 @@ __global__ void attend_mse_tc_kernel(
     __shared__ __align__(16) int32_t slot_base_stg[STAGES][BLOCK_N];           // 2×128B
     __shared__ __align__(16) int32_t meta_stg     [STAGES][BLOCK_N];
 
+    // Prod-only smem. Declared unconditionally (1-byte dummies when USE_QJL
+    // is false would complicate the code); nvcc drops them out of the mse
+    // specialization via dead-code elimination in the generated SASS.
+    // Total prod overhead: ~7.25 KB on top of mse's ~41 KB = ~48 KB total.
+    __shared__ __align__(16) bf16    Sq_sh     [BLOCK_M_PAD][HEAD_SIZE];       // 4 KB (prod)
+    __shared__ __align__(16) uint8_t K_qjl_stg [STAGES][BLOCK_N * QJL_BYTES];  // 1 KB (prod)
+    __shared__ __align__(16) float   K_rnorm_stg[STAGES][BLOCK_N];             // 256 B (prod)
+    __shared__ float qjl_scores_sh[BLOCK_M_PAD][BLOCK_N];                      // 2 KB (prod)
+
     // --- Load codebook (tiny) ---
     if (tid < K_CB) codebook_sh[tid] = __bfloat162float(codebook[tid]);
 
-    // --- Load Q (gqa_group rows into padded 16) ---
+    // --- Load Q (gqa_group rows into padded 16); Sq for prod ---
     for (int cell = tid; cell < BLOCK_M_PAD * HEAD_SIZE; cell += THREADS) {
         const int m = cell / HEAD_SIZE;
         const int d = cell % HEAD_SIZE;
@@ -222,8 +292,14 @@ __global__ void attend_mse_tc_kernel(
             const int q_head = q_head_start + m;
             const int q_off  = (q_idx * num_heads_q + q_head) * HEAD_SIZE + d;
             Q_sh[m][d] = q_rot[q_off];
+            if constexpr (USE_QJL) {
+                Sq_sh[m][d] = Sq[q_off];
+            }
         } else {
             Q_sh[m][d] = __float2bfloat16(0.f);
+            if constexpr (USE_QJL) {
+                Sq_sh[m][d] = __float2bfloat16(0.f);
+            }
         }
     }
 
@@ -247,10 +323,13 @@ __global__ void attend_mse_tc_kernel(
                           idx_dim, bt_stride,
                           slot_base_stg[0], meta_stg[0]);
         __syncthreads();
-        issue_prefetch(cache_k_idx, cache_v_idx, cache_k_norm, cache_v_norm,
-                       slot_base_stg[0], meta_stg[0],
-                       K_idx_stg[0], V_idx_stg[0],
-                       K_norm_stg[0], V_norm_stg[0]);
+        issue_prefetch<USE_QJL>(
+            cache_k_idx, cache_v_idx, cache_k_norm, cache_v_norm,
+            cache_k_qjl_sign, cache_k_rnorm, qjl_dim,
+            slot_base_stg[0], meta_stg[0],
+            K_idx_stg[0], V_idx_stg[0],
+            K_norm_stg[0], V_norm_stg[0],
+            K_qjl_stg[0], K_rnorm_stg[0]);
         __pipeline_commit();
     }
 
@@ -268,11 +347,14 @@ __global__ void attend_mse_tc_kernel(
                               block_size, num_heads_kv, idx_dim, bt_stride,
                               slot_base_stg[next_s], meta_stg[next_s]);
             __syncthreads();
-            issue_prefetch(cache_k_idx, cache_v_idx,
-                           cache_k_norm, cache_v_norm,
-                           slot_base_stg[next_s], meta_stg[next_s],
-                           K_idx_stg[next_s], V_idx_stg[next_s],
-                           K_norm_stg[next_s], V_norm_stg[next_s]);
+            issue_prefetch<USE_QJL>(
+                cache_k_idx, cache_v_idx,
+                cache_k_norm, cache_v_norm,
+                cache_k_qjl_sign, cache_k_rnorm, qjl_dim,
+                slot_base_stg[next_s], meta_stg[next_s],
+                K_idx_stg[next_s], V_idx_stg[next_s],
+                K_norm_stg[next_s], V_norm_stg[next_s],
+                K_qjl_stg[next_s], K_rnorm_stg[next_s]);
             __pipeline_commit();
         }
 
@@ -313,13 +395,45 @@ __global__ void attend_mse_tc_kernel(
         }
         __syncthreads();
 
-        // --- Mask invalid slots + scale by 1/d ---
+        // --- prod: Sq @ qjl_sign^T -> qjl_scores_sh (reuses K_sh) ---
+        if constexpr (USE_QJL) {
+            dequant_qjl_sign_tile(K_qjl_stg[s], &K_sh[0][0], n_valid);
+            __syncthreads();
+            if (warp_id < 2) {
+                fragment<matrix_a, WMMA_M, WMMA_N, WMMA_K, bf16, row_major> a_frag;
+                fragment<matrix_b, WMMA_M, WMMA_N, WMMA_K, bf16, col_major> b_frag;
+                fragment<accumulator, WMMA_M, WMMA_N, WMMA_K, float> c_frag;
+                fill_fragment(c_frag, 0.f);
+                const int n_start = warp_id * WMMA_N;
+                #pragma unroll
+                for (int k_off = 0; k_off < HEAD_SIZE; k_off += WMMA_K) {
+                    load_matrix_sync(a_frag, &Sq_sh[0][k_off], HEAD_SIZE);
+                    load_matrix_sync(b_frag, &K_sh[n_start][k_off], HEAD_SIZE);
+                    mma_sync(c_frag, a_frag, b_frag, c_frag);
+                }
+                store_matrix_sync(&qjl_scores_sh[0][n_start], c_frag,
+                                  BLOCK_N, mem_row_major);
+            }
+            __syncthreads();
+        }
+
+        // --- Mask invalid slots + scale by 1/d (+ prod: fold QJL correction) ---
         for (int cell = tid; cell < BLOCK_M_PAD * BLOCK_N; cell += THREADS) {
             const int m = cell / BLOCK_N;
             const int n = cell % BLOCK_N;
-            scores_sh[m][n] = (n < n_valid)
-                ? (scores_sh[m][n] * inv_d)
-                : -1e30f;
+            float logit;
+            if constexpr (USE_QJL) {
+                // logit = (qk + qjl_coef * r_norm * qjl_dot * k_norm) * inv_d
+                //   qk already absorbs k_norm via the scaled K dequant.
+                const float qk = scores_sh[m][n];
+                const float qjl_dot = qjl_scores_sh[m][n];
+                const float kn = K_norm_stg[s][n];
+                const float rn = K_rnorm_stg[s][n];
+                logit = (qk + qjl_coef * rn * qjl_dot * kn) * inv_d;
+            } else {
+                logit = scores_sh[m][n] * inv_d;
+            }
+            scores_sh[m][n] = (n < n_valid) ? logit : -1e30f;
         }
         __syncthreads();
 
@@ -408,25 +522,41 @@ __global__ void attend_mse_tc_kernel(
 // ---------------------------------------------------------------------------
 // C++ launch entry
 // ---------------------------------------------------------------------------
-void attend_mse_launch(
+void attend_launch(
     at::Tensor q_rot,
+    c10::optional<at::Tensor> Sq_opt,                 // prod only
     at::Tensor cache_k_idx,
     at::Tensor cache_k_norm,
     at::Tensor cache_v_idx,
     at::Tensor cache_v_norm,
+    c10::optional<at::Tensor> cache_k_qjl_sign_opt,   // prod only
+    c10::optional<at::Tensor> cache_k_rnorm_opt,      // prod only
     at::Tensor block_table,
     at::Tensor seq_id_per_query,
     at::Tensor kv_end_per_query,
     at::Tensor codebook,
     at::Tensor out,
     int block_size,
-    int gqa_group
+    int gqa_group,
+    int algo                                           // 0=mse, 1=prod
 ) {
     TORCH_CHECK(q_rot.is_cuda() && q_rot.scalar_type() == at::kBFloat16,
                 "q_rot must be bf16 CUDA");
     TORCH_CHECK(cache_k_idx.scalar_type() == at::kByte);
     TORCH_CHECK(cache_k_norm.scalar_type() == at::kFloat);
     TORCH_CHECK(codebook.scalar_type() == at::kBFloat16);
+    TORCH_CHECK(algo == 0 || algo == 1,
+                "algo must be 0 (mse) or 1 (prod)");
+
+    const bool use_qjl = (algo == 1);
+    if (use_qjl) {
+        TORCH_CHECK(Sq_opt.has_value() && cache_k_qjl_sign_opt.has_value()
+                    && cache_k_rnorm_opt.has_value(),
+                    "prod path requires Sq, cache_k_qjl_sign, cache_k_rnorm");
+        TORCH_CHECK(Sq_opt->scalar_type() == at::kBFloat16);
+        TORCH_CHECK(cache_k_qjl_sign_opt->scalar_type() == at::kByte);
+        TORCH_CHECK(cache_k_rnorm_opt->scalar_type() == at::kFloat);
+    }
 
     const int T_q          = q_rot.size(0);
     const int num_heads_q  = q_rot.size(1);
@@ -435,6 +565,7 @@ void attend_mse_launch(
     const int idx_dim      = cache_k_idx.size(3);
     const int bt_stride    = block_table.size(1);
     const int K_CB         = codebook.size(0);
+    const int qjl_dim      = use_qjl ? (int)cache_k_qjl_sign_opt->size(3) : 0;
 
     TORCH_CHECK(head_size == HEAD_SIZE,
                 "head_size must be 128 for this WMMA kernel");
@@ -444,32 +575,55 @@ void attend_mse_launch(
     TORCH_CHECK(idx_dim == IDX_BYTES,
                 "idx_dim must equal HEAD_SIZE/2 (4-bit nibble packing); "
                 "cp.async prefetch is hard-wired to 16-byte transfers");
+    if (use_qjl) {
+        TORCH_CHECK(qjl_dim == QJL_BYTES,
+                    "qjl_dim (last dim of cache_k_qjl_sign) must equal "
+                    "HEAD_SIZE/8 (1-bit packing)");
+    }
 
     const float inv_d = 1.0f / static_cast<float>(head_size);
+    // sqrt(pi/2) from QJL Definition 1 (paper arXiv:2504.19874).
+    constexpr float kSqrtPiOverTwo = 1.2533141373155002f;
+    const float qjl_coef = kSqrtPiOverTwo / static_cast<float>(head_size);
 
     dim3 grid(T_q, num_heads_kv);
     dim3 block(THREADS);
 
-    attend_mse_tc_kernel<<<grid, block>>>(
-        reinterpret_cast<const bf16*>(q_rot.data_ptr<at::BFloat16>()),
-        cache_k_idx.data_ptr<uint8_t>(),
-        cache_k_norm.data_ptr<float>(),
-        cache_v_idx.data_ptr<uint8_t>(),
-        cache_v_norm.data_ptr<float>(),
-        block_table.data_ptr<int32_t>(),
-        seq_id_per_query.data_ptr<int32_t>(),
-        kv_end_per_query.data_ptr<int32_t>(),
-        reinterpret_cast<const bf16*>(codebook.data_ptr<at::BFloat16>()),
-        reinterpret_cast<bf16*>(out.data_ptr<at::BFloat16>()),
-        inv_d,
-        block_size,
-        num_heads_q,
-        num_heads_kv,
-        gqa_group,
-        idx_dim,
-        bt_stride,
-        K_CB
-    );
+    auto q_rot_p = reinterpret_cast<const bf16*>(q_rot.data_ptr<at::BFloat16>());
+    auto out_p   = reinterpret_cast<bf16*>(out.data_ptr<at::BFloat16>());
+    auto cb_p    = reinterpret_cast<const bf16*>(codebook.data_ptr<at::BFloat16>());
+
+    if (use_qjl) {
+        auto Sq_p   = reinterpret_cast<const bf16*>(
+            Sq_opt->data_ptr<at::BFloat16>());
+        auto qjl_p  = cache_k_qjl_sign_opt->data_ptr<uint8_t>();
+        auto rn_p   = cache_k_rnorm_opt->data_ptr<float>();
+        attend_tc_kernel<true><<<grid, block>>>(
+            q_rot_p, Sq_p,
+            cache_k_idx.data_ptr<uint8_t>(), cache_k_norm.data_ptr<float>(),
+            cache_v_idx.data_ptr<uint8_t>(), cache_v_norm.data_ptr<float>(),
+            qjl_p, rn_p,
+            block_table.data_ptr<int32_t>(),
+            seq_id_per_query.data_ptr<int32_t>(),
+            kv_end_per_query.data_ptr<int32_t>(),
+            cb_p, out_p,
+            inv_d, qjl_coef,
+            block_size, num_heads_q, num_heads_kv, gqa_group,
+            idx_dim, qjl_dim, bt_stride, K_CB);
+    } else {
+        attend_tc_kernel<false><<<grid, block>>>(
+            q_rot_p, /*Sq=*/nullptr,
+            cache_k_idx.data_ptr<uint8_t>(), cache_k_norm.data_ptr<float>(),
+            cache_v_idx.data_ptr<uint8_t>(), cache_v_norm.data_ptr<float>(),
+            /*cache_k_qjl_sign=*/nullptr, /*cache_k_rnorm=*/nullptr,
+            block_table.data_ptr<int32_t>(),
+            seq_id_per_query.data_ptr<int32_t>(),
+            kv_end_per_query.data_ptr<int32_t>(),
+            cb_p, out_p,
+            inv_d, /*qjl_coef=*/0.f,
+            block_size, num_heads_q, num_heads_kv, gqa_group,
+            idx_dim, /*qjl_dim=*/0, bt_stride, K_CB);
+    }
 }
 
 } // namespace cuda
