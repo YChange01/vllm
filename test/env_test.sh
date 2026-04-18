@@ -41,8 +41,11 @@ print(f'matmul OK, y.sum() = {y.float().sum().item():.3f}')
 echo ""
 echo "=========================================================="
 echo "4) Tiny Triton kernel smoke (no turboquant, no vLLM)"
+echo "   @triton.jit needs a real source file -- use a temp .py"
 echo "=========================================================="
-python3 -c "
+TMP_SMOKE="$(mktemp --suffix=.py)"
+trap 'rm -f "$TMP_SMOKE"' EXIT
+cat > "$TMP_SMOKE" <<'PY'
 import torch, triton
 import triton.language as tl
 
@@ -60,7 +63,8 @@ y = torch.empty_like(x)
 _smoke[(N // 64,)](x, y, N, BLOCK=64)
 torch.cuda.synchronize()
 print(f'triton smoke OK, rel_err = {(y - 2*x).abs().max().item():.2e}')
-"
+PY
+python3 "$TMP_SMOKE"
 
 echo ""
 echo "[env_test] all stages above should print 'OK'. If anything failed,"
