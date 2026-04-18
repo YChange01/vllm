@@ -1,19 +1,26 @@
 # TurboQuant CUDA attend extension
 
 Raw-CUDA / C++ implementation of the turboquant attend kernel with inline
-dequant. Purpose: provide a starting point for **FA3-style** optimization
-(Hopper/Blackwell tensor cores, TMA, warp specialization) that the Triton
-path can't reach.
+dequant and WMMA tensor cores. Purpose: provide a starting point for
+**FA3-style** optimization (Hopper/Blackwell `wgmma`, TMA, warp
+specialization) that the Triton path can't fully reach.
 
-## Stages
+## What's here today
+
+* **Tensor-core matmul** via `nvcuda::wmma` (`mma.m16n8k16`) for both
+  `Q @ K^T` and `P @ V`. Ampere+.
+* **Inline dequant**: load 4-bit nibble-packed K/V idx, codebook
+  gather to bf16, scale by per-slot norm, feed WMMA fragment.
+* **mse path only** for now.
+
+## Roadmap
 
 | Stage | Contents | Status |
 |---|---|---|
-| **1** | Scalar fp32 matmul baseline. mse path only. Builds via JIT (`cpp_extension.load`). | **this PR** |
-| 1.5 | WMMA tensor cores (`mma.m16n8k16`) for Q·K^T and P·V. Ampere+. | next |
-| 2 | prod / QJL path (fused S·r_unit matvec, sign bit-pack load). | follow-up |
-| 3 | wgmma (Hopper+): larger matmul tiles, higher tensor-core throughput. | follow-up |
-| 4 | Warp specialization + TMA (true FA3 architecture: async pipeline). | follow-up |
+| **Today** | WMMA (mma.m16n8k16), mse only. JIT-compiled via `cpp_extension.load`. | shipped |
+| Next | **prod / QJL** path (S·r_unit matvec, 1-bit qjl_sign bit-pack load) | follow-up |
+| Next | **wgmma** on Hopper/Blackwell: larger `m64n256k16` tiles | follow-up |
+| Final | **Warp specialization + TMA**: producer/consumer async pipeline (true FA3 architecture) | follow-up |
 
 ## Files
 
@@ -25,57 +32,56 @@ csrc/
 ```
 
 Python side:
+
 ```
 vllm/turboquant/attend_cuda.py   - JIT loader + Python wrapper
 ```
 
 ## How it's wired
 
-Set `TURBOQUANT_USE_CUDA=1` at module import time. Backend's attend
-dispatch picks `turboquant_paged_attention_cuda` over the Triton TC /
-base paths. First use triggers a one-time JIT compile of the CUDA
-extension (~30s on B200 with nvcc, cached thereafter).
-
-The precedence is CUDA > TC > base, so CUDA overrides TC if both env
-vars are set.
+Set `TURBOQUANT_USE_CUDA=1`. The backend's attend dispatch replaces the
+default Triton TC kernel with `turboquant_paged_attention_cuda`. First
+use triggers a one-time JIT compile (~30-60s nvcc on B200, cached
+thereafter).
 
 ## Build (manual)
 
-The extension is JIT-compiled on first use. No manual build is needed
-for normal operation. If you want to pre-build or troubleshoot:
+The extension is JIT-compiled on first use. No manual build needed for
+normal operation. For troubleshooting:
 
 ```bash
-# Set build directory explicitly
+# Custom build cache
 export TURBOQUANT_CUDA_BUILD_DIR=/tmp/turboquant_cuda_build
 
 # Restrict to a single arch for faster nvcc
-export TURBOQUANT_CUDA_ARCH=90    # H100 only
+export TURBOQUANT_CUDA_ARCH=90           # e.g. H100 only
 
 # Verbose nvcc output
 export TURBOQUANT_CUDA_VERBOSE=1
 
-# Trigger compile
+# Trigger compile eagerly
 python3 -c "from vllm.turboquant.attend_cuda import _ext; _ext()"
 ```
 
 ## Correctness smoke test
 
 ```bash
-GPU=3 python3 test/test_cuda_vs_triton.py
+GPU=3 python3 test/test_cuda_vs_tc.py
 ```
 
-Compares this kernel's output vs the Triton `attend.py` base kernel on
-random Q/K/V. Expected: `max_abs_diff` around bf16 precision (~1.6e-2),
+Compares this kernel's output against the Triton TC kernel on random
+Q/K/V. Expected: `max_abs_diff` around bf16 precision (~1.6e-2),
 `mean_rel_diff` under 1%.
 
-## Known limitations (Stage 1)
+## Known limitations
 
-* **No tensor core yet.** The kernel uses scalar fp32 multiply-adds.
-  Expect it to be ~same speed as the Triton base kernel, slower than
-  the Triton TC kernel. This is a correctness baseline; Stage 1.5 adds
-  WMMA and should leapfrog both.
-* **mse only.** prod/QJL is a `NotImplementedError` in the Python wrapper.
+* **mse only.** prod path raises `NotImplementedError` in the Python
+  wrapper.
 * **head_size = 128 hardcoded.** Change `HEAD_SIZE` in `attend_cuda.cu`
   if you need a different head dim.
-* **Single warpgroup.** No producer/consumer warp specialization yet.
+* **BLOCK_N = 32** to stay under the default 48 KB static shared memory
+  limit. Reaching 64 requires switching to dynamic shared memory +
+  `cudaFuncSetAttribute(..., cudaFuncAttributeMaxDynamicSharedMemorySize)`.
+* **No warp specialization** (producer/consumer). Single warp group,
+  compute and memory serialized per tile.
 * **No TMA.** Uses plain shared-memory loads.

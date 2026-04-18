@@ -51,22 +51,9 @@ import torch
 from vllm.config import VllmConfig
 from vllm.config.cache import CacheDType
 from vllm.logger import init_logger
-from vllm.turboquant.attend import turboquant_paged_attention
 from vllm.turboquant.attend_tc import turboquant_paged_attention_tc
 from vllm.turboquant.codebook import QuantState
 from vllm.turboquant.store import turboquant_store_kv, turboquant_store_v
-
-# CUDA extension is imported lazily -- JIT compile takes ~30 seconds on
-# first call, so we defer until TURBOQUANT_USE_CUDA=1 is actually chosen.
-_turboquant_paged_attention_cuda = None
-
-
-def _get_cuda_attend():
-    global _turboquant_paged_attention_cuda
-    if _turboquant_paged_attention_cuda is None:
-        from vllm.turboquant.attend_cuda import turboquant_paged_attention_cuda
-        _turboquant_paged_attention_cuda = turboquant_paged_attention_cuda
-    return _turboquant_paged_attention_cuda
 from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionCGSupport,
@@ -87,11 +74,10 @@ logger = init_logger(__name__)
 
 TURBOQUANT_ALGO = os.environ.get("TURBOQUANT_ALGO", "prod").lower()
 TURBOQUANT_BITS = int(os.environ.get("TURBOQUANT_BITS", "4"))
-# Triton tensor-core attend kernel (tl.dot over BLOCK_N KV tiles, flash-
-# attention style). Toggle with TURBOQUANT_USE_TC=1.
-TURBOQUANT_USE_TC = os.environ.get("TURBOQUANT_USE_TC", "0") == "1"
-# Raw-CUDA attend kernel (WMMA tensor cores). Takes precedence over
-# TURBOQUANT_USE_TC when set.
+# Attend kernel selection:
+#   default              -> Triton tensor-core (attend_tc.py, tl.dot over
+#                           BLOCK_N KV tiles)
+#   TURBOQUANT_USE_CUDA=1 -> raw CUDA / WMMA kernel (attend_cuda.cu)
 TURBOQUANT_USE_CUDA = os.environ.get("TURBOQUANT_USE_CUDA", "0") == "1"
 
 if TURBOQUANT_ALGO not in ("mse", "prod"):
@@ -99,7 +85,7 @@ if TURBOQUANT_ALGO not in ("mse", "prod"):
         f"TURBOQUANT_ALGO must be 'mse' or 'prod', got {TURBOQUANT_ALGO!r}"
     )
 # b=4 only on this branch. mse b=4 -> K_CB=16; prod b=4 -> K_CB=8.
-# Both satisfy K_CB <= 16 (4-bit nibble pack + TC kernel).
+# Both satisfy K_CB <= 16 (4-bit nibble pack + tensor-core kernel).
 _K_CB = 1 << (TURBOQUANT_BITS - 1 if TURBOQUANT_ALGO == "prod" else TURBOQUANT_BITS)
 if _K_CB > 16:
     raise ValueError(
@@ -109,9 +95,22 @@ if _K_CB > 16:
     )
 
 logger.info(
-    "TurboQuant backend: algo=%s bits=%d use_tc=%s use_cuda=%s",
-    TURBOQUANT_ALGO, TURBOQUANT_BITS, TURBOQUANT_USE_TC, TURBOQUANT_USE_CUDA,
+    "TurboQuant backend: algo=%s bits=%d use_cuda=%s",
+    TURBOQUANT_ALGO, TURBOQUANT_BITS, TURBOQUANT_USE_CUDA,
 )
+
+
+# CUDA extension is imported lazily. JIT compile takes ~30-60 seconds on
+# first call; defer until TURBOQUANT_USE_CUDA=1 is actually chosen.
+_cuda_attend_fn = None
+
+
+def _get_cuda_attend():
+    global _cuda_attend_fn
+    if _cuda_attend_fn is None:
+        from vllm.turboquant.attend_cuda import turboquant_paged_attention_cuda
+        _cuda_attend_fn = turboquant_paged_attention_cuda
+    return _cuda_attend_fn
 
 
 @dataclass
@@ -392,12 +391,10 @@ class TurboQuantAttentionImpl(AttentionImpl):
         self._ensure_buffers(kv_cache)
         state = self._ensure_state(query.dtype, query.device)
 
-        if TURBOQUANT_USE_CUDA:
-            attend_fn = _get_cuda_attend()
-        elif TURBOQUANT_USE_TC:
-            attend_fn = turboquant_paged_attention_tc
-        else:
-            attend_fn = turboquant_paged_attention
+        attend_fn = (
+            _get_cuda_attend() if TURBOQUANT_USE_CUDA
+            else turboquant_paged_attention_tc
+        )
         attn_out = attend_fn(
             q=q,
             cache_k_idx=self._k_idx,

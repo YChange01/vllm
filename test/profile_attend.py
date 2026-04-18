@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
 """Profile turboquant store + attend directly (no vLLM).
 
-The vLLM LLM class runs its EngineCore in a subprocess, so a torch.profiler
-in the main process cannot see the decode-step GPU work. Instead we drive
-``turboquant_store_kv / _v`` and ``turboquant_paged_attention[_tc]`` in
-the same process with synthetic tensors, simulating a 32-layer decode.
-This isolates exactly the path we can optimize (store + attend + the
-Python rotation matmuls), gives clean CUDA timings, and keeps the
-profiler in-process.
+vLLM's LLM class runs its EngineCore in a subprocess, so a
+torch.profiler in the main process cannot see the decode-step GPU
+work. Instead we drive ``turboquant_store_kv / _v`` and the attend
+kernel in the same process with synthetic tensors, simulating a
+NUM_LAYERS-layer decode. This isolates the store + attend path (what
+we can optimize) and keeps the profiler in-process.
 
 The simulation:
   - NUM_LAYERS  decode-style forwards per decode step
@@ -16,9 +15,14 @@ The simulation:
 
 Usage
 -----
+    # Profile the Triton TC attend kernel (default):
     GPU=3 python3 test/profile_attend.py
-    GPU=3 TURBOQUANT_USE_TC=1 python3 test/profile_attend.py
-    GPU=3 TURBOQUANT_ALGO=prod TURBOQUANT_USE_TC=1 python3 test/profile_attend.py
+
+    # Profile the raw-CUDA / WMMA attend kernel:
+    GPU=3 TURBOQUANT_USE_CUDA=1 python3 test/profile_attend.py
+
+    # Switch algorithm:
+    GPU=3 TURBOQUANT_ALGO=prod python3 test/profile_attend.py
 
 Env overrides:
     PROMPT_LEN     : pre-fill KV length (default 1024)
@@ -42,16 +46,15 @@ from pathlib import Path
 _ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_ROOT))
 
-# Env defaults before importing the backend module (which reads env at load).
+# Env defaults before importing the backend module.
 os.environ.setdefault("TURBOQUANT_ALGO", "mse")
 os.environ.setdefault("TURBOQUANT_BITS", "4")
-os.environ.setdefault("TURBOQUANT_USE_TC", "0")
+os.environ.setdefault("TURBOQUANT_USE_CUDA", "0")
 os.environ["CUDA_VISIBLE_DEVICES"] = os.environ.get("GPU", "0")
 
 import torch
 from torch.profiler import profile, ProfilerActivity
 
-from vllm.turboquant.attend import turboquant_paged_attention
 from vllm.turboquant.attend_tc import turboquant_paged_attention_tc
 from vllm.turboquant.codebook import QuantState
 from vllm.turboquant.store import turboquant_store_kv, turboquant_store_v
@@ -59,7 +62,7 @@ from vllm.turboquant.store import turboquant_store_kv, turboquant_store_v
 
 ALGO = os.environ["TURBOQUANT_ALGO"]
 BITS = int(os.environ["TURBOQUANT_BITS"])
-USE_TC = os.environ["TURBOQUANT_USE_TC"] == "1"
+USE_CUDA = os.environ["TURBOQUANT_USE_CUDA"] == "1"
 
 PROMPT_LEN = int(os.environ.get("PROMPT_LEN", "1024"))
 DECODE_STEPS = int(os.environ.get("DECODE_STEPS", "16"))
@@ -73,7 +76,14 @@ WARMUP_STEPS = int(os.environ.get("WARMUP_STEPS", "4"))
 
 
 def _tag() -> str:
-    return f"{ALGO}_b{BITS}_{'tc' if USE_TC else 'base'}"
+    return f"{ALGO}_b{BITS}_{'cuda' if USE_CUDA else 'tc'}"
+
+
+def _load_attend_fn():
+    if USE_CUDA:
+        from vllm.turboquant.attend_cuda import turboquant_paged_attention_cuda
+        return turboquant_paged_attention_cuda
+    return turboquant_paged_attention_tc
 
 
 def _categorize(name: str) -> str:
@@ -149,8 +159,7 @@ def _one_decode_step(layers, caches, block_table, seq_lens,
     has no ``torch.randn`` overhead (randn per layer is harness noise --
     in real vLLM K/V come from linear projections of hidden_states).
     """
-    attend_fn = (turboquant_paged_attention_tc
-                 if USE_TC else turboquant_paged_attention)
+    attend_fn = _load_attend_fn()
     for layer_state, cache, k, v in zip(layers, caches,
                                          k_per_layer, v_per_layer):
         c_k_idx, c_k_norm, c_v_idx, c_v_norm, c_k_qjl, c_k_rnorm = cache
@@ -180,7 +189,7 @@ def _one_decode_step(layers, caches, block_table, seq_lens,
 
 def run():
     tag = _tag()
-    print(f"# tag={tag} algo={ALGO} bits={BITS} use_tc={USE_TC}")
+    print(f"# tag={tag} algo={ALGO} bits={BITS} use_cuda={USE_CUDA}")
     print(f"# batch={BATCH} prompt_len={PROMPT_LEN} decode_steps={DECODE_STEPS}")
     print(f"# num_layers={NUM_LAYERS} head_q={HEAD_Q} head_kv={HEAD_KV} "
           f"d={HEAD_SIZE} block={BLOCK_SIZE}")

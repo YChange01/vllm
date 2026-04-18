@@ -2,24 +2,22 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Raw-CUDA turboquant attend kernel with inline dequant.
 
-JIT-compiled at import time via ``torch.utils.cpp_extension.load``. First
-import takes ~30 seconds on B200 while nvcc runs; subsequent imports
-hit the torch extension cache.
+Uses ``nvcuda::wmma`` (mma.m16n8k16 family) tensor cores for both
+Q @ K.T and P @ V matmuls; Ampere (sm_80) and newer. Same signature
+as ``turboquant_paged_attention_tc`` so the two are drop-in swappable
+from the backend.
 
-This is Stage 1 of the CUDA-native attend kernel -- scalar fp32 matmul
-inside, so performance is NOT yet competitive with the Triton TC
-kernel. Subsequent stages will add WMMA / wgmma tensor-core matmuls,
-warp specialization, and TMA loads.
+JIT-compiled on first call via ``torch.utils.cpp_extension.load``
+(~30-60 s while nvcc runs; cached thereafter). Compilation is lazy so
+importing this module is cheap.
 
-Usage (same signature as the other turboquant_paged_attention_* wrappers):
-
+Usage:
     from vllm.turboquant.attend_cuda import turboquant_paged_attention_cuda
-    out = turboquant_paged_attention_cuda(
-        q, cache_k_idx, cache_k_norm, cache_v_idx, cache_v_norm,
-        block_table, seq_lens, query_start_loc, state,
-    )
 
-Switch on via ``TURBOQUANT_USE_CUDA=1`` in the backend.
+Selected by setting ``TURBOQUANT_USE_CUDA=1`` in the attention backend.
+
+Scope: mse path only. prod / QJL is a follow-up. Future work will
+replace WMMA with wgmma + TMA + warp specialization (true FA3 shape).
 """
 
 from __future__ import annotations
@@ -104,12 +102,12 @@ def turboquant_paged_attention_cuda(
     cache_k_qjl_sign: torch.Tensor | None = None,
     cache_k_rnorm: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """CUDA-backed paged attention. Stage 1: mse only, scalar fp32 matmul."""
+    """CUDA-backed paged attention (WMMA tensor cores). mse only for now."""
     use_qjl = state.algo == "prod"
     if use_qjl:
         raise NotImplementedError(
             "turboquant_paged_attention_cuda only supports mse path for now "
-            "(Stage 1). prod/QJL will come in a follow-up PR."
+            "prod/QJL will come in a follow-up PR."
         )
 
     num_query_tokens, num_heads_q, head_size = q.shape

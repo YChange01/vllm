@@ -2,9 +2,9 @@
 # Baseline comparison (turboquant-cuda branch -- b=4 only).
 #
 # Runs the same prompt through three configurations:
-#   1. FLASH_ATTN                   (fp reference)
-#   2. TURBOQUANT b=4 + TC   (Triton tensor-core attend, TURBOQUANT_USE_TC=1)
-#   3. TURBOQUANT b=4 + CUDA  (raw-CUDA WMMA attend, TURBOQUANT_USE_CUDA=1)
+#   1. FLASH_ATTN            (fp reference, vLLM's own FA backend)
+#   2. TURBOQUANT b=4 (TC)   (default turboquant: Triton tensor-core attend)
+#   3. TURBOQUANT b=4 (CUDA) (raw-CUDA WMMA attend, TURBOQUANT_USE_CUDA=1)
 #
 # Each server is started with setsid so it has its own process group; at
 # the end of that stage we kill the WHOLE group (signal -TERM to -PGID)
@@ -141,7 +141,7 @@ TQ_CUDA_TEXT=""
 
 run_backend "FLASH_ATTN" "$FP_PORT" "$FP_LOG" FLASH_ATTN "" FP_TEXT
 run_backend "TURBOQUANT b=4 (TC)" "$TQ_PORT" "$TQ_TC_LOG" TURBOQUANT \
-    "TURBOQUANT_ALGO=$ALGO TURBOQUANT_BITS=4 TURBOQUANT_USE_TC=1" TQ_TC_TEXT
+    "TURBOQUANT_ALGO=$ALGO TURBOQUANT_BITS=4" TQ_TC_TEXT
 run_backend "TURBOQUANT b=4 (CUDA)" "$TQ_PORT" "$TQ_CUDA_LOG" TURBOQUANT \
     "TURBOQUANT_ALGO=$ALGO TURBOQUANT_BITS=4 TURBOQUANT_USE_CUDA=1" TQ_CUDA_TEXT
 

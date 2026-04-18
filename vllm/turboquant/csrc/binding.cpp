@@ -30,7 +30,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def(
         "attend_mse",
         &turboquant::cuda::attend_mse_launch,
-        "TurboQuant mse attend kernel (CUDA, scalar fp32 matmul baseline)",
+        "TurboQuant mse attend kernel (CUDA, WMMA tensor cores)",
         py::arg("q_rot"),
         py::arg("cache_k_idx"),
         py::arg("cache_k_norm"),

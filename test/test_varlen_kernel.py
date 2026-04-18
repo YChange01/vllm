@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Standalone smoke test for TurboQuant kernels (no vLLM runtime).
 
-Drives ``turboquant_store_kv`` + ``turboquant_paged_attention`` on random
-Gaussian K, V, Q and compares against a pure-PyTorch softmax attention on
-the UNQUANTIZED vectors. Reports separate numbers for Algorithm 1 (Q_mse)
-and Algorithm 2 (Q_prod).
+Drives ``turboquant_store_kv`` + the Triton TC attend kernel on random
+Gaussian K, V, Q and compares against a pure-PyTorch softmax attention
+on the UNQUANTIZED vectors. Reports separate numbers for Algorithm 1
+(Q_mse) and Algorithm 2 (Q_prod).
 
 Usage::
     python3 test/test_varlen_kernel.py                 # default bits=4
@@ -21,7 +21,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import torch
 
-from vllm.turboquant.attend import turboquant_paged_attention
+from vllm.turboquant.attend_tc import turboquant_paged_attention_tc
 from vllm.turboquant.codebook import QuantState
 from vllm.turboquant.store import turboquant_store_kv, turboquant_store_v
 
@@ -95,7 +95,7 @@ def _run_algo(algo: str, num_tokens: int, bits: int, q, k, v, slot_mapping,
         state=state, block_size=block_size,
     )
     torch.cuda.synchronize()
-    out = turboquant_paged_attention(
+    out = turboquant_paged_attention_tc(
         q=q,
         cache_k_idx=c_k_idx, cache_k_norm=c_k_norm,
         cache_v_idx=c_v_idx, cache_v_norm=c_v_norm,
