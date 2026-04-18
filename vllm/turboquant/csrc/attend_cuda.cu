@@ -474,7 +474,6 @@ __global__ void attend_reduce_kernel(
     const int tid    = threadIdx.x;
 
     __shared__ float rescale_sh[MAX_SPLITS];   // exp(m_s - m_max)
-    __shared__ float m_max_sh;
     __shared__ float Z_sh;
 
     const int p_base = (q_idx * num_heads_q + qh_idx) * num_splits;
@@ -487,7 +486,6 @@ __global__ void attend_reduce_kernel(
             const float m_s = m_partial[p_base + s];
             if (m_s > mx) mx = m_s;
         }
-        m_max_sh = mx;
         float Z = 0.f;
         #pragma unroll 8
         for (int s = 0; s < num_splits; ++s) {
