@@ -80,20 +80,36 @@ def _categorize(name: str) -> str:
     n = name.lower()
     if "tc_attend" in n or "_attend_kernel" in n or "combine_kernel" in n:
         return "tq_attend"
-    if "scatter" in n or "index_put" in n:
-        return "tq_store_scatter"
-    if "searchsorted" in n:
-        return "tq_store_search"
-    if "gemm" in n or "cutlass" in n or "matmul" in n or "mm_" in n \
-            or "nt_kernel" in n or "sm90" in n or "sm80" in n or "bmm" in n:
-        return "matmul"  # hadamard / QJL rotation cuBLAS calls
+    if "_store_quant_kernel" in n or "_store_kernel" in n:
+        return "tq_store"
+    if "scatter" in n or "index_put" in n or "searchsorted" in n:
+        return "tq_store"
+    if "gemm" in n or "cutlass" in n or "nt_kernel" in n \
+            or "sm90" in n or "sm80" in n or "sm100" in n or "bmm" in n \
+            or "nvjet" in n or n == "aten::mm" or n == "aten::matmul":
+        return "matmul"  # hadamard / QJL rotation cuBLAS/cutlass calls
     if "copy" in n or "memset" in n or "to_copy" in n or "memcpy" in n \
             or "contiguous" in n:
         return "mem"
-    if "norm" in n or "reduce" in n:
+    if "local_scalar_dense" in n or "item" in n or "nonzero" in n \
+            or "cub::detail::select" in n:
+        return "sync"
+    if "sum" in n or "reduce" in n or n == "aten::norm":
         return "reduce"
-    if "elementwise" in n or "pointwise" in n or "mul_" in n or "add_" in n:
+    # Elementwise arithmetic ops -- catch aten-level names too.
+    if ("elementwise" in n or "pointwise" in n
+            or n in ("aten::mul", "aten::add", "aten::sub", "aten::div",
+                     "aten::pow", "aten::sqrt", "aten::clamp_min",
+                     "aten::clamp", "aten::where", "aten::any",
+                     "aten::ge", "aten::le", "aten::lt", "aten::gt",
+                     "aten::remainder", "aten::floor_divide",
+                     "aten::__lshift__", "aten::__rshift__",
+                     "aten::mul_", "aten::add_", "aten::normal_")):
         return "elemwise"
+    if n == "aten::index_select" or "index_elementwise" in n \
+            or "vectorized_gather" in n or "index_put_impl" in n \
+            or "index" in n:
+        return "index"
     return "other"
 
 
@@ -125,18 +141,19 @@ def _alloc_caches(num_blocks: int, device: torch.device, dtype: torch.dtype):
 
 
 def _one_decode_step(layers, caches, block_table, seq_lens,
-                     query_start_loc, slot_mapping, q_dec):
-    """One decode step: for each layer, store 1 new K/V token + attend."""
+                     query_start_loc, slot_mapping, q_dec,
+                     k_per_layer, v_per_layer):
+    """One decode step: for each layer, store 1 new K/V token + attend.
+
+    ``k_per_layer`` and ``v_per_layer`` are pre-generated so the hot loop
+    has no ``torch.randn`` overhead (randn per layer is harness noise --
+    in real vLLM K/V come from linear projections of hidden_states).
+    """
     attend_fn = (turboquant_paged_attention_lut
                  if USE_LUT else turboquant_paged_attention)
-    for layer_state, cache in zip(layers, caches):
+    for layer_state, cache, k, v in zip(layers, caches,
+                                         k_per_layer, v_per_layer):
         c_k_idx, c_k_norm, c_v_idx, c_v_norm, c_k_qjl, c_k_rnorm = cache
-
-        # Fake K/V for this decode step (BATCH tokens).
-        k = torch.randn(BATCH, HEAD_KV, HEAD_SIZE, dtype=q_dec.dtype,
-                        device=q_dec.device)
-        v = torch.randn(BATCH, HEAD_KV, HEAD_SIZE, dtype=q_dec.dtype,
-                        device=q_dec.device)
 
         turboquant_store_kv(
             new_k=k, cache_k_idx=c_k_idx, cache_k_norm=c_k_norm,
@@ -197,19 +214,27 @@ def run():
             block_table[b, i] = phys
             phys += 1
 
+    def _compute_slot_mapping_gpu(pos_per_batch: torch.Tensor) -> torch.Tensor:
+        """Compute slot_mapping on GPU via vectorized block_table gather --
+        no .item() sync."""
+        blk_idx = pos_per_batch // BLOCK_SIZE
+        off = pos_per_batch % BLOCK_SIZE
+        batch_ar = torch.arange(BATCH, device=device)
+        phys_blks = block_table[batch_ar, blk_idx].to(torch.int64)
+        return phys_blks * BLOCK_SIZE + off
+
     # Initial prefill: one big store so the cache is populated.
     prompt_k = torch.randn(BATCH * PROMPT_LEN, HEAD_KV, HEAD_SIZE,
                            dtype=dtype, device=device)
     prompt_v = torch.randn_like(prompt_k)
-    prompt_slot = torch.empty(BATCH * PROMPT_LEN, dtype=torch.int64,
-                              device=device)
-    for b in range(BATCH):
-        base = b * PROMPT_LEN
-        for i in range(PROMPT_LEN):
-            blk_idx = i // BLOCK_SIZE
-            off = i % BLOCK_SIZE
-            phys_blk = int(block_table[b, blk_idx].item())
-            prompt_slot[base + i] = phys_blk * BLOCK_SIZE + off
+    # Vectorized prompt slot mapping: pos = b*PROMPT_LEN_IGNORED ... actually
+    # each row b has its own block range, so compute per-(b, i).
+    pos_grid = torch.arange(PROMPT_LEN, device=device).view(1, -1).expand(BATCH, -1)
+    batch_grid = torch.arange(BATCH, device=device).view(-1, 1).expand(-1, PROMPT_LEN)
+    blk_grid = pos_grid // BLOCK_SIZE
+    off_grid = pos_grid % BLOCK_SIZE
+    phys_grid = block_table[batch_grid, blk_grid].to(torch.int64)
+    prompt_slot = (phys_grid * BLOCK_SIZE + off_grid).reshape(-1).contiguous()
 
     for layer_state, cache in zip(layers, caches):
         c_k_idx, c_k_norm, c_v_idx, c_v_norm, c_k_qjl, c_k_rnorm = cache
@@ -230,19 +255,37 @@ def run():
     seq_lens = torch.full((BATCH,), PROMPT_LEN, dtype=torch.int32, device=device)
     query_start_loc = torch.arange(BATCH + 1, dtype=torch.int32, device=device)
 
+    # Pre-build slot_mapping, Q, and per-layer K/V for every warmup+profile
+    # step so the profile loop itself has no Python-side allocation or
+    # sync. These are harness artifacts -- in real vLLM they come from
+    # the scheduler and linear projections.
+    all_slot_mappings = []
+    all_q_decs = []
+    all_ks_per_step = []   # list of list of tensors: [step][layer] -> K
+    all_vs_per_step = []
+    for step in range(WARMUP_STEPS + DECODE_STEPS):
+        pos_per_batch = torch.full((BATCH,), PROMPT_LEN + step,
+                                   dtype=torch.int64, device=device)
+        all_slot_mappings.append(_compute_slot_mapping_gpu(pos_per_batch))
+        all_q_decs.append(torch.randn(BATCH, HEAD_Q, HEAD_SIZE,
+                                      dtype=dtype, device=device))
+        ks = [torch.randn(BATCH, HEAD_KV, HEAD_SIZE, dtype=dtype, device=device)
+              for _ in range(NUM_LAYERS)]
+        vs = [torch.randn(BATCH, HEAD_KV, HEAD_SIZE, dtype=dtype, device=device)
+              for _ in range(NUM_LAYERS)]
+        all_ks_per_step.append(ks)
+        all_vs_per_step.append(vs)
+    torch.cuda.synchronize()
+
     # Warmup.
     print(f"Warmup ({WARMUP_STEPS} decode steps)...")
     for step in range(WARMUP_STEPS):
-        slot_mapping = torch.empty(BATCH, dtype=torch.int64, device=device)
-        for b in range(BATCH):
-            pos = PROMPT_LEN + step
-            blk_idx = pos // BLOCK_SIZE
-            off = pos % BLOCK_SIZE
-            phys_blk = int(block_table[b, blk_idx].item())
-            slot_mapping[b] = phys_blk * BLOCK_SIZE + off
-        q_dec = torch.randn(BATCH, HEAD_Q, HEAD_SIZE, dtype=dtype, device=device)
-        _one_decode_step(layers, caches, block_table, seq_lens + step,
-                         query_start_loc, slot_mapping, q_dec)
+        _one_decode_step(
+            layers, caches, block_table, seq_lens + step,
+            query_start_loc,
+            all_slot_mappings[step], all_q_decs[step],
+            all_ks_per_step[step], all_vs_per_step[step],
+        )
     torch.cuda.synchronize()
 
     # Profile.
@@ -254,17 +297,16 @@ def run():
         with_stack=False,
     ) as prof:
         for step in range(DECODE_STEPS):
-            slot_mapping = torch.empty(BATCH, dtype=torch.int64, device=device)
-            for b in range(BATCH):
-                pos = PROMPT_LEN + WARMUP_STEPS + step
-                blk_idx = pos // BLOCK_SIZE
-                off = pos % BLOCK_SIZE
-                phys_blk = int(block_table[b, blk_idx].item())
-                slot_mapping[b] = phys_blk * BLOCK_SIZE + off
-            q_dec = torch.randn(BATCH, HEAD_Q, HEAD_SIZE, dtype=dtype, device=device)
-            _one_decode_step(layers, caches, block_table,
-                             seq_lens + WARMUP_STEPS + step,
-                             query_start_loc, slot_mapping, q_dec)
+            global_step = WARMUP_STEPS + step
+            _one_decode_step(
+                layers, caches, block_table,
+                seq_lens + global_step,
+                query_start_loc,
+                all_slot_mappings[global_step],
+                all_q_decs[global_step],
+                all_ks_per_step[global_step],
+                all_vs_per_step[global_step],
+            )
         torch.cuda.synchronize()
 
     averages = prof.key_averages()
