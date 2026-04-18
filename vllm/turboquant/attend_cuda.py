@@ -187,6 +187,16 @@ def turboquant_paged_attention_cuda(
     out = torch.empty_like(q)
     gqa_group = num_heads_q // num_heads_kv
 
+    # Flash-decoding split-KV: divide each query's KV into chunks of
+    # split_len tokens. A grid.z = num_splits dimension fans compute out
+    # across more SMs when the batch alone can't fill them; the reduce
+    # kernel merges partials via log-sum-exp. split_len must be a multiple
+    # of BLOCK_N=32 (kernel-side assertion).
+    split_len = int(os.environ.get("TURBOQUANT_KV_SPLIT_LEN", "512"))
+    max_kv_end = int(kv_end_per_query.max().item())
+    num_splits = max(1, (max_kv_end + split_len - 1) // split_len)
+    num_splits = min(num_splits, 64)  # kernel MAX_SPLITS
+
     _ext().attend_mse(
         q_rotated,
         cache_k_idx,
@@ -200,6 +210,8 @@ def turboquant_paged_attention_cuda(
         out,
         int(block_size),
         int(gqa_group),
+        int(split_len),
+        int(num_splits),
     )
 
     # Post-rotate V back to original space.

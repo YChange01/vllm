@@ -20,7 +20,9 @@ void attend_mse_launch(
     at::Tensor codebook,
     at::Tensor out,
     int block_size,
-    int gqa_group
+    int gqa_group,
+    int split_len,
+    int num_splits
 );
 
 } // namespace cuda
@@ -51,7 +53,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def(
         "attend_mse",
         &turboquant::cuda::attend_mse_launch,
-        "TurboQuant mse attend kernel (CUDA, WMMA tensor cores)",
+        "TurboQuant mse attend kernel (CUDA, WMMA + cp.async + split-KV)",
         py::arg("q_rot"),
         py::arg("cache_k_idx"),
         py::arg("cache_k_norm"),
@@ -63,7 +65,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         py::arg("codebook"),
         py::arg("out"),
         py::arg("block_size"),
-        py::arg("gqa_group")
+        py::arg("gqa_group"),
+        py::arg("split_len"),
+        py::arg("num_splits")
     );
     m.def(
         "cutlass_version_probe",
