@@ -23,17 +23,23 @@
 set -u
 
 MODEL="${MODEL:-/mnt/nvme3n1/g00872988/models/Llama-3.1-8B-Instruct}"
-# Point at an offline HF datasets cache dir. B200 can't reach huggingface.co
-# from the compute mounts, so lm_eval must load gsm8k from local cache.
-GSM8K_DATA_DIR="${GSM8K_DATA_DIR:-/mnt/nvme3n1/g00872988/dataset}"
-if [[ -n "$GSM8K_DATA_DIR" && -d "$GSM8K_DATA_DIR" ]]; then
-    export HF_DATASETS_CACHE="$GSM8K_DATA_DIR"
-    export HF_HOME="$GSM8K_DATA_DIR"
-    export HF_DATASETS_OFFLINE=1
-    export HF_HUB_OFFLINE=1
-    export TRANSFORMERS_OFFLINE=1
-    echo "[gsm8k] offline HF datasets cache = $GSM8K_DATA_DIR"
+# Local gsm8k dataset directory. Expected layout (git-clone of the HF repo):
+#   $GSM8K_LOCAL_DIR/
+#     main/{test,train}-00000-of-00001.parquet
+#     socratic/...
+# We pass this path directly to lm_eval via a custom task YAML, so no HF
+# hub lookup is attempted. B200 has this at /mnt/nvme3n1/g00872988/dataset.
+GSM8K_LOCAL_DIR="${GSM8K_LOCAL_DIR:-/mnt/nvme3n1/g00872988/dataset/gsm8k}"
+if [[ ! -d "$GSM8K_LOCAL_DIR/main" ]]; then
+    echo "[gsm8k] ERROR: $GSM8K_LOCAL_DIR/main not found. Set GSM8K_LOCAL_DIR" >&2
+    echo "         to a gsm8k checkout containing main/{train,test}*.parquet." >&2
+    exit 1
 fi
+# Mark everything offline so the gsm8k parquet read doesn't try hitting
+# the Hub for metadata.
+export HF_DATASETS_OFFLINE=1
+export HF_HUB_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
 N="${N:-100}"               # <=0 -> full test set (1319); lm_eval --limit
 NUM_FEWSHOT="${NUM_FEWSHOT:-5}"
 NUM_CONCURRENT="${NUM_CONCURRENT:-64}"
@@ -50,6 +56,18 @@ TS="$(date +%Y%m%d_%H%M%S)"
 LOG_DIR="$ROOT_DIR/logs/gsm8k_$TS"
 mkdir -p "$LOG_DIR"
 ln -sfn "gsm8k_$TS" "$ROOT_DIR/logs/gsm8k_latest"
+
+# Materialize the lm_eval custom task YAML with the local dataset path
+# substituted in. Template lives under test/lm_eval_tasks/; we copy to
+# the log dir and sed-replace the __DATASET_PATH__ placeholder so the
+# task name 'gsm8k_local' resolves to the checked-out parquet files.
+TASK_DIR="$LOG_DIR/tasks"
+mkdir -p "$TASK_DIR"
+sed "s|__DATASET_PATH__|${GSM8K_LOCAL_DIR}|" \
+    "$ROOT_DIR/test/lm_eval_tasks/gsm8k_local.yaml" \
+    > "$TASK_DIR/gsm8k_local.yaml"
+echo "[gsm8k] lm_eval task YAML: $TASK_DIR/gsm8k_local.yaml"
+echo "[gsm8k] dataset path      : $GSM8K_LOCAL_DIR"
 
 # lm_eval's --limit expects a positive integer; translate N<=0 to full set.
 if [[ "$N" -le 0 ]]; then
@@ -120,15 +138,15 @@ run_stage() {
         exit 1
     fi
 
-    echo "[gsm8k] $label server healthy; running lm_eval (gsm8k, ${NUM_FEWSHOT}-shot, limit=${N})"
+    echo "[gsm8k] $label server healthy; running lm_eval (gsm8k_local, ${NUM_FEWSHOT}-shot, limit=${N})"
     local url="http://localhost:${port}/v1/completions"
     local model_args="model=${MODEL},base_url=${url},num_concurrent=${NUM_CONCURRENT},tokenized_requests=False"
 
-    # lm_eval writes results JSON under output_path
     lm_eval \
         --model local-completions \
         --model_args "$model_args" \
-        --tasks gsm8k \
+        --include_path "$TASK_DIR" \
+        --tasks gsm8k_local \
         --num_fewshot "$NUM_FEWSHOT" \
         --apply_chat_template \
         --fewshot_as_multiturn \
@@ -151,7 +169,7 @@ parse_acc() {
     json=$(find "$out_dir" -name 'results_*.json' 2>/dev/null | head -1)
     if [[ -z "$json" || ! -f "$json" ]]; then
         # Fallback: grep the stdout table ("exact_match")
-        grep -E '\|gsm8k\|.*exact_match' "$out_dir/stdout.log" 2>/dev/null \
+        grep -E '\|gsm8k_local\|.*exact_match' "$out_dir/stdout.log" 2>/dev/null \
             | head -1 \
             | awk -F'|' '{print $7}' \
             | xargs \
@@ -161,7 +179,7 @@ parse_acc() {
     python3 -c "
 import json, sys
 d = json.load(open('$json'))
-r = d['results']['gsm8k']
+r = d['results']['gsm8k_local']
 # report strict-match exact_match (gsm8k's primary metric)
 for k, v in r.items():
     if k.startswith('exact_match') and 'strict' in k:
