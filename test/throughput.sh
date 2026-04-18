@@ -139,11 +139,12 @@ run_stage() {
 stage_args() {
     # echo "backend env" for a given tag
     case "$1" in
-        FLASH_ATTN)             echo "FLASH_ATTN  " ;;
-        TURBOQUANT_mse_b4)      echo "TURBOQUANT  TURBOQUANT_ALGO=mse TURBOQUANT_BITS=4" ;;
-        TURBOQUANT_prod_b4)     echo "TURBOQUANT  TURBOQUANT_ALGO=prod TURBOQUANT_BITS=4" ;;
-        TURBOQUANT_mse_b4_lut)  echo "TURBOQUANT  TURBOQUANT_ALGO=mse TURBOQUANT_BITS=4 TURBOQUANT_USE_LUT=1" ;;
-        TURBOQUANT_prod_b4_lut) echo "TURBOQUANT  TURBOQUANT_ALGO=prod TURBOQUANT_BITS=4 TURBOQUANT_USE_LUT=1" ;;
+        FLASH_ATTN)              echo "FLASH_ATTN  " ;;
+        TURBOQUANT_mse_b4)       echo "TURBOQUANT  TURBOQUANT_ALGO=mse TURBOQUANT_BITS=4" ;;
+        TURBOQUANT_prod_b4)      echo "TURBOQUANT  TURBOQUANT_ALGO=prod TURBOQUANT_BITS=4" ;;
+        TURBOQUANT_mse_b4_lut)   echo "TURBOQUANT  TURBOQUANT_ALGO=mse TURBOQUANT_BITS=4 TURBOQUANT_USE_LUT=1" ;;
+        TURBOQUANT_prod_b4_lut)  echo "TURBOQUANT  TURBOQUANT_ALGO=prod TURBOQUANT_BITS=4 TURBOQUANT_USE_LUT=1" ;;
+        TURBOQUANT_mse_b4_cuda)  echo "TURBOQUANT  TURBOQUANT_ALGO=mse TURBOQUANT_BITS=4 TURBOQUANT_USE_CUDA=1" ;;
         *) echo "[bench] unknown stage tag: $1" >&2; return 1 ;;
     esac
 }
