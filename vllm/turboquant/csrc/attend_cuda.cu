@@ -1,28 +1,29 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 //
-// TurboQuant flash-style attend kernel in raw CUDA with inline dequant.
+// TurboQuant flash-style attend kernel in raw CUDA with WMMA tensor cores.
 //
-// Stage 1 (this file):
-//   * Functional correctness baseline -- scalar fp32 matmul (no tensor core
-//     yet). Proves the C++ extension path, paged addressing, online softmax
-//     and dequant plumbing work end-to-end.
-//   * mse path only (no QJL yet).
-//   * 4-bit nibble-packed K/V idx, fp32 per-slot norm.
+// Pipeline (per thread block, one per (query_token, kv_head) pair):
+//   1. Load Q into shared memory; dequant 16-entry codebook
+//   2. For each KV tile of BLOCK_N=64 slots:
+//        a. Build paged slot addresses
+//        b. Dequant K idx (4-bit) + codebook gather + norm scale -> K_sh bf16
+//        c. WMMA: scores = Q_sh @ K_sh.T  (tensor core)
+//        d. Mask invalid slots; scale by 1/d
+//        e. Online softmax: row max -> alpha -> probs (bf16 P_sh); update l
+//        f. Rescale acc_sh *= alpha
+//        g. Dequant V similarly -> V_sh bf16
+//        h. WMMA: acc_sh += P_sh @ V_sh  (tensor core)
+//   3. Normalize acc_sh / l_sh and write out (rotated V space).
 //
-// Future stages (follow-up PRs):
-//   Stage 1.5: WMMA tensor cores (mma.m16n8k16) for Q @ K.T and P @ V.
-//              This alone should match or beat the Triton LUT kernel.
-//   Stage 2:   add prod/QJL path
-//   Stage 3:   upgrade to wgmma (Hopper/Blackwell) for larger matmul tiles
-//   Stage 4:   warp specialization + TMA (async pipeline) -- true FA3 parity
+// Uses nvcuda::wmma (mma.m16n8k16 family) for both matmuls. Requires sm_80+.
+// Hopper/Blackwell also execute this fine, but the big wgmma tiles and TMA
+// asynchronous loads are left for a follow-up PR.
 //
-// Target arches: sm_80 (Ampere), sm_90 (Hopper), sm_100 (Blackwell).
-// WMMA works on all of them. wgmma/TMA are sm_90+.
+// Scope: mse path only. prod/QJL is a follow-up.
 
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
-#include <cuda_fp16.h>
 #include <mma.h>
 #include <torch/extension.h>
 
@@ -34,75 +35,52 @@ using bf16 = __nv_bfloat16;
 
 // --- Compile-time tile sizes (tuned for head_size=128, BLOCK_N=64) ---
 constexpr int HEAD_SIZE = 128;
-constexpr int BLOCK_N   = 64;           // KV tile size
-constexpr int BLOCK_M_PAD = 16;          // WMMA tile min
+constexpr int BLOCK_N   = 64;
+constexpr int BLOCK_M_PAD = 16;             // WMMA min
 constexpr int WMMA_M    = 16;
 constexpr int WMMA_N    = 16;
 constexpr int WMMA_K    = 16;
-constexpr int K_CB_MAX  = 16;            // 4-bit codebook max
+constexpr int K_CB_MAX  = 16;
+constexpr int THREADS   = 128;              // 4 warps
+constexpr int WARPS     = THREADS / 32;     // 4
 
-// Each block: 128 threads = 4 warps.
-constexpr int THREADS_PER_BLOCK = 128;
-
-// -------------------------------------------------------------------------
-// Helpers: nibble unpack + codebook dequant into a shared-memory bf16 tile.
-//
-// in_idx_global: (BLOCK_N, HEAD_SIZE/2) uint8, paged-addressed externally
-// norms_global : (BLOCK_N,) fp32
-// codebook_sh  : (K_CB,) fp32 (already loaded into shared mem)
-// out_tile_sh  : (BLOCK_N, HEAD_SIZE) bf16 output
-//
-// Each thread handles one (n, d) pair. With 128 threads and 64*128=8192 cells,
-// each thread covers 64 cells via a stride-128 loop.
-// -------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// Dequant one KV tile into shared memory as bf16.
+// ---------------------------------------------------------------------------
 __device__ __forceinline__
 void dequant_tile(
-    const uint8_t* __restrict__ idx_ptr_base,   // starting addr for this tile (BLOCK_N, d/2)
-    const int32_t* __restrict__ slot_addrs,     // (BLOCK_N,) base addr per slot into idx buf
-    const float*   __restrict__ norms_global,   // (num_blocks, bs, H_kv)
-    const int32_t* __restrict__ meta_addrs,     // (BLOCK_N,) addresses into norm buf
-    const float*   __restrict__ codebook_sh,    // (K_CB,)
-    bf16* __restrict__ tile_sh,                 // (BLOCK_N, HEAD_SIZE) shared
-    const int n_valid,                          // number of slots actually in-range
-    const int idx_dim                           // head_size / 2
+    const uint8_t* __restrict__ idx_buf,
+    const int32_t* __restrict__ slot_base_sh,
+    const float*   __restrict__ norms_buf,
+    const int32_t* __restrict__ meta_sh,
+    const float*   __restrict__ codebook_sh,
+    bf16* __restrict__ tile_sh,
+    const int n_valid
 ) {
     const int tid = threadIdx.x;
-    // For each (n, d) pair in the tile, dequant + scale.
-    // Total cells: BLOCK_N * HEAD_SIZE = 8192. Stride THREADS_PER_BLOCK = 128.
+    // 64 * 128 = 8192 cells; 128 threads -> 64 cells/thread.
     #pragma unroll 8
-    for (int cell = tid; cell < BLOCK_N * HEAD_SIZE; cell += THREADS_PER_BLOCK) {
+    for (int cell = tid; cell < BLOCK_N * HEAD_SIZE; cell += THREADS) {
         const int n = cell / HEAD_SIZE;
         const int d = cell % HEAD_SIZE;
         if (n >= n_valid) {
             tile_sh[n * HEAD_SIZE + d] = __float2bfloat16(0.f);
             continue;
         }
-        // Load packed byte at (n, d/2)
-        const int32_t slot_base = slot_addrs[n];
-        const uint8_t packed = idx_ptr_base[slot_base + (d >> 1)];
+        const int32_t slot_off = slot_base_sh[n] + (d >> 1);
+        const uint8_t packed = idx_buf[slot_off];
         const int nib = (d & 1) ? ((packed >> 4) & 0xF) : (packed & 0xF);
         const float c = codebook_sh[nib];
-        // Multiply by this slot's norm
-        const float nv = norms_global[meta_addrs[n]];
+        const float nv = norms_buf[meta_sh[n]];
         tile_sh[n * HEAD_SIZE + d] = __float2bfloat16(c * nv);
     }
 }
 
-// -------------------------------------------------------------------------
-// Main attend kernel -- one thread block per (query_token, kv_head).
-//
-// Inputs:
-//   q_rot          : (T_q, H_q, HEAD_SIZE) bf16, Hadamard-rotated
-//   cache_k_idx    : (num_blocks, block_size, H_kv, HEAD_SIZE/2) uint8
-//   cache_k_norm   : (num_blocks, block_size, H_kv) fp32
-//   cache_v_idx/norm: same layout
-//   block_table    : (num_seqs, bt_stride) int32
-//   seq_id/ kv_end : per-query (T_q,) int32
-//   codebook       : (K_CB,) bf16
-//   out            : (T_q, H_q, HEAD_SIZE) bf16, rotated V space (Python post-rotates)
-// -------------------------------------------------------------------------
-__launch_bounds__(THREADS_PER_BLOCK, 2)
-__global__ void attend_mse_kernel(
+// ---------------------------------------------------------------------------
+// Main attend kernel (WMMA tensor cores for both QK and PV matmuls).
+// ---------------------------------------------------------------------------
+__launch_bounds__(THREADS, 2)
+__global__ void attend_mse_tc_kernel(
     const bf16* __restrict__ q_rot,
     const uint8_t* __restrict__ cache_k_idx,
     const float*   __restrict__ cache_k_norm,
@@ -126,78 +104,68 @@ __global__ void attend_mse_kernel(
     const int kvh_idx = blockIdx.y;
     const int tid     = threadIdx.x;
     const int warp_id = tid / 32;
-    const int lane    = tid % 32;
     const int q_head_start = kvh_idx * gqa_group;
 
     const int32_t seq_idx = seq_id_per_query[q_idx];
     const int32_t kv_end  = kv_end_per_query[q_idx];
 
-    // ---- Shared memory layout ----
-    __shared__ bf16  Q_sh[BLOCK_M_PAD][HEAD_SIZE];            // (16, 128) bf16 -- Q (gqa padded to 16)
-    __shared__ bf16  K_tile[BLOCK_N][HEAD_SIZE];              // (64, 128) bf16
-    __shared__ bf16  V_tile[BLOCK_N][HEAD_SIZE];              // (64, 128) bf16
-    __shared__ float codebook_sh[K_CB_MAX];                   // (16,)
-    __shared__ float m_sh[BLOCK_M_PAD];                       // (16,)
-    __shared__ float l_sh[BLOCK_M_PAD];                       // (16,)
-    __shared__ float acc_sh[BLOCK_M_PAD][HEAD_SIZE];          // (16, 128) fp32
-    __shared__ float scores_sh[BLOCK_M_PAD][BLOCK_N];         // (16, 64)
-
-    // Slot-addressing scratch (computed per-tile)
+    // --- Shared memory (16-byte aligned for WMMA) ---
+    __shared__ __align__(16) bf16  Q_sh    [BLOCK_M_PAD][HEAD_SIZE];       // (16, 128)
+    __shared__ __align__(16) bf16  K_sh    [BLOCK_N][HEAD_SIZE];           // (64, 128)
+    __shared__ __align__(16) bf16  V_sh    [BLOCK_N][HEAD_SIZE];           // (64, 128)
+    __shared__ __align__(16) bf16  P_sh    [BLOCK_M_PAD][BLOCK_N];         // (16, 64)
+    __shared__ float scores_sh[BLOCK_M_PAD][BLOCK_N];                      // (16, 64)
+    __shared__ float codebook_sh[K_CB_MAX];
+    __shared__ float m_sh   [BLOCK_M_PAD];
+    __shared__ float l_sh   [BLOCK_M_PAD];
+    __shared__ float alpha_sh[BLOCK_M_PAD];
+    __shared__ float acc_sh [BLOCK_M_PAD][HEAD_SIZE];                      // (16, 128)
     __shared__ int32_t slot_base_sh[BLOCK_N];
-    __shared__ int32_t meta_sh[BLOCK_N];
+    __shared__ int32_t meta_sh     [BLOCK_N];
 
-    // -------- Load codebook (few threads) --------
-    if (tid < K_CB) {
-        codebook_sh[tid] = __bfloat162float(codebook[tid]);
-    }
+    // --- Load codebook (tiny) ---
+    if (tid < K_CB) codebook_sh[tid] = __bfloat162float(codebook[tid]);
 
-    // -------- Load Q (gqa_group rows into padded BLOCK_M_PAD) --------
-    // Q_sh[m][d] for m in [0, gqa_group), d in [0, HEAD_SIZE)
-    // Each thread handles one (m, d) pair.
-    #pragma unroll
-    for (int cell = tid; cell < BLOCK_M_PAD * HEAD_SIZE; cell += THREADS_PER_BLOCK) {
+    // --- Load Q (gqa_group rows into padded 16) ---
+    for (int cell = tid; cell < BLOCK_M_PAD * HEAD_SIZE; cell += THREADS) {
         const int m = cell / HEAD_SIZE;
         const int d = cell % HEAD_SIZE;
         if (m < gqa_group) {
             const int q_head = q_head_start + m;
-            const int q_off = (q_idx * num_heads_q + q_head) * HEAD_SIZE + d;
+            const int q_off  = (q_idx * num_heads_q + q_head) * HEAD_SIZE + d;
             Q_sh[m][d] = q_rot[q_off];
         } else {
             Q_sh[m][d] = __float2bfloat16(0.f);
         }
     }
 
-    // -------- Initialize softmax state --------
+    // --- Init softmax state + acc ---
     if (tid < BLOCK_M_PAD) {
         m_sh[tid] = -1e30f;
         l_sh[tid] = 0.f;
     }
-    for (int cell = tid; cell < BLOCK_M_PAD * HEAD_SIZE; cell += THREADS_PER_BLOCK) {
+    for (int cell = tid; cell < BLOCK_M_PAD * HEAD_SIZE; cell += THREADS) {
         acc_sh[cell / HEAD_SIZE][cell % HEAD_SIZE] = 0.f;
     }
-
     __syncthreads();
 
-    // -------- KV loop --------
+    // ========================= KV LOOP =========================
     const int num_tiles = (kv_end + BLOCK_N - 1) / BLOCK_N;
 
-    for (int tile_i = 0; tile_i < num_tiles; ++tile_i) {
-        const int kv_base = tile_i * BLOCK_N;
+    for (int tile = 0; tile < num_tiles; ++tile) {
+        const int kv_base = tile * BLOCK_N;
         const int n_valid = min(BLOCK_N, kv_end - kv_base);
 
-        // ---- Compute slot_base / meta addresses for this tile ----
-        // slot_base[n] = phys_block * bs * H_kv * idx_dim
-        //              + tok_in_block * H_kv * idx_dim
-        //              + kvh_idx * idx_dim
+        // --- Paged addresses ---
         if (tid < BLOCK_N) {
             const int n = tid;
             if (n < n_valid) {
                 const int pos = kv_base + n;
                 const int blk = pos / block_size;
-                const int tok_in_blk = pos % block_size;
+                const int tok = pos % block_size;
                 const int phys = block_table[seq_idx * bt_stride + blk];
-                slot_base_sh[n] = ((phys * block_size + tok_in_blk) * num_heads_kv + kvh_idx) * idx_dim;
-                meta_sh[n]      = (phys * block_size + tok_in_blk) * num_heads_kv + kvh_idx;
+                slot_base_sh[n] = ((phys * block_size + tok) * num_heads_kv + kvh_idx) * idx_dim;
+                meta_sh[n]      = (phys * block_size + tok) * num_heads_kv + kvh_idx;
             } else {
                 slot_base_sh[n] = 0;
                 meta_sh[n]      = 0;
@@ -205,88 +173,124 @@ __global__ void attend_mse_kernel(
         }
         __syncthreads();
 
-        // ---- Dequant K tile into K_tile[BLOCK_N][HEAD_SIZE] ----
+        // --- Dequant K ---
         dequant_tile(cache_k_idx, slot_base_sh, cache_k_norm, meta_sh,
-                     codebook_sh, &K_tile[0][0], n_valid, idx_dim);
+                     codebook_sh, &K_sh[0][0], n_valid);
         __syncthreads();
 
-        // ---- Compute scores[m][n] = Q_sh[m] . K_tile[n] for m<BLOCK_M_PAD, n<BLOCK_N ----
-        // Simple one-thread-per-(m,n) parallelism for first version.
-        // BLOCK_M_PAD*BLOCK_N = 16*64 = 1024 scores, 128 threads -> each does 8.
-        #pragma unroll
-        for (int cell = tid; cell < BLOCK_M_PAD * BLOCK_N; cell += THREADS_PER_BLOCK) {
-            const int m = cell / BLOCK_N;
-            const int n = cell % BLOCK_N;
-            if (n >= n_valid) {
-                scores_sh[m][n] = -1e30f;
-                continue;
-            }
-            float s = 0.f;
+        // --- WMMA Q @ K.T -> scores_sh ---
+        // Each warp owns one (16x16) tile of scores:
+        //   warp w -> scores[0:16, 16*w : 16*(w+1)]
+        // M = BLOCK_M_PAD = 16, N = BLOCK_N = 64, K = HEAD_SIZE = 128.
+        {
+            fragment<matrix_a, WMMA_M, WMMA_N, WMMA_K, bf16, row_major> a_frag;
+            fragment<matrix_b, WMMA_M, WMMA_N, WMMA_K, bf16, col_major> b_frag;
+            fragment<accumulator, WMMA_M, WMMA_N, WMMA_K, float> c_frag;
+            fill_fragment(c_frag, 0.f);
+
+            const int n_start = warp_id * WMMA_N;   // 0, 16, 32, 48
             #pragma unroll
-            for (int d = 0; d < HEAD_SIZE; ++d) {
-                s += __bfloat162float(Q_sh[m][d]) * __bfloat162float(K_tile[n][d]);
+            for (int k_off = 0; k_off < HEAD_SIZE; k_off += WMMA_K) {
+                // A tile: Q_sh[0:16, k_off:k_off+16] row-major, ld=HEAD_SIZE.
+                load_matrix_sync(a_frag, &Q_sh[0][k_off], HEAD_SIZE);
+                // B tile (col-major): K_sh is (BLOCK_N, HEAD_SIZE) row-major;
+                // viewed as (HEAD_SIZE, BLOCK_N) col-major with ld=HEAD_SIZE
+                // the 16-col tile starts at offset (n_start * HEAD_SIZE + k_off).
+                load_matrix_sync(b_frag,
+                                 &K_sh[n_start][k_off],
+                                 HEAD_SIZE);
+                mma_sync(c_frag, a_frag, b_frag, c_frag);
             }
-            scores_sh[m][n] = s * inv_d;
+            store_matrix_sync(&scores_sh[0][n_start], c_frag,
+                              BLOCK_N, mem_row_major);
         }
         __syncthreads();
 
-        // ---- Online softmax update (per row m) ----
-        // Use one warp per m (16 rows, 4 warps available). 4 rows/warp.
+        // --- Mask invalid slots + scale by 1/d ---
+        for (int cell = tid; cell < BLOCK_M_PAD * BLOCK_N; cell += THREADS) {
+            const int m = cell / BLOCK_N;
+            const int n = cell % BLOCK_N;
+            scores_sh[m][n] = (n < n_valid)
+                ? (scores_sh[m][n] * inv_d)
+                : -1e30f;
+        }
+        __syncthreads();
+
+        // --- Online softmax (one thread per M row) ---
+        // 16 M rows; threads 0..15 each do one row.
         if (tid < BLOCK_M_PAD) {
             const int m = tid;
-            // Row max
             float row_max = -1e30f;
             #pragma unroll
             for (int n = 0; n < BLOCK_N; ++n) {
                 row_max = fmaxf(row_max, scores_sh[m][n]);
             }
             const float m_new = fmaxf(m_sh[m], row_max);
-            const float alpha = __expf(m_sh[m] - m_new);
-            // Convert scores -> probs inline and compute row sum + rescale acc
+            alpha_sh[m] = __expf(m_sh[m] - m_new);
+            m_sh[m] = m_new;
+
             float row_sum = 0.f;
             #pragma unroll
             for (int n = 0; n < BLOCK_N; ++n) {
-                const float p = __expf(scores_sh[m][n] - m_new);
-                scores_sh[m][n] = p;              // reuse scores_sh as probs
+                const float p = (n < n_valid) ? __expf(scores_sh[m][n] - m_new) : 0.f;
+                P_sh[m][n] = __float2bfloat16(p);
                 row_sum += p;
             }
-            l_sh[m] = l_sh[m] * alpha + row_sum;
-            // Rescale acc
-            #pragma unroll
-            for (int d = 0; d < HEAD_SIZE; ++d) {
-                acc_sh[m][d] *= alpha;
-            }
-            m_sh[m] = m_new;
+            l_sh[m] = l_sh[m] * alpha_sh[m] + row_sum;
         }
         __syncthreads();
 
-        // ---- Dequant V tile ----
-        dequant_tile(cache_v_idx, slot_base_sh, cache_v_norm, meta_sh,
-                     codebook_sh, &V_tile[0][0], n_valid, idx_dim);
-        __syncthreads();
-
-        // ---- acc[m][d] += sum_n probs[m][n] * V_tile[n][d] ----
-        // One thread per (m, d) pair: BLOCK_M_PAD * HEAD_SIZE = 2048 cells / 128 threads = 16 cells/thread.
-        #pragma unroll
-        for (int cell = tid; cell < BLOCK_M_PAD * HEAD_SIZE; cell += THREADS_PER_BLOCK) {
+        // --- Rescale acc_sh *= alpha (parallel over (m, d)) ---
+        for (int cell = tid; cell < BLOCK_M_PAD * HEAD_SIZE; cell += THREADS) {
             const int m = cell / HEAD_SIZE;
             const int d = cell % HEAD_SIZE;
-            float s = 0.f;
+            acc_sh[m][d] *= alpha_sh[m];
+        }
+        __syncthreads();
+
+        // --- Dequant V ---
+        dequant_tile(cache_v_idx, slot_base_sh, cache_v_norm, meta_sh,
+                     codebook_sh, &V_sh[0][0], n_valid);
+        __syncthreads();
+
+        // --- WMMA P @ V -> acc_sh (accumulate into existing) ---
+        // M = 16, N = HEAD_SIZE = 128, K = BLOCK_N = 64.
+        // Each of 4 warps handles 2 consecutive N-tiles (16 cols each).
+        {
+            fragment<matrix_a, WMMA_M, WMMA_N, WMMA_K, bf16, row_major> a_frag;
+            fragment<matrix_b, WMMA_M, WMMA_N, WMMA_K, bf16, row_major> b_frag;
+            fragment<accumulator, WMMA_M, WMMA_N, WMMA_K, float> c_frag;
+
             #pragma unroll
-            for (int n = 0; n < BLOCK_N; ++n) {
-                s += scores_sh[m][n] * __bfloat162float(V_tile[n][d]);
+            for (int sub = 0; sub < 2; ++sub) {
+                const int n_start = (warp_id * 2 + sub) * WMMA_N;  // [0..112] step 16
+
+                // Preload current acc tile into c_frag so mma_sync keeps adding.
+                load_matrix_sync(c_frag,
+                                 &acc_sh[0][n_start],
+                                 HEAD_SIZE, mem_row_major);
+
+                #pragma unroll
+                for (int k_off = 0; k_off < BLOCK_N; k_off += WMMA_K) {
+                    // A: P_sh[0:16, k_off:k_off+16] row-major, ld=BLOCK_N.
+                    load_matrix_sync(a_frag, &P_sh[0][k_off], BLOCK_N);
+                    // B: V_sh[k_off:k_off+16, n_start:n_start+16] row-major, ld=HEAD_SIZE.
+                    load_matrix_sync(b_frag, &V_sh[k_off][n_start], HEAD_SIZE);
+                    mma_sync(c_frag, a_frag, b_frag, c_frag);
+                }
+                store_matrix_sync(&acc_sh[0][n_start], c_frag,
+                                  HEAD_SIZE, mem_row_major);
             }
-            acc_sh[m][d] += s;
         }
         __syncthreads();
     }
 
-    // -------- Normalize and write out (first gqa_group rows only) --------
-    for (int cell = tid; cell < BLOCK_M_PAD * HEAD_SIZE; cell += THREADS_PER_BLOCK) {
+    // ========================= FINAL NORMALIZE + STORE =========================
+    for (int cell = tid; cell < BLOCK_M_PAD * HEAD_SIZE; cell += THREADS) {
         const int m = cell / HEAD_SIZE;
         const int d = cell % HEAD_SIZE;
         if (m < gqa_group) {
-            const int q_head = q_head_start + m;
+            const int q_head  = q_head_start + m;
             const int out_off = (q_idx * num_heads_q + q_head) * HEAD_SIZE + d;
             const float denom = fmaxf(l_sh[m], 1e-12f);
             out[out_off] = __float2bfloat16(acc_sh[m][d] / denom);
@@ -294,20 +298,20 @@ __global__ void attend_mse_kernel(
     }
 }
 
-// -------------------------------------------------------------------------
-// C++ entry point (called from pybind binding). Dispatches the kernel.
-// -------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// C++ launch entry
+// ---------------------------------------------------------------------------
 void attend_mse_launch(
-    at::Tensor q_rot,                   // (T_q, H_q, HEAD_SIZE) bf16
-    at::Tensor cache_k_idx,             // (num_blocks, bs, H_kv, HEAD_SIZE/2) uint8
-    at::Tensor cache_k_norm,            // (num_blocks, bs, H_kv) fp32
+    at::Tensor q_rot,
+    at::Tensor cache_k_idx,
+    at::Tensor cache_k_norm,
     at::Tensor cache_v_idx,
     at::Tensor cache_v_norm,
-    at::Tensor block_table,             // (num_seqs, bt_stride) int32
-    at::Tensor seq_id_per_query,        // (T_q,) int32
-    at::Tensor kv_end_per_query,        // (T_q,) int32
-    at::Tensor codebook,                // (K_CB,) bf16
-    at::Tensor out,                     // (T_q, H_q, HEAD_SIZE) bf16
+    at::Tensor block_table,
+    at::Tensor seq_id_per_query,
+    at::Tensor kv_end_per_query,
+    at::Tensor codebook,
+    at::Tensor out,
     int block_size,
     int gqa_group
 ) {
@@ -317,23 +321,26 @@ void attend_mse_launch(
     TORCH_CHECK(cache_k_norm.scalar_type() == at::kFloat);
     TORCH_CHECK(codebook.scalar_type() == at::kBFloat16);
 
-    const int T_q         = q_rot.size(0);
-    const int num_heads_q = q_rot.size(1);
-    const int head_size   = q_rot.size(2);
+    const int T_q          = q_rot.size(0);
+    const int num_heads_q  = q_rot.size(1);
+    const int head_size    = q_rot.size(2);
     const int num_heads_kv = cache_k_idx.size(2);
-    const int idx_dim     = cache_k_idx.size(3);
-    const int bt_stride   = block_table.size(1);
-    const int K_CB        = codebook.size(0);
+    const int idx_dim      = cache_k_idx.size(3);
+    const int bt_stride    = block_table.size(1);
+    const int K_CB         = codebook.size(0);
 
-    TORCH_CHECK(head_size == HEAD_SIZE, "head_size must be 128 for this kernel");
+    TORCH_CHECK(head_size == HEAD_SIZE,
+                "head_size must be 128 for this WMMA kernel");
     TORCH_CHECK(K_CB <= K_CB_MAX, "K_CB too large");
+    TORCH_CHECK(gqa_group <= BLOCK_M_PAD,
+                "gqa_group must be <= 16 (WMMA tile)");
 
     const float inv_d = 1.0f / static_cast<float>(head_size);
 
     dim3 grid(T_q, num_heads_kv);
-    dim3 block(THREADS_PER_BLOCK);
+    dim3 block(THREADS);
 
-    attend_mse_kernel<<<grid, block>>>(
+    attend_mse_tc_kernel<<<grid, block>>>(
         reinterpret_cast<const bf16*>(q_rot.data_ptr<at::BFloat16>()),
         cache_k_idx.data_ptr<uint8_t>(),
         cache_k_norm.data_ptr<float>(),
