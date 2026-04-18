@@ -27,9 +27,11 @@ QJL path (prod): the ``Sq @ qjl_sign.T`` term is also turned into a
 ``tl.dot`` by unpacking 1-bit qjl signs into a (BLOCK_N, d) bf16
 ``{+1, -1}`` tile.
 
-Post-rotation of V (``(out @ H.T) * signs / sqrt(d)``) still runs in
-Python on the kernel output -- fusing it is a separate follow-up.
-Store path (K/V quantization write) also stays in Python for now.
+Pre-rotation of Q (``(q * signs) @ H``, plus ``Sq = q_rot @ S.T`` for
+prod) and post-rotation of V (``signs * (out @ H) / sqrt(d)``) are
+fused into this kernel. Each program loads H (and S for prod) once
+from global memory -- the compiler puts them in shared memory --
+amortising three cuBLAS launches per layer into one Triton launch.
 
 Scope: b=4 only (K_CB <= 16, 4-bit nibble-packed K/V idx, 1-bit-packed
 QJL sign for prod).
@@ -76,8 +78,7 @@ _AUTOTUNE_CONFIGS = [
 )
 @triton.jit
 def _tc_attend_kernel(
-    q_rotated_ptr,                  # (T_q, H_q, d) bf16/fp16
-    Sq_ptr,                         # (T_q, H_q, d) bf16/fp16  prod only
+    q_raw_ptr,                      # (T_q, H_q, d) bf16/fp16  RAW q
     cache_k_idx_ptr,                # (num_blocks, bs, H_kv, d/2) uint8
     cache_k_norm_ptr,               # (num_blocks, bs, H_kv) fp32
     cache_v_idx_ptr,                # (num_blocks, bs, H_kv, d/2) uint8
@@ -88,9 +89,13 @@ def _tc_attend_kernel(
     seq_id_per_query_ptr,           # (T_q,) int32
     kv_end_per_query_ptr,           # (T_q,) int32
     codebook_ptr,                   # (K_CB,) bf16 (same dtype as Q)
-    out_ptr,                        # (T_q, H_q, d) OUT_DTYPE
+    H_ptr,                          # (d, d) bf16 -- Hadamard, symmetric
+    signs_ptr,                      # (d,) bf16 -- +/-1 diagonal
+    S_ptr,                          # (d, d) bf16 -- QJL projection (prod only)
+    out_ptr,                        # (T_q, H_q, d) OUT_DTYPE (original space)
     inv_d,
     qjl_coef,
+    inv_sqrt_d,                     # 1 / sqrt(d); for post-rotate scaling
     block_table_stride,
     OUT_DTYPE: tl.constexpr,
     COMPUTE_DTYPE: tl.constexpr,    # tl.bfloat16 or tl.float16
@@ -120,25 +125,45 @@ def _tc_attend_kernel(
     mask_m = m_off < GQA_GROUP
     mask_d = d_off < head_size
 
-    # Load Q tile (BLOCK_M, BLOCK_D) in compute dtype (bf16/fp16).
+    # -------- Load raw Q, signs; pre-rotate in-kernel --------
+    # q_rot = (q * signs) @ H   where H is symmetric (H.T == H).
     q_base = q_idx * num_heads_q * head_size
     q_offs_2d = (
         q_base
         + (q_head_start + m_off[:, None]) * head_size
         + d_off[None, :]
     )
-    q_rot = tl.load(
-        q_rotated_ptr + q_offs_2d,
+    q_raw = tl.load(
+        q_raw_ptr + q_offs_2d,
         mask=mask_m[:, None] & mask_d[None, :],
         other=0.0,
     )
+    signs = tl.load(signs_ptr + d_off, mask=mask_d, other=0.0)
+    q_signed = (
+        q_raw.to(tl.float32) * signs.to(tl.float32)
+    ).to(COMPUTE_DTYPE)                                              # (BLOCK_M, BLOCK_D)
+
+    # Load H tile (d, d). Compiler will put this in shared memory for
+    # reuse across the pre-rotate, post-rotate, and (for prod) the
+    # Sq matmul below.
+    H_rows = d_off[:, None]
+    H_cols = d_off[None, :]
+    H_tile = tl.load(
+        H_ptr + H_rows * head_size + H_cols,
+        mask=mask_d[:, None] & mask_d[None, :],
+        other=0.0,
+    )                                                                # (BLOCK_D, BLOCK_D)
+
+    q_rot = tl.dot(q_signed, H_tile).to(COMPUTE_DTYPE)               # (BLOCK_M, BLOCK_D)
 
     if USE_QJL:
-        sq = tl.load(
-            Sq_ptr + q_offs_2d,
-            mask=mask_m[:, None] & mask_d[None, :],
+        # Sq = q_rot @ S.T
+        S_tile = tl.load(
+            S_ptr + H_rows * head_size + H_cols,
+            mask=mask_d[:, None] & mask_d[None, :],
             other=0.0,
         )
+        sq = tl.dot(q_rot, tl.trans(S_tile)).to(COMPUTE_DTYPE)       # (BLOCK_M, BLOCK_D)
 
     m_i = tl.full((BLOCK_M,), _NEG_LARGE, dtype=tl.float32)
     l_i = tl.zeros((BLOCK_M,), dtype=tl.float32)
@@ -268,8 +293,15 @@ def _tc_attend_kernel(
 
         m_i = m_new
 
-    # Normalize V accumulator and write out.
-    out = acc / tl.maximum(l_i[:, None], 1e-12)
+    # Normalize accumulator (in V's rotated space) and post-rotate back
+    # to original space: output = signs * (acc_norm @ H) / sqrt(d).
+    acc_norm = acc / tl.maximum(l_i[:, None], 1e-12)                 # fp32
+    acc_norm_ct = acc_norm.to(COMPUTE_DTYPE)                         # (BLOCK_M, BLOCK_D)
+    out_rotated = tl.dot(acc_norm_ct, H_tile)                        # (BLOCK_M, BLOCK_D) fp32
+    out_final = (
+        out_rotated * signs[None, :].to(tl.float32) * inv_sqrt_d
+    )
+
     out_offs = (
         q_base
         + (q_head_start + m_off[:, None]) * head_size
@@ -277,7 +309,7 @@ def _tc_attend_kernel(
     )
     tl.store(
         out_ptr + out_offs,
-        out.to(OUT_DTYPE),
+        out_final.to(OUT_DTYPE),
         mask=mask_m[:, None] & mask_d[None, :],
     )
 
@@ -337,21 +369,6 @@ def turboquant_paged_attention_lut(
     seq_id_per_query = seq_id_per_query_i64.to(torch.int32).contiguous()
     kv_end_per_query = kv_end_per_query_i64.to(torch.int32).contiguous()
 
-    # Pre-rotate Q in Python, in the query's native dtype so the matmul
-    # hits tensor cores (cuBLAS sgemm_f32 was dominating the prior
-    # profile). H is symmetric so H.T == H.
-    q_signed = q * state.signs                                       # bf16 elementwise
-    q_rotated_k = (
-        q_signed.reshape(-1, head_size) @ state.H
-    ).view(num_query_tokens, num_heads_q, head_size).contiguous()    # bf16
-
-    if use_qjl:
-        Sq_k = (
-            q_rotated_k.reshape(-1, head_size) @ state.S.T
-        ).view(num_query_tokens, num_heads_q, head_size).contiguous()
-    else:
-        Sq_k = q_rotated_k
-
     qjl_dim = head_size // 8 if use_qjl else 1
     if use_qjl:
         qjl_sign_buf = cache_k_qjl_sign
@@ -359,15 +376,16 @@ def turboquant_paged_attention_lut(
         assert qjl_sign_buf.shape[-1] == qjl_dim
     else:
         qjl_sign_buf = cache_k_idx
-    rnorm_buf = cache_k_rnorm if use_qjl else cache_k_norm
 
-    # Codebook in the query's compute dtype (bf16 or fp16) so the
-    # gather inside the kernel directly produces tensor-core operands.
+    rnorm_buf = cache_k_rnorm if use_qjl else cache_k_norm
+    S_buf = state.S if use_qjl else state.H  # dummy same-dtype tensor
+
+    # Codebook in the query's compute dtype so the gather inside the
+    # kernel directly produces tensor-core operands.
     codebook_ct = state.codebook.to(q.dtype)
 
     gqa_group = num_heads_q // num_heads_kv
     BLOCK_M = max(gqa_group, _BLOCK_M_MIN)
-    # Round BLOCK_M up to next power of two to keep tl.dot happy.
     BLOCK_M = 1 << (BLOCK_M - 1).bit_length()
     BLOCK_D = triton.next_power_of_2(head_size)
 
@@ -378,12 +396,12 @@ def turboquant_paged_attention_lut(
 
     inv_d = 1.0 / float(head_size)
     qjl_coef = math.sqrt(math.pi / 2.0) / float(head_size)
+    inv_sqrt_d = 1.0 / math.sqrt(float(head_size))
     block_table_stride = int(block_table.shape[1])
 
     grid = (num_query_tokens, num_heads_kv)
     _tc_attend_kernel[grid](
-        q_rotated_k,
-        Sq_k,
+        q,                   # raw Q -- kernel rotates in-line
         cache_k_idx,
         cache_k_norm,
         cache_v_idx,
@@ -394,9 +412,13 @@ def turboquant_paged_attention_lut(
         seq_id_per_query,
         kv_end_per_query,
         codebook_ct,
+        state.H,
+        state.signs,
+        S_buf,
         out,
         inv_d,
         qjl_coef,
+        inv_sqrt_d,
         block_table_stride,
         OUT_DTYPE=OUT_DTYPE,
         COMPUTE_DTYPE=COMPUTE_DTYPE,
@@ -413,11 +435,4 @@ def turboquant_paged_attention_lut(
         GQA_GROUP=gqa_group,
     )
 
-    # Post-rotate V back to original space in bf16 (tensor core matmul).
-    # H symmetric so H.T == H. Do it in place in the query's dtype.
-    inv_sqrt_d = 1.0 / math.sqrt(float(head_size))
-    output = (
-        out.reshape(-1, head_size) @ state.H
-    ).view(num_query_tokens, num_heads_q, head_size)
-    output = output * state.signs * inv_sqrt_d
-    return output.contiguous()
+    return out
