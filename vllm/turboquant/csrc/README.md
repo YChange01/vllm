@@ -17,10 +17,66 @@ specialization) that the Triton path can't fully reach.
 
 | Stage | Contents | Status |
 |---|---|---|
-| **Today** | WMMA (mma.m16n8k16), mse only. JIT-compiled via `cpp_extension.load`. | shipped |
-| Next | **prod / QJL** path (S·r_unit matvec, 1-bit qjl_sign bit-pack load) | follow-up |
-| Next | **wgmma** on Hopper/Blackwell: larger `m64n256k16` tiles | follow-up |
-| Final | **Warp specialization + TMA**: producer/consumer async pipeline (true FA3 architecture) | follow-up |
+| 1.5 | WMMA (mma.m16n8k16), mse only. JIT-compiled. 65ms ITL (slower than TC, see throughput log 2026-04-18) | shipped |
+| **3A** | **wgmma** replaces WMMA. Single warpgroup, sync cp.async loads. Target: ≤40ms (TC parity). | **next** |
+| 3B | cp.async double-buffer loads, still single warpgroup. Target: ≤30ms. | planned |
+| 3C | Producer/consumer warp specialization. TMA for Q + idx/norm arrays, producer decodes bf16 K/V into smem staging, consumer wgmma. + prod/QJL merged. Target: ≤22ms. | planned |
+
+## Stage 3C design (full FA3 form, dequant-aware)
+
+Reference: `vllm-project/flash-attention@f5bc33c` `hopper/mainloop_fwd_sm90_tma_gmma_ws.hpp`
+— we mirror its structure but cannot reuse it directly: vanilla FA3 TMAs bf16 K/V
+straight from gmem to smem, our K/V live as 4-bit idx + fp32 norm + codebook
+gather. TMA cannot gather, so the load→dequant→mma pipeline gains a middle stage.
+
+### Warp group layout (Hopper sm_90a, 3 warpgroups × 128 threads = 384)
+
+| WG | Role | Work |
+|---|---|---|
+| 0 | **Producer** | TMA load Q (once), paged TMA load of K/V idx+norm tiles, decode idx+norm → bf16 K/V tile in smem staging, signal consumer via `mbarrier` |
+| 1 | **Consumer A** | wgmma QK on (Q, decoded K) → scores; online softmax running max/sum; wgmma PV on (P, decoded V) → accumulator |
+| 2 | **Consumer B** | Same as A but on next tile (pingpong: while A is in softmax, B runs wgmma and vice versa) |
+
+### Shared memory layout (per SM, ≤228 KB dynamic smem on Hopper)
+
+```
+smem {
+  Q_tile          [BLOCK_M × HEAD_SIZE] bf16     # 16 × 128 × 2 =  4 KB, 1 stage
+  K_staging       [STAGES × BLOCK_N × HEAD_SIZE] bf16   # 2 × 64 × 128 × 2 = 32 KB
+  V_staging       [STAGES × BLOCK_N × HEAD_SIZE] bf16   # same = 32 KB
+  K_idx_raw       [STAGES × BLOCK_N × HEAD_SIZE/8] uint32  # 4-bit nibbles packed
+  K_norm_raw      [STAGES × BLOCK_N × HEAD_SIZE/G] fp32
+  V_idx_raw       same shape
+  V_norm_raw      same shape
+  codebook        [2**b × HEAD_SIZE] bf16  # persistent, reused all blocks
+  softmax_scratch [BLOCK_M × 2] fp32       # max, sum per row
+  mbar_load_k[STAGES], mbar_decode_k[STAGES], ...
+}
+```
+
+### Pipeline (per KV tile of BLOCK_N tokens)
+
+```
+producer (WG0)                     consumer A (WG1)            consumer B (WG2)
+---------------                    ------------------          ------------------
+TMA load idx/norm tile i   ---->   ~wait on decode_k[i]~       ~running on tile i-1~
+decode K[i], V[i]          ---->   wgmma QK                    softmax pass
+mbarrier.arrive decode[i]          pingpong swap
+advance stage                      wgmma PV
+...
+```
+
+### Dequant math (in producer)
+
+mse: `K_bf16[n,d] = codebook[K_idx[n,d]] * K_norm[n,d/G]`
+prod: `K_bf16[n,d] = codebook[K_idx[n,d]] * K_norm[n,d/G] + (sqrt(π/2)/d) * dot(S[d,:], qjl_sign[n,:])`
+
+Both compile from the same kernel via `enum Algo { MSE, PROD }` template parameter — no runtime branch.
+
+### What we don't get that vanilla FA3 has
+
+- TMA cannot stream bf16 K/V directly (we gather). Producer WG is doing real work, not just issuing TMA descriptors. This caps our speedup below vanilla FA3.
+- Can't reuse FA3's `CollectiveMainloopFwdSm90` template — it assumes contiguous K/V. We use CUTLASS pipeline + mbarrier primitives directly.
 
 ## Files
 

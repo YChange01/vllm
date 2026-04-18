@@ -21,6 +21,31 @@ rm -rf "${TURBOQUANT_CUDA_BUILD_DIR:-$HOME/.cache/torch_extensions/turboquant_cu
 export CUDA_VISIBLE_DEVICES="$GPU"
 export PYTHONPATH="$PWD:${PYTHONPATH:-}"
 
+# CUTLASS discovery. The extension builds FA3 path by default; point this at
+# a CUTLASS checkout (e.g. vllm's build/_deps/cutlass-src) or set
+# TURBOQUANT_BUILD_FA3=0 to fall back to WMMA-only build.
+: "${VLLM_CUTLASS_SRC_DIR:=}"
+if [[ -z "$VLLM_CUTLASS_SRC_DIR" ]]; then
+    for guess in \
+        "$PWD/build/_deps/cutlass-src" \
+        "$PWD/build"/cp*/_deps/cutlass-src \
+        "/usr/local/cutlass"; do
+        if [[ -f "$guess/include/cutlass/cutlass.h" ]]; then
+            export VLLM_CUTLASS_SRC_DIR="$guess"
+            break
+        fi
+    done
+fi
+echo "[temp] VLLM_CUTLASS_SRC_DIR=${VLLM_CUTLASS_SRC_DIR:-<unset>}"
+
+echo ""
+echo "=========================================================="
+echo "0) FA3 build probe (JIT compile with CUTLASS, verify version)"
+echo "=========================================================="
+TURBOQUANT_CUDA_VERBOSE=1 \
+    python3 test/test_fa3_build.py 2>&1 | tee "$LOG_DIR/fa3_build.log"
+
+echo ""
 echo "=========================================================="
 echo "1) CUDA kernel numerical check vs Triton TC"
 echo "   First run JIT-compiles the CUDA extension (~30-60s)."

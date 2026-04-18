@@ -42,6 +42,32 @@ _BUILD_DIR = Path(
 )
 
 
+def _discover_cutlass_include() -> str | None:
+    """Locate CUTLASS headers. Order: env var → vllm build tree → None."""
+    for var in ("VLLM_CUTLASS_SRC_DIR", "CUTLASS_DIR", "CUTLASS_SRC_DIR"):
+        root = os.environ.get(var)
+        if root and (Path(root) / "include" / "cutlass" / "cutlass.h").exists():
+            return str(Path(root) / "include")
+
+    try:
+        import vllm
+        vllm_root = Path(vllm.__file__).resolve().parent.parent
+    except ImportError:
+        return None
+
+    candidates = [
+        vllm_root / "build" / "_deps" / "cutlass-src" / "include",
+        vllm_root / ".." / "build" / "_deps" / "cutlass-src" / "include",
+    ]
+    candidates.extend(
+        vllm_root.glob("build/cp*/_deps/cutlass-src/include")
+    )
+    for c in candidates:
+        if (c / "cutlass" / "cutlass.h").exists():
+            return str(c.resolve())
+    return None
+
+
 def _load_extension():
     """JIT-compile and load the CUDA extension. Only run once per process."""
     from torch.utils.cpp_extension import load
@@ -54,10 +80,14 @@ def _load_extension():
         "--expt-relaxed-constexpr",
         "--expt-extended-lambda",
     ]
-    # Target current and recent GPU arches. If nvcc doesn't know sm_100,
-    # drop it. sm_80 (A100) and sm_90 (H100) cover most deployments.
-    arch_flags = os.environ.get("TURBOQUANT_CUDA_ARCH",
-                                "80;86;89;90;100").split(";")
+    # Hopper (sm_90a) and Blackwell (sm_100a) — the `a` suffix enables
+    # wgmma. Older arches drop to WMMA kernel only (no wgmma codegen).
+    arch_flags = os.environ.get(
+        "TURBOQUANT_CUDA_ARCH", "80;86;89;90a;100a"
+    ).split(";")
+    # wgmma requires the architecture-conditional suffix on BOTH the
+    # virtual (compute_XXa) and real (sm_XXa) arch — see
+    # cmake/utils.cmake's "compute_90a,code=sm_90a" pattern.
     for arch in arch_flags:
         arch = arch.strip()
         if not arch:
@@ -66,15 +96,32 @@ def _load_extension():
             f"-gencode=arch=compute_{arch},code=sm_{arch}",
         ]
 
+    sources = [
+        str(_CSRC_DIR / "binding.cpp"),
+        str(_CSRC_DIR / "attend_cuda.cu"),
+    ]
+
+    build_fa3 = os.environ.get("TURBOQUANT_BUILD_FA3", "1") == "1"
+    extra_include_paths: list[str] = []
+    if build_fa3:
+        cutlass_inc = _discover_cutlass_include()
+        if cutlass_inc is None:
+            raise RuntimeError(
+                "CUTLASS headers not found. Set VLLM_CUTLASS_SRC_DIR to the "
+                "CUTLASS checkout, or set TURBOQUANT_BUILD_FA3=0 to skip the "
+                "FA3 path (WMMA only)."
+            )
+        extra_include_paths.append(cutlass_inc)
+        extra_cuda_cflags += ["-DTURBOQUANT_HAS_FA3=1"]
+        sources.append(str(_CSRC_DIR / "attend_fa3.cu"))
+
     return load(
         name="turboquant_cuda",
-        sources=[
-            str(_CSRC_DIR / "binding.cpp"),
-            str(_CSRC_DIR / "attend_cuda.cu"),
-        ],
+        sources=sources,
         build_directory=str(_BUILD_DIR),
         extra_cflags=["-O3", "-std=c++17"],
         extra_cuda_cflags=extra_cuda_cflags,
+        extra_include_paths=extra_include_paths,
         verbose=os.environ.get("TURBOQUANT_CUDA_VERBOSE", "0") == "1",
     )
 
