@@ -33,16 +33,19 @@ namespace cuda {
 using namespace nvcuda::wmma;
 using bf16 = __nv_bfloat16;
 
-// --- Compile-time tile sizes (tuned for head_size=128, BLOCK_N=64) ---
+// --- Compile-time tile sizes ---
+// BLOCK_N = 32 keeps static shared memory under the 48 KB default limit
+// (total ~32 KB). We could reach 64 with dynamic shared memory +
+// cudaFuncSetAttribute(..., cudaFuncAttributeMaxDynamicSharedMemorySize)
+// up to 228 KB on sm_90+, but per-tile overhead is tiny so 32 is fine.
 constexpr int HEAD_SIZE = 128;
-constexpr int BLOCK_N   = 64;
+constexpr int BLOCK_N   = 32;
 constexpr int BLOCK_M_PAD = 16;             // WMMA min
 constexpr int WMMA_M    = 16;
 constexpr int WMMA_N    = 16;
 constexpr int WMMA_K    = 16;
 constexpr int K_CB_MAX  = 16;
 constexpr int THREADS   = 128;              // 4 warps
-constexpr int WARPS     = THREADS / 32;     // 4
 
 // ---------------------------------------------------------------------------
 // Dequant one KV tile into shared memory as bf16.
@@ -179,23 +182,23 @@ __global__ void attend_mse_tc_kernel(
         __syncthreads();
 
         // --- WMMA Q @ K.T -> scores_sh ---
-        // Each warp owns one (16x16) tile of scores:
-        //   warp w -> scores[0:16, 16*w : 16*(w+1)]
-        // M = BLOCK_M_PAD = 16, N = BLOCK_N = 64, K = HEAD_SIZE = 128.
-        {
+        // M = BLOCK_M_PAD = 16, N = BLOCK_N = 32, K = HEAD_SIZE = 128.
+        // Two 16x16 N-tiles total; warps 0 and 1 handle them. Warps 2/3
+        // are idle during QK (they come back to work for PV below).
+        if (warp_id < 2) {
             fragment<matrix_a, WMMA_M, WMMA_N, WMMA_K, bf16, row_major> a_frag;
             fragment<matrix_b, WMMA_M, WMMA_N, WMMA_K, bf16, col_major> b_frag;
             fragment<accumulator, WMMA_M, WMMA_N, WMMA_K, float> c_frag;
             fill_fragment(c_frag, 0.f);
 
-            const int n_start = warp_id * WMMA_N;   // 0, 16, 32, 48
+            const int n_start = warp_id * WMMA_N;   // 0, 16
             #pragma unroll
             for (int k_off = 0; k_off < HEAD_SIZE; k_off += WMMA_K) {
                 // A tile: Q_sh[0:16, k_off:k_off+16] row-major, ld=HEAD_SIZE.
                 load_matrix_sync(a_frag, &Q_sh[0][k_off], HEAD_SIZE);
-                // B tile (col-major): K_sh is (BLOCK_N, HEAD_SIZE) row-major;
-                // viewed as (HEAD_SIZE, BLOCK_N) col-major with ld=HEAD_SIZE
-                // the 16-col tile starts at offset (n_start * HEAD_SIZE + k_off).
+                // B tile (col-major): K_sh row-major (BLOCK_N, HEAD_SIZE)
+                // is bit-identical to K^T col-major (HEAD_SIZE, BLOCK_N)
+                // with leading dim = HEAD_SIZE.
                 load_matrix_sync(b_frag,
                                  &K_sh[n_start][k_off],
                                  HEAD_SIZE);
