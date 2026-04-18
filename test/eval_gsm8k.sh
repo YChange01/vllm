@@ -42,9 +42,14 @@ export HF_HUB_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
 N="${N:-100}"               # <=0 -> full test set (1319); lm_eval --limit
 NUM_FEWSHOT="${NUM_FEWSHOT:-5}"
-NUM_CONCURRENT="${NUM_CONCURRENT:-64}"
+# 5-shot gsm8k inputs are ~1.5-2K tokens each; too many concurrent requests
+# blow out vLLM's KV budget at gpu_memory_utilization=0.5 and the server
+# disconnects. 16 matches throughput.sh's working config.
+NUM_CONCURRENT="${NUM_CONCURRENT:-16}"
 GPU="${GPU:-3}"
 MAX_LEN="${MAX_LEN:-4096}"
+GPU_UTIL="${GPU_UTIL:-0.5}"
+MAX_NUM_SEQS="${MAX_NUM_SEQS:-32}"
 ALGO="${TURBOQUANT_ALGO:-mse}"
 STAGES="${STAGES:-FLASH_ATTN TURBOQUANT_TC TURBOQUANT_CUDA}"
 
@@ -121,7 +126,8 @@ run_stage() {
             --enforce-eager \
             --attention-backend "$backend" \
             --max-model-len "$MAX_LEN" \
-            --gpu-memory-utilization 0.3 \
+            --gpu-memory-utilization "$GPU_UTIL" \
+            --max-num-seqs "$MAX_NUM_SEQS" \
             >>"$srv_log" 2>&1 &
     else
         setsid vllm serve "$MODEL" \
@@ -129,7 +135,8 @@ run_stage() {
             --enforce-eager \
             --attention-backend "$backend" \
             --max-model-len "$MAX_LEN" \
-            --gpu-memory-utilization 0.3 \
+            --gpu-memory-utilization "$GPU_UTIL" \
+            --max-num-seqs "$MAX_NUM_SEQS" \
             >>"$srv_log" 2>&1 &
     fi
     CURRENT_PGID=$!
