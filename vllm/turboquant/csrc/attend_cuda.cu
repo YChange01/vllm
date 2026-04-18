@@ -5,25 +5,26 @@
 //
 // Pipeline (per thread block, one per (query_token, kv_head) pair):
 //   1. Load Q into shared memory; dequant 16-entry codebook
-//   2. For each KV tile of BLOCK_N=64 slots:
-//        a. Build paged slot addresses
-//        b. Dequant K idx (4-bit) + codebook gather + norm scale -> K_sh bf16
-//        c. WMMA: scores = Q_sh @ K_sh.T  (tensor core)
-//        d. Mask invalid slots; scale by 1/d
-//        e. Online softmax: row max -> alpha -> probs (bf16 P_sh); update l
+//   2. Prefetch raw K/V idx+norm for tile 0 via cp.async (stage 0)
+//   3. For each KV tile:
+//        a. Prefetch raw for tile t+1 into the other stage via cp.async
+//        b. Wait on tile t's async (keep t+1 in-flight)
+//        c. Dequant K from smem staging -> K_sh bf16
+//        d. WMMA: scores = Q_sh @ K_sh.T
+//        e. Mask + scale + online softmax -> P_sh, alpha, m, l
 //        f. Rescale acc_sh *= alpha
-//        g. Dequant V similarly -> V_sh bf16
-//        h. WMMA: acc_sh += P_sh @ V_sh  (tensor core)
-//   3. Normalize acc_sh / l_sh and write out (rotated V space).
+//        g. Dequant V from smem staging -> V_sh bf16
+//        h. WMMA: acc_sh += P_sh @ V_sh
+//   4. Normalize acc_sh / l_sh and write out (rotated V space).
 //
-// Uses nvcuda::wmma (mma.m16n8k16 family) for both matmuls. Requires sm_80+.
-// Hopper/Blackwell also execute this fine, but the big wgmma tiles and TMA
-// asynchronous loads are left for a follow-up PR.
+// Uses nvcuda::wmma (mma.m16n8k16) for matmuls, cp.async for overlapping
+// tile t+1's gmem load with tile t's compute. Requires sm_80+.
 //
 // Scope: mse path only. prod/QJL is a follow-up.
 
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
+#include <cuda_pipeline.h>
 #include <mma.h>
 #include <torch/extension.h>
 
@@ -34,10 +35,8 @@ using namespace nvcuda::wmma;
 using bf16 = __nv_bfloat16;
 
 // --- Compile-time tile sizes ---
-// BLOCK_N = 32 keeps static shared memory under the 48 KB default limit
-// (total ~32 KB). We could reach 64 with dynamic shared memory +
-// cudaFuncSetAttribute(..., cudaFuncAttributeMaxDynamicSharedMemorySize)
-// up to 228 KB on sm_90+, but per-tile overhead is tiny so 32 is fine.
+// BLOCK_N = 32 keeps static shared memory under the 48 KB default limit.
+// With cp.async double-buffer staging we sit at ~41 KB total smem.
 constexpr int HEAD_SIZE = 128;
 constexpr int BLOCK_N   = 32;
 constexpr int BLOCK_M_PAD = 16;             // WMMA min
@@ -46,22 +45,22 @@ constexpr int WMMA_N    = 16;
 constexpr int WMMA_K    = 16;
 constexpr int K_CB_MAX  = 16;
 constexpr int THREADS   = 128;              // 4 warps
+constexpr int IDX_BYTES = HEAD_SIZE / 2;    // 4-bit packed -> 64 bytes/slot
+constexpr int STAGES    = 2;                // cp.async double buffer
 
 // ---------------------------------------------------------------------------
-// Dequant one KV tile into shared memory as bf16.
+// Dequant one KV tile (raw idx+norm already staged in smem) into bf16 smem.
+// All sources are now smem; the gmem load happened asynchronously earlier.
 // ---------------------------------------------------------------------------
 __device__ __forceinline__
-void dequant_tile(
-    const uint8_t* __restrict__ idx_buf,
-    const int32_t* __restrict__ slot_base_sh,
-    const float*   __restrict__ norms_buf,
-    const int32_t* __restrict__ meta_sh,
+void dequant_tile_from_stage(
+    const uint8_t* __restrict__ idx_stg,    // smem: BLOCK_N * IDX_BYTES
+    const float*   __restrict__ norm_stg,   // smem: BLOCK_N floats
     const float*   __restrict__ codebook_sh,
     bf16* __restrict__ tile_sh,
     const int n_valid
 ) {
     const int tid = threadIdx.x;
-    // 64 * 128 = 8192 cells; 128 threads -> 64 cells/thread.
     #pragma unroll 8
     for (int cell = tid; cell < BLOCK_N * HEAD_SIZE; cell += THREADS) {
         const int n = cell / HEAD_SIZE;
@@ -70,12 +69,91 @@ void dequant_tile(
             tile_sh[n * HEAD_SIZE + d] = __float2bfloat16(0.f);
             continue;
         }
-        const int32_t slot_off = slot_base_sh[n] + (d >> 1);
-        const uint8_t packed = idx_buf[slot_off];
+        const uint8_t packed = idx_stg[n * IDX_BYTES + (d >> 1)];
         const int nib = (d & 1) ? ((packed >> 4) & 0xF) : (packed & 0xF);
         const float c = codebook_sh[nib];
-        const float nv = norms_buf[meta_sh[n]];
+        const float nv = norm_stg[n];
         tile_sh[n * HEAD_SIZE + d] = __float2bfloat16(c * nv);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Compute paged slot_base + meta arrays for one tile (gmem block_table read).
+// Fills slot_base_stg[stage] and meta_stg[stage] for slots [0, BLOCK_N).
+// Writes 0 for slots past n_valid (they won't be dequanted).
+// ---------------------------------------------------------------------------
+__device__ __forceinline__
+void compute_slot_meta(
+    const int32_t* __restrict__ block_table,
+    const int seq_idx,
+    const int kvh_idx,
+    const int kv_base,
+    const int kv_end,
+    const int block_size,
+    const int num_heads_kv,
+    const int idx_dim,
+    const int bt_stride,
+    int32_t* __restrict__ slot_base_stg_row,
+    int32_t* __restrict__ meta_stg_row
+) {
+    const int tid = threadIdx.x;
+    if (tid < BLOCK_N) {
+        const int pos = kv_base + tid;
+        if (pos < kv_end) {
+            const int blk = pos / block_size;
+            const int tok = pos % block_size;
+            const int phys = block_table[seq_idx * bt_stride + blk];
+            slot_base_stg_row[tid] =
+                ((phys * block_size + tok) * num_heads_kv + kvh_idx) * idx_dim;
+            meta_stg_row[tid] =
+                (phys * block_size + tok) * num_heads_kv + kvh_idx;
+        } else {
+            slot_base_stg_row[tid] = 0;
+            meta_stg_row[tid] = 0;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Issue cp.async loads of raw K/V idx + norm for one tile into smem stage.
+// Caller must __pipeline_commit() after. 128 threads each issue one 16-byte
+// cp.async for K idx, one for V idx; 32 threads also issue one 4-byte cp.async
+// for K norm and one for V norm.
+// ---------------------------------------------------------------------------
+__device__ __forceinline__
+void issue_prefetch(
+    const uint8_t* __restrict__ cache_k_idx_g,
+    const uint8_t* __restrict__ cache_v_idx_g,
+    const float*   __restrict__ cache_k_norm_g,
+    const float*   __restrict__ cache_v_norm_g,
+    const int32_t* __restrict__ slot_base_stg_row,  // smem, BLOCK_N
+    const int32_t* __restrict__ meta_stg_row,       // smem, BLOCK_N
+    uint8_t* __restrict__ k_idx_stg_row,            // smem, BLOCK_N*IDX_BYTES
+    uint8_t* __restrict__ v_idx_stg_row,
+    float*   __restrict__ k_norm_stg_row,           // smem, BLOCK_N
+    float*   __restrict__ v_norm_stg_row
+) {
+    const int tid = threadIdx.x;
+    // 32 slots × 64 bytes / 16-byte cp.async = 128 transfers, one per thread.
+    constexpr int COPIES_PER_IDX_TILE = BLOCK_N * IDX_BYTES / 16;
+    static_assert(COPIES_PER_IDX_TILE == THREADS,
+                  "expect 1 idx 16B cp.async per thread");
+    const int slot = tid / (IDX_BYTES / 16);
+    const int col16 = (tid % (IDX_BYTES / 16)) * 16;
+    const int32_t soff = slot_base_stg_row[slot] + col16;
+    __pipeline_memcpy_async(
+        &k_idx_stg_row[slot * IDX_BYTES + col16],
+        &cache_k_idx_g[soff], 16);
+    __pipeline_memcpy_async(
+        &v_idx_stg_row[slot * IDX_BYTES + col16],
+        &cache_v_idx_g[soff], 16);
+    if (tid < BLOCK_N) {
+        __pipeline_memcpy_async(
+            &k_norm_stg_row[tid],
+            &cache_k_norm_g[meta_stg_row[tid]], 4);
+        __pipeline_memcpy_async(
+            &v_norm_stg_row[tid],
+            &cache_v_norm_g[meta_stg_row[tid]], 4);
     }
 }
 
@@ -112,19 +190,26 @@ __global__ void attend_mse_tc_kernel(
     const int32_t seq_idx = seq_id_per_query[q_idx];
     const int32_t kv_end  = kv_end_per_query[q_idx];
 
-    // --- Shared memory (16-byte aligned for WMMA) ---
+    // --- Shared memory (16-byte aligned for WMMA / cp.async) ---
     __shared__ __align__(16) bf16  Q_sh    [BLOCK_M_PAD][HEAD_SIZE];       // (16, 128)
-    __shared__ __align__(16) bf16  K_sh    [BLOCK_N][HEAD_SIZE];           // (64, 128)
-    __shared__ __align__(16) bf16  V_sh    [BLOCK_N][HEAD_SIZE];           // (64, 128)
-    __shared__ __align__(16) bf16  P_sh    [BLOCK_M_PAD][BLOCK_N];         // (16, 64)
-    __shared__ float scores_sh[BLOCK_M_PAD][BLOCK_N];                      // (16, 64)
+    __shared__ __align__(16) bf16  K_sh    [BLOCK_N][HEAD_SIZE];           // (32, 128)
+    __shared__ __align__(16) bf16  V_sh    [BLOCK_N][HEAD_SIZE];           // (32, 128)
+    __shared__ __align__(16) bf16  P_sh    [BLOCK_M_PAD][BLOCK_N];         // (16, 32)
+    __shared__ float scores_sh[BLOCK_M_PAD][BLOCK_N];                      // (16, 32)
     __shared__ float codebook_sh[K_CB_MAX];
     __shared__ float m_sh   [BLOCK_M_PAD];
     __shared__ float l_sh   [BLOCK_M_PAD];
     __shared__ float alpha_sh[BLOCK_M_PAD];
     __shared__ float acc_sh [BLOCK_M_PAD][HEAD_SIZE];                      // (16, 128)
-    __shared__ int32_t slot_base_sh[BLOCK_N];
-    __shared__ int32_t meta_sh     [BLOCK_N];
+
+    // cp.async double-buffered raw staging. Tile t uses stage t & 1; tile t+1
+    // is loading into stage (t+1) & 1 concurrently with tile t's compute.
+    __shared__ __align__(16) uint8_t K_idx_stg [STAGES][BLOCK_N * IDX_BYTES];  // 2×2KB
+    __shared__ __align__(16) uint8_t V_idx_stg [STAGES][BLOCK_N * IDX_BYTES];  // 2×2KB
+    __shared__ __align__(16) float   K_norm_stg[STAGES][BLOCK_N];              // 2×128B
+    __shared__ __align__(16) float   V_norm_stg[STAGES][BLOCK_N];
+    __shared__ __align__(16) int32_t slot_base_stg[STAGES][BLOCK_N];           // 2×128B
+    __shared__ __align__(16) int32_t meta_stg     [STAGES][BLOCK_N];
 
     // --- Load codebook (tiny) ---
     if (tid < K_CB) codebook_sh[tid] = __bfloat162float(codebook[tid]);
@@ -155,30 +240,49 @@ __global__ void attend_mse_tc_kernel(
     // ========================= KV LOOP =========================
     const int num_tiles = (kv_end + BLOCK_N - 1) / BLOCK_N;
 
+    // --- Prefetch tile 0 into stage 0 ---
+    if (num_tiles > 0) {
+        compute_slot_meta(block_table, seq_idx, kvh_idx,
+                          /*kv_base=*/0, kv_end, block_size, num_heads_kv,
+                          idx_dim, bt_stride,
+                          slot_base_stg[0], meta_stg[0]);
+        __syncthreads();
+        issue_prefetch(cache_k_idx, cache_v_idx, cache_k_norm, cache_v_norm,
+                       slot_base_stg[0], meta_stg[0],
+                       K_idx_stg[0], V_idx_stg[0],
+                       K_norm_stg[0], V_norm_stg[0]);
+        __pipeline_commit();
+    }
+
     for (int tile = 0; tile < num_tiles; ++tile) {
         const int kv_base = tile * BLOCK_N;
         const int n_valid = min(BLOCK_N, kv_end - kv_base);
+        const int s       = tile & 1;
 
-        // --- Paged addresses ---
-        if (tid < BLOCK_N) {
-            const int n = tid;
-            if (n < n_valid) {
-                const int pos = kv_base + n;
-                const int blk = pos / block_size;
-                const int tok = pos % block_size;
-                const int phys = block_table[seq_idx * bt_stride + blk];
-                slot_base_sh[n] = ((phys * block_size + tok) * num_heads_kv + kvh_idx) * idx_dim;
-                meta_sh[n]      = (phys * block_size + tok) * num_heads_kv + kvh_idx;
-            } else {
-                slot_base_sh[n] = 0;
-                meta_sh[n]      = 0;
-            }
+        // --- Kick off tile t+1 prefetch into the other stage ---
+        const bool has_next = (tile + 1 < num_tiles);
+        if (has_next) {
+            const int next_s  = (tile + 1) & 1;
+            compute_slot_meta(block_table, seq_idx, kvh_idx,
+                              /*kv_base=*/(tile + 1) * BLOCK_N, kv_end,
+                              block_size, num_heads_kv, idx_dim, bt_stride,
+                              slot_base_stg[next_s], meta_stg[next_s]);
+            __syncthreads();
+            issue_prefetch(cache_k_idx, cache_v_idx,
+                           cache_k_norm, cache_v_norm,
+                           slot_base_stg[next_s], meta_stg[next_s],
+                           K_idx_stg[next_s], V_idx_stg[next_s],
+                           K_norm_stg[next_s], V_norm_stg[next_s]);
+            __pipeline_commit();
         }
+
+        // Wait for THIS tile's cp.async (keep next tile's in-flight if any).
+        __pipeline_wait_prior(has_next ? 1 : 0);
         __syncthreads();
 
-        // --- Dequant K ---
-        dequant_tile(cache_k_idx, slot_base_sh, cache_k_norm, meta_sh,
-                     codebook_sh, &K_sh[0][0], n_valid);
+        // --- Dequant K from smem stage ---
+        dequant_tile_from_stage(K_idx_stg[s], K_norm_stg[s],
+                                codebook_sh, &K_sh[0][0], n_valid);
         __syncthreads();
 
         // --- WMMA Q @ K.T -> scores_sh ---
@@ -251,9 +355,9 @@ __global__ void attend_mse_tc_kernel(
         }
         __syncthreads();
 
-        // --- Dequant V ---
-        dequant_tile(cache_v_idx, slot_base_sh, cache_v_norm, meta_sh,
-                     codebook_sh, &V_sh[0][0], n_valid);
+        // --- Dequant V from same smem stage ---
+        dequant_tile_from_stage(V_idx_stg[s], V_norm_stg[s],
+                                codebook_sh, &V_sh[0][0], n_valid);
         __syncthreads();
 
         // --- WMMA P @ V -> acc_sh (accumulate into existing) ---
@@ -337,6 +441,9 @@ void attend_mse_launch(
     TORCH_CHECK(K_CB <= K_CB_MAX, "K_CB too large");
     TORCH_CHECK(gqa_group <= BLOCK_M_PAD,
                 "gqa_group must be <= 16 (WMMA tile)");
+    TORCH_CHECK(idx_dim == IDX_BYTES,
+                "idx_dim must equal HEAD_SIZE/2 (4-bit nibble packing); "
+                "cp.async prefetch is hard-wired to 16-byte transfers");
 
     const float inv_d = 1.0f / static_cast<float>(head_size);
 
