@@ -16,16 +16,16 @@ export CUDA_VISIBLE_DEVICES="$GPU"
 export PYTHONPATH="$PWD:${PYTHONPATH:-}"
 
 echo "=========================================================="
-echo "1) CUDA kernel numerical check vs Triton base"
-echo "   First run JIT-compiles the extension (~30-60s)."
+echo "1) CUDA kernel numerical check vs Triton TC"
+echo "   First run JIT-compiles the CUDA extension (~30-60s)."
 echo "=========================================================="
 TURBOQUANT_CUDA_VERBOSE=1 \
-    python3 test/test_cuda_vs_triton.py 2>&1 | tee "$LOG_DIR/test_cuda_vs_triton.log"
+    python3 test/test_cuda_vs_tc.py 2>&1 | tee "$LOG_DIR/test_cuda_vs_tc.log"
 
 echo ""
 echo "=========================================================="
-echo "2) vLLM text-level agreement: FLASH vs Triton base vs CUDA"
-echo "   mse path only (CUDA stage 1 raises NotImplementedError on prod)"
+echo "2) vLLM text-level agreement: FLASH vs Triton TC vs CUDA"
+echo "   mse path only (CUDA raises NotImplementedError on prod)"
 echo "=========================================================="
 GPU="$GPU" TURBOQUANT_USE_CUDA=1 \
     bash test/baseline.sh 2>&1 | tee "$LOG_DIR/baseline_cuda.log"

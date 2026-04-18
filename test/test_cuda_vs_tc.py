@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""Numerical equivalence smoke test: CUDA attend vs Triton base attend.
+"""Numerical equivalence smoke test: CUDA attend vs Triton TC attend.
 
 Drives both kernels on the same quantized KV cache and query, compares
-outputs element-wise. Expected: ``max_abs_diff`` around bf16 precision
-(~1.6e-2), ``mean_rel_diff`` under 1%.
+outputs element-wise. TC is our current performance milestone; CUDA
+(WMMA) should produce matching values modulo bf16 rounding (~1.6e-2
+max_abs, <1% mean_rel).
 
-First run triggers the CUDA extension JIT compile (~30s on B200).
+First run triggers the CUDA extension JIT compile (~30-60 s on B200).
 """
 
 from __future__ import annotations
@@ -18,7 +19,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import torch
 
-from vllm.turboquant.attend import turboquant_paged_attention
+from vllm.turboquant.attend_tc import turboquant_paged_attention_tc
 from vllm.turboquant.attend_cuda import turboquant_paged_attention_cuda
 from vllm.turboquant.codebook import QuantState
 from vllm.turboquant.store import turboquant_store_kv, turboquant_store_v
@@ -81,18 +82,18 @@ def run_one(num_tokens: int, bits: int = 4, num_heads_q: int = 16,
         query_start_loc=query_start_loc, state=state,
     )
 
-    out_triton = turboquant_paged_attention(**common_kwargs)
+    out_tc = turboquant_paged_attention_tc(**common_kwargs)
     out_cuda = turboquant_paged_attention_cuda(**common_kwargs)
     torch.cuda.synchronize()
 
-    diff = (out_triton.float() - out_cuda.float()).abs()
-    base_abs = out_triton.float().abs().mean().clamp(min=1e-9)
+    diff = (out_tc.float() - out_cuda.float()).abs()
+    base_abs = out_tc.float().abs().mean().clamp(min=1e-9)
     return {
         "num_tokens": num_tokens,
         "max_abs_diff": float(diff.max().item()),
         "mean_abs_diff": float(diff.mean().item()),
         "mean_rel_diff": float((diff.mean() / base_abs).item()),
-        "triton_mean": float(out_triton.float().abs().mean().item()),
+        "tc_mean": float(out_tc.float().abs().mean().item()),
         "cuda_mean": float(out_cuda.float().abs().mean().item()),
     }
 
@@ -108,13 +109,13 @@ def main():
 
     print(f"# bits={args.bits} head_size={args.head_size} algo=mse")
     print(f"{'tokens':>7} {'max_abs':>12} {'mean_abs':>12} "
-          f"{'mean_rel':>10} {'triton':>10} {'cuda':>10}")
+          f"{'mean_rel':>10} {'tc':>10} {'cuda':>10}")
     for n in cases:
         r = run_one(num_tokens=n, bits=args.bits, head_size=args.head_size)
         print(f"{r['num_tokens']:>7} "
               f"{r['max_abs_diff']:>12.2e} {r['mean_abs_diff']:>12.2e} "
               f"{r['mean_rel_diff']:>10.4%} "
-              f"{r['triton_mean']:>10.4f} {r['cuda_mean']:>10.4f}")
+              f"{r['tc_mean']:>10.4f} {r['cuda_mean']:>10.4f}")
 
 
 if __name__ == "__main__":
