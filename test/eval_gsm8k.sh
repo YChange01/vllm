@@ -23,6 +23,17 @@
 set -u
 
 MODEL="${MODEL:-/mnt/nvme3n1/g00872988/models/Llama-3.1-8B-Instruct}"
+# Point at an offline HF datasets cache dir. B200 can't reach huggingface.co
+# from the compute mounts, so lm_eval must load gsm8k from local cache.
+GSM8K_DATA_DIR="${GSM8K_DATA_DIR:-/mnt/nvme3n1/g00872988/dataset}"
+if [[ -n "$GSM8K_DATA_DIR" && -d "$GSM8K_DATA_DIR" ]]; then
+    export HF_DATASETS_CACHE="$GSM8K_DATA_DIR"
+    export HF_HOME="$GSM8K_DATA_DIR"
+    export HF_DATASETS_OFFLINE=1
+    export HF_HUB_OFFLINE=1
+    export TRANSFORMERS_OFFLINE=1
+    echo "[gsm8k] offline HF datasets cache = $GSM8K_DATA_DIR"
+fi
 N="${N:-100}"               # <=0 -> full test set (1319); lm_eval --limit
 NUM_FEWSHOT="${NUM_FEWSHOT:-5}"
 NUM_CONCURRENT="${NUM_CONCURRENT:-64}"
