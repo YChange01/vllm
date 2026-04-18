@@ -337,17 +337,18 @@ def turboquant_paged_attention_lut(
     seq_id_per_query = seq_id_per_query_i64.to(torch.int32).contiguous()
     kv_end_per_query = kv_end_per_query_i64.to(torch.int32).contiguous()
 
-    # Pre-rotate Q in Python (fusing into kernel is a follow-up).
-    H_f = state.H.to(torch.float32)
-    signs_f = state.signs.to(torch.float32)
-    q_f = q.float()
-    q_rotated = (q_f * signs_f) @ H_f.T
-    q_rotated_k = q_rotated.to(q.dtype).contiguous()
+    # Pre-rotate Q in Python, in the query's native dtype so the matmul
+    # hits tensor cores (cuBLAS sgemm_f32 was dominating the prior
+    # profile). H is symmetric so H.T == H.
+    q_signed = q * state.signs                                       # bf16 elementwise
+    q_rotated_k = (
+        q_signed.reshape(-1, head_size) @ state.H
+    ).view(num_query_tokens, num_heads_q, head_size).contiguous()    # bf16
 
     if use_qjl:
-        S_f = state.S.to(torch.float32)
-        Sq = q_rotated @ S_f.T
-        Sq_k = Sq.to(q.dtype).contiguous()
+        Sq_k = (
+            q_rotated_k.reshape(-1, head_size) @ state.S.T
+        ).view(num_query_tokens, num_heads_q, head_size).contiguous()
     else:
         Sq_k = q_rotated_k
 
@@ -412,7 +413,11 @@ def turboquant_paged_attention_lut(
         GQA_GROUP=gqa_group,
     )
 
-    # Post-rotate V back to original space (Python for now).
-    out_f = out.float()
-    output_f = (out_f @ H_f.T) * signs_f / math.sqrt(float(head_size))
-    return output_f.to(out.dtype)
+    # Post-rotate V back to original space in bf16 (tensor core matmul).
+    # H symmetric so H.T == H. Do it in place in the query's dtype.
+    inv_sqrt_d = 1.0 / math.sqrt(float(head_size))
+    output = (
+        out.reshape(-1, head_size) @ state.H
+    ).view(num_query_tokens, num_heads_q, head_size)
+    output = output * state.signs * inv_sqrt_d
+    return output.contiguous()

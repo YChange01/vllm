@@ -262,17 +262,17 @@ def turboquant_paged_attention(
     seq_id_per_query = seq_id_per_query_i64.to(torch.int32).contiguous()
     kv_end_per_query = kv_end_per_query_i64.to(torch.int32).contiguous()
 
-    # Pre-rotate Q (and Sq for prod). H is symmetric, so H.T == H.
-    H_f = state.H.to(torch.float32)
-    signs_f = state.signs.to(torch.float32)
-    q_f = q.float()
-    q_rotated = (q_f * signs_f) @ H_f.T
-    q_rotated_k = q_rotated.to(q.dtype).contiguous()
+    # Pre-rotate Q (and Sq for prod) in native bf16/fp16 for tensor-core
+    # matmul. H is symmetric so H.T == H.
+    q_signed = q * state.signs
+    q_rotated_k = (
+        q_signed.reshape(-1, head_size) @ state.H
+    ).view(num_query_tokens, num_heads_q, head_size).contiguous()
 
     if use_qjl:
-        S_f = state.S.to(torch.float32)
-        Sq = q_rotated @ S_f.T
-        Sq_k = Sq.to(q.dtype).contiguous()
+        Sq_k = (
+            q_rotated_k.reshape(-1, head_size) @ state.S.T
+        ).view(num_query_tokens, num_heads_q, head_size).contiguous()
     else:
         # Unused when USE_QJL=False, but the kernel still needs a valid
         # pointer of the right dtype.
@@ -287,8 +287,13 @@ def turboquant_paged_attention(
     inv_d = 1.0 / float(head_size)
     qjl_coef = math.sqrt(math.pi / 2.0) / float(head_size)
 
-    actual_max_blocks = (int(seq_lens.max().item()) + block_size - 1) // block_size
+    # Use block_table.shape[1] as the outer loop bound. It is always >=
+    # the max-required number of blocks (block_table is pre-allocated
+    # large enough), and the kernel short-circuits per-block via
+    # ``if block_i < num_blocks_q`` so extra iterations cost nothing.
+    # This avoids a seq_lens.max().item() -> CPU sync per layer.
     block_table_stride = int(block_table.shape[1])
+    actual_max_blocks = block_table_stride
 
     qjl_dim = head_size // 8 if use_qjl else 1
     if use_qjl:
@@ -338,9 +343,11 @@ def turboquant_paged_attention(
         USE_4BIT_PACK=use_4bit_pack,
     )
 
-    # Post-rotate V back to original space:
-    #   output[d] = signs[d] * (H @ acc)[d] / sqrt(d)
-    #            = signs[d] * (acc @ H.T)[d] / sqrt(d)        (H symmetric)
-    out_f = out.float()
-    output_f = (out_f @ H_f.T) * signs_f / math.sqrt(float(head_size))
-    return output_f.to(out.dtype)
+    # Post-rotate V back to original space in native dtype (tensor core).
+    # H symmetric so H.T == H.
+    inv_sqrt_d = 1.0 / math.sqrt(float(head_size))
+    output = (
+        out.reshape(-1, head_size) @ state.H
+    ).view(num_query_tokens, num_heads_q, head_size)
+    output = output * state.signs * inv_sqrt_d
+    return output.contiguous()
