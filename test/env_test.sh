@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Environment diagnostic for turboquant-lut: versions + a tiny CUDA matmul.
+# Environment diagnostic for turboquant-* branches: versions + tiny CUDA matmul.
 # No vLLM / no turboquant kernels here -- if a stage below fails, the
 # problem is in the driver / torch / triton layer, not in our code.
 

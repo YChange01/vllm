@@ -7,7 +7,7 @@ import takes ~30 seconds on B200 while nvcc runs; subsequent imports
 hit the torch extension cache.
 
 This is Stage 1 of the CUDA-native attend kernel -- scalar fp32 matmul
-inside, so performance is NOT yet competitive with the Triton LUT
+inside, so performance is NOT yet competitive with the Triton TC
 kernel. Subsequent stages will add WMMA / wgmma tensor-core matmuls,
 warp specialization, and TMA loads.
 
@@ -133,7 +133,7 @@ def turboquant_paged_attention_cuda(
     kv_end_per_query = kv_end_per_query_i64.to(torch.int32).contiguous()
 
     # Pre-rotate Q in Python (bf16 tensor core via cuBLAS). Same as the
-    # LUT path -- fusing into the kernel is deferred.
+    # TC path -- fusing into the kernel is deferred.
     q_signed = q * state.signs
     q_rotated = (
         q_signed.reshape(-1, head_size) @ state.H

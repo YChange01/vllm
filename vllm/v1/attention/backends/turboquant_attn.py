@@ -52,7 +52,7 @@ from vllm.config import VllmConfig
 from vllm.config.cache import CacheDType
 from vllm.logger import init_logger
 from vllm.turboquant.attend import turboquant_paged_attention
-from vllm.turboquant.attend_lut import turboquant_paged_attention_lut
+from vllm.turboquant.attend_tc import turboquant_paged_attention_tc
 from vllm.turboquant.codebook import QuantState
 from vllm.turboquant.store import turboquant_store_kv, turboquant_store_v
 
@@ -87,11 +87,11 @@ logger = init_logger(__name__)
 
 TURBOQUANT_ALGO = os.environ.get("TURBOQUANT_ALGO", "prod").lower()
 TURBOQUANT_BITS = int(os.environ.get("TURBOQUANT_BITS", "4"))
-# Experimental LUT (Triton + tensor core) attend kernel. Toggle with
-# TURBOQUANT_USE_LUT=1.
-TURBOQUANT_USE_LUT = os.environ.get("TURBOQUANT_USE_LUT", "0") == "1"
-# Experimental raw-CUDA attend kernel (scalar fp32 baseline for now;
-# wmma/wgmma to come). Takes precedence over TURBOQUANT_USE_LUT when set.
+# Triton tensor-core attend kernel (tl.dot over BLOCK_N KV tiles, flash-
+# attention style). Toggle with TURBOQUANT_USE_TC=1.
+TURBOQUANT_USE_TC = os.environ.get("TURBOQUANT_USE_TC", "0") == "1"
+# Raw-CUDA attend kernel (WMMA tensor cores). Takes precedence over
+# TURBOQUANT_USE_TC when set.
 TURBOQUANT_USE_CUDA = os.environ.get("TURBOQUANT_USE_CUDA", "0") == "1"
 
 if TURBOQUANT_ALGO not in ("mse", "prod"):
@@ -99,18 +99,18 @@ if TURBOQUANT_ALGO not in ("mse", "prod"):
         f"TURBOQUANT_ALGO must be 'mse' or 'prod', got {TURBOQUANT_ALGO!r}"
     )
 # b=4 only on this branch. mse b=4 -> K_CB=16; prod b=4 -> K_CB=8.
-# Both satisfy K_CB <= 16 (4-bit nibble pack + LUT kernel).
+# Both satisfy K_CB <= 16 (4-bit nibble pack + TC kernel).
 _K_CB = 1 << (TURBOQUANT_BITS - 1 if TURBOQUANT_ALGO == "prod" else TURBOQUANT_BITS)
 if _K_CB > 16:
     raise ValueError(
-        f"turboquant-lut branch is b=4 only (K_CB <= 16); got "
+        f"turboquant-cuda branch is b=4 only (K_CB <= 16); got "
         f"algo={TURBOQUANT_ALGO} bits={TURBOQUANT_BITS} -> K_CB={_K_CB}. "
         f"Use TURBOQUANT_BITS=4 (mse) or TURBOQUANT_BITS=4/5 (prod)."
     )
 
 logger.info(
-    "TurboQuant backend: algo=%s bits=%d use_lut=%s use_cuda=%s",
-    TURBOQUANT_ALGO, TURBOQUANT_BITS, TURBOQUANT_USE_LUT, TURBOQUANT_USE_CUDA,
+    "TurboQuant backend: algo=%s bits=%d use_tc=%s use_cuda=%s",
+    TURBOQUANT_ALGO, TURBOQUANT_BITS, TURBOQUANT_USE_TC, TURBOQUANT_USE_CUDA,
 )
 
 
@@ -394,8 +394,8 @@ class TurboQuantAttentionImpl(AttentionImpl):
 
         if TURBOQUANT_USE_CUDA:
             attend_fn = _get_cuda_attend()
-        elif TURBOQUANT_USE_LUT:
-            attend_fn = turboquant_paged_attention_lut
+        elif TURBOQUANT_USE_TC:
+            attend_fn = turboquant_paged_attention_tc
         else:
             attend_fn = turboquant_paged_attention
         attn_out = attend_fn(

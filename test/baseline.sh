@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# Baseline comparison (turboquant-lut branch -- b=4 only).
+# Baseline comparison (turboquant-cuda branch -- b=4 only).
 #
 # Runs the same prompt through three configurations:
 #   1. FLASH_ATTN                   (fp reference)
-#   2. TURBOQUANT b=4 + LUT   (Triton tensor-core attend, TURBOQUANT_USE_LUT=1)
+#   2. TURBOQUANT b=4 + TC   (Triton tensor-core attend, TURBOQUANT_USE_TC=1)
 #   3. TURBOQUANT b=4 + CUDA  (raw-CUDA WMMA attend, TURBOQUANT_USE_CUDA=1)
 #
 # Each server is started with setsid so it has its own process group; at
@@ -38,7 +38,7 @@ LOG_DIR="$ROOT_DIR/logs/baseline_$TS"
 mkdir -p "$LOG_DIR"
 ln -sfn "$LOG_DIR" "$ROOT_DIR/logs/baseline_latest"
 FP_LOG="$LOG_DIR/fp_server.log"
-TQ_LUT_LOG="$LOG_DIR/tq_lut_server.log"
+TQ_TC_LOG="$LOG_DIR/tq_tc_server.log"
 TQ_CUDA_LOG="$LOG_DIR/tq_cuda_server.log"
 
 CURRENT_PGID=""
@@ -132,16 +132,16 @@ run_backend() {
 # ---- main ---------------------------------------------------------------
 export CUDA_VISIBLE_DEVICES="$GPU"
 echo "[baseline] model=$MODEL prompt='$PROMPT' max_tokens=$MAX_TOKENS gpu=$GPU"
-echo "[baseline] algo=$ALGO (bits=4, LUT branch)"
+echo "[baseline] algo=$ALGO (bits=4, TC branch)"
 echo "[baseline] logs dir: $LOG_DIR  (symlink: $ROOT_DIR/logs/baseline_latest)"
 
 FP_TEXT=""
-TQ_LUT_TEXT=""
+TQ_TC_TEXT=""
 TQ_CUDA_TEXT=""
 
 run_backend "FLASH_ATTN" "$FP_PORT" "$FP_LOG" FLASH_ATTN "" FP_TEXT
-run_backend "TURBOQUANT b=4 (LUT)" "$TQ_PORT" "$TQ_LUT_LOG" TURBOQUANT \
-    "TURBOQUANT_ALGO=$ALGO TURBOQUANT_BITS=4 TURBOQUANT_USE_LUT=1" TQ_LUT_TEXT
+run_backend "TURBOQUANT b=4 (TC)" "$TQ_PORT" "$TQ_TC_LOG" TURBOQUANT \
+    "TURBOQUANT_ALGO=$ALGO TURBOQUANT_BITS=4 TURBOQUANT_USE_TC=1" TQ_TC_TEXT
 run_backend "TURBOQUANT b=4 (CUDA)" "$TQ_PORT" "$TQ_CUDA_LOG" TURBOQUANT \
     "TURBOQUANT_ALGO=$ALGO TURBOQUANT_BITS=4 TURBOQUANT_USE_CUDA=1" TQ_CUDA_TEXT
 
@@ -151,7 +151,7 @@ echo "prompt:                    ${PROMPT}"
 echo "max_tokens:                ${MAX_TOKENS}  (temperature=0, greedy)"
 echo "algo:                      ${ALGO}"
 echo "FLASH_ATTN:                ${FP_TEXT}"
-echo "TURBOQUANT b=4 (LUT):      ${TQ_LUT_TEXT}"
+echo "TURBOQUANT b=4 (TC):      ${TQ_TC_TEXT}"
 echo "TURBOQUANT b=4 (CUDA):     ${TQ_CUDA_TEXT}"
 echo "=================================================================="
 echo "[baseline] done; all three servers have been stopped."

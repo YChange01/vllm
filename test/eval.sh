@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # NIAH (Needle-in-a-Haystack) eval across two backends:
 #   - FLASH_ATTN       (fp reference)
-#   - TURBOQUANT b=4   (LUT branch is b=4 only)
+#   - TURBOQUANT b=4   (this branch is b=4 only)
 #
 # Same prompt set, temperature=0, so any accuracy drop is attributable to the
 # quantization path. Each server is started via setsid in its own process

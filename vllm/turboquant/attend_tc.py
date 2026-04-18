@@ -285,7 +285,7 @@ def _tc_attend_kernel(
 # ---------------------------------------------------------------------------
 # Python wrapper
 # ---------------------------------------------------------------------------
-def turboquant_paged_attention_lut(
+def turboquant_paged_attention_tc(
     q: torch.Tensor,
     cache_k_idx: torch.Tensor,
     cache_k_norm: torch.Tensor,

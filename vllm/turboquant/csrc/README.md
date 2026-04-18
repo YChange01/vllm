@@ -32,11 +32,11 @@ vllm/turboquant/attend_cuda.py   - JIT loader + Python wrapper
 ## How it's wired
 
 Set `TURBOQUANT_USE_CUDA=1` at module import time. Backend's attend
-dispatch picks `turboquant_paged_attention_cuda` over the Triton LUT /
+dispatch picks `turboquant_paged_attention_cuda` over the Triton TC /
 base paths. First use triggers a one-time JIT compile of the CUDA
 extension (~30s on B200 with nvcc, cached thereafter).
 
-The precedence is CUDA > LUT > base, so CUDA overrides LUT if both env
+The precedence is CUDA > TC > base, so CUDA overrides TC if both env
 vars are set.
 
 ## Build (manual)
@@ -72,7 +72,7 @@ random Q/K/V. Expected: `max_abs_diff` around bf16 precision (~1.6e-2),
 
 * **No tensor core yet.** The kernel uses scalar fp32 multiply-adds.
   Expect it to be ~same speed as the Triton base kernel, slower than
-  the Triton LUT kernel. This is a correctness baseline; Stage 1.5 adds
+  the Triton TC kernel. This is a correctness baseline; Stage 1.5 adds
   WMMA and should leapfrog both.
 * **mse only.** prod/QJL is a `NotImplementedError` in the Python wrapper.
 * **head_size = 128 hardcoded.** Change `HEAD_SIZE` in `attend_cuda.cu`

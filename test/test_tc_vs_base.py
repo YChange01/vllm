@@ -1,21 +1,21 @@
 #!/usr/bin/env python3
-"""Numerical equivalence smoke test: turboquant_paged_attention vs _lut.
+"""Numerical equivalence smoke test: turboquant_paged_attention vs _tc.
 
 Drives both kernels on the same quantized KV cache and the same query,
 compares outputs element-wise. Expected:
 
   * ``max_abs_diff`` <= 1e-3 (fp32 accumulation order differs between
-    base and LUT-flash-decoding variants; online softmax is
+    base and TC-flash-decoding variants; online softmax is
     mathematically associative but fp rounding differs when the KV
     dimension is split across programs).
   * ``mean_rel_diff`` <= 1%.
 
-If diffs blow up beyond these, the LUT kernel drifted -- fix before
+If diffs blow up beyond these, the TC kernel drifted -- fix before
 benchmarking throughput.
 
 Usage::
-    python3 test/test_lut_vs_base.py
-    python3 test/test_lut_vs_base.py --algo prod --bits 4 --num-tokens 128
+    python3 test/test_tc_vs_base.py
+    python3 test/test_tc_vs_base.py --algo prod --bits 4 --num-tokens 128
 """
 
 from __future__ import annotations
@@ -29,7 +29,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import torch
 
 from vllm.turboquant.attend import turboquant_paged_attention
-from vllm.turboquant.attend_lut import turboquant_paged_attention_lut
+from vllm.turboquant.attend_tc import turboquant_paged_attention_tc
 from vllm.turboquant.codebook import QuantState
 from vllm.turboquant.store import turboquant_store_kv, turboquant_store_v
 
@@ -102,17 +102,17 @@ def run_one(algo: str, bits: int, num_tokens: int, num_heads_q: int,
         cache_k_qjl_sign=c_k_qjl, cache_k_rnorm=c_k_rnorm,
     )
     out_base = turboquant_paged_attention(**common_kwargs)
-    out_lut = turboquant_paged_attention_lut(**common_kwargs)
+    out_tc = turboquant_paged_attention_tc(**common_kwargs)
     torch.cuda.synchronize()
 
-    diff = (out_base.float() - out_lut.float()).abs()
+    diff = (out_base.float() - out_tc.float()).abs()
     base_abs = out_base.float().abs().mean().clamp(min=1e-9)
     return {
         "max_abs_diff": float(diff.max().item()),
         "mean_abs_diff": float(diff.mean().item()),
         "mean_rel_diff": float((diff.mean() / base_abs).item()),
         "out_base_mean": float(out_base.float().abs().mean().item()),
-        "out_lut_mean": float(out_lut.float().abs().mean().item()),
+        "out_tc_mean": float(out_tc.float().abs().mean().item()),
     }
 
 
@@ -134,7 +134,7 @@ def main():
           f"d={args.head_size} block_size={args.block_size} "
           f"bits={args.bits}")
     print(f"{'algo':<5} {'tokens':>7} {'max_abs':>12} {'mean_abs':>12} "
-          f"{'mean_rel':>10} {'base_mean':>11} {'lut_mean':>11}")
+          f"{'mean_rel':>10} {'base_mean':>11} {'tc_mean':>11}")
     for algo in algos:
         for n in cases:
             r = run_one(
@@ -147,7 +147,7 @@ def main():
             print(f"{algo:<5} {n:>7} "
                   f"{r['max_abs_diff']:>12.2e} {r['mean_abs_diff']:>12.2e} "
                   f"{r['mean_rel_diff']:>10.4%} "
-                  f"{r['out_base_mean']:>11.4f} {r['out_lut_mean']:>11.4f}")
+                  f"{r['out_base_mean']:>11.4f} {r['out_tc_mean']:>11.4f}")
 
 
 if __name__ == "__main__":

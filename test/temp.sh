@@ -32,12 +32,12 @@ GPU="$GPU" TURBOQUANT_USE_CUDA=1 \
 
 echo ""
 echo "=========================================================="
-echo "3) Throughput A/B: FLASH, Triton LUT, CUDA (WMMA)"
-echo "   FLASH_ATTN is the reference; LUT is the previous milestone"
+echo "3) Throughput A/B: FLASH, Triton TC, CUDA (WMMA)"
+echo "   FLASH_ATTN is the reference; TC is the previous milestone"
 echo "   (ITL ~44 ms); CUDA WMMA is the new contender."
 echo "=========================================================="
 GPU="$GPU" \
-    STAGES="FLASH_ATTN TURBOQUANT_mse_b4_lut TURBOQUANT_mse_b4_cuda" \
+    STAGES="FLASH_ATTN TURBOQUANT_mse_b4_tc TURBOQUANT_mse_b4_cuda" \
     bash test/throughput.sh 2>&1 | tee "$LOG_DIR/throughput.log" || true
 
 echo ""

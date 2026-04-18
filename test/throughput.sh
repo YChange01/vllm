@@ -4,9 +4,9 @@
 #   - FLASH_ATTN                (bf16 reference)
 #   - TURBOQUANT mse b=4        (base Triton attend kernel)
 #   - TURBOQUANT prod b=4       (base Triton attend kernel)
-# Opt-in LUT stages (add to STAGES=...):
-#   - TURBOQUANT_mse_b4_lut     (flash-decoding + LUT kernel)
-#   - TURBOQUANT_prod_b4_lut    (flash-decoding + LUT kernel)
+# Opt-in TC stages (add to STAGES=...):
+#   - TURBOQUANT_mse_b4_tc     (flash-decoding + TC kernel)
+#   - TURBOQUANT_prod_b4_tc    (flash-decoding + TC kernel)
 #
 # Uses the ``random`` dataset with fixed input/output lengths. Each backend
 # is served by its own setsid'd vllm process group; we ``kill -TERM -$PGID``
@@ -142,8 +142,8 @@ stage_args() {
         FLASH_ATTN)              echo "FLASH_ATTN  " ;;
         TURBOQUANT_mse_b4)       echo "TURBOQUANT  TURBOQUANT_ALGO=mse TURBOQUANT_BITS=4" ;;
         TURBOQUANT_prod_b4)      echo "TURBOQUANT  TURBOQUANT_ALGO=prod TURBOQUANT_BITS=4" ;;
-        TURBOQUANT_mse_b4_lut)   echo "TURBOQUANT  TURBOQUANT_ALGO=mse TURBOQUANT_BITS=4 TURBOQUANT_USE_LUT=1" ;;
-        TURBOQUANT_prod_b4_lut)  echo "TURBOQUANT  TURBOQUANT_ALGO=prod TURBOQUANT_BITS=4 TURBOQUANT_USE_LUT=1" ;;
+        TURBOQUANT_mse_b4_tc)   echo "TURBOQUANT  TURBOQUANT_ALGO=mse TURBOQUANT_BITS=4 TURBOQUANT_USE_TC=1" ;;
+        TURBOQUANT_prod_b4_tc)  echo "TURBOQUANT  TURBOQUANT_ALGO=prod TURBOQUANT_BITS=4 TURBOQUANT_USE_TC=1" ;;
         TURBOQUANT_mse_b4_cuda)  echo "TURBOQUANT  TURBOQUANT_ALGO=mse TURBOQUANT_BITS=4 TURBOQUANT_USE_CUDA=1" ;;
         *) echo "[bench] unknown stage tag: $1" >&2; return 1 ;;
     esac
