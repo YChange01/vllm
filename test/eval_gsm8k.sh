@@ -119,6 +119,8 @@ run_stage() {
         --model_args "$model_args" \
         --tasks gsm8k \
         --num_fewshot "$NUM_FEWSHOT" \
+        --apply_chat_template \
+        --fewshot_as_multiturn \
         $LIMIT_ARG \
         --output_path "$out_dir" \
         2>&1 | tee "$out_dir/stdout.log"
