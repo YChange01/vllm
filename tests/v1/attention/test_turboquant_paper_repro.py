@@ -188,6 +188,30 @@ def test_q_prod_inner_product_is_unbiased(d: int) -> None:
     )
 
 
+@pytest.mark.parametrize(
+    "bits,expected_pack_bits,expected_K_CB",
+    [
+        (2, 1, 2),    # prod main=1
+        (3, 2, 4),    # prod main=2
+        (4, 4, 8),    # prod main=3 (nibble, wastes 1 bit)
+        (5, 4, 16),   # prod main=4
+    ],
+)
+def test_variable_bit_width_packing(
+    bits: int, expected_pack_bits: int, expected_K_CB: int
+) -> None:
+    """Stage 2: QuantState exposes pack_bits consistent with main_bits."""
+    state = QuantState(
+        algo="prod", bits=bits, head_dim=128, seed=0,
+        dtype=torch.float32, device=torch.device("cpu"),
+    )
+    assert state.pack_bits == expected_pack_bits
+    assert state.codebook.shape[0] == expected_K_CB
+    # Sanity: codebook values are bounded within paper's [-1, 1] support.
+    assert state.codebook.min() > -1.01
+    assert state.codebook.max() < 1.01
+
+
 @pytest.mark.parametrize("d", [64, 128])
 def test_q_mse_reconstruction_bounded(d: int) -> None:
     """Paper Theorem 1: D_mse <= sqrt(3)*pi/2 * 1/4^b for unit-norm x."""

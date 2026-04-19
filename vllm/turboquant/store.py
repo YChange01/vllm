@@ -43,10 +43,10 @@ def _store_quant_kernel(
     rotated_ptr,            # (T, H_kv, d) bf16/fp16  unit-norm rotated input
     x_norm_ptr,             # (T, H_kv)    fp32       ||x|| per (tok, head)
     slot_mapping_ptr,       # (T,)         int64
-    cache_idx_ptr,          # (num_blocks, bs, H_kv, d/2) uint8
-    cache_norm_ptr,         # (num_blocks, bs, H_kv)      fp32
-    cache_qjl_sign_ptr,     # (num_blocks, bs, H_kv, d/8) uint8 prod only
-    cache_rnorm_ptr,        # (num_blocks, bs, H_kv)      fp32  prod only
+    cache_idx_ptr,          # (num_blocks, bs, H_kv, idx_dim) uint8
+    cache_norm_ptr,         # (num_blocks, bs, H_kv)          fp32
+    cache_qjl_sign_ptr,     # (num_blocks, bs, H_kv, d/8)     uint8 prod only
+    cache_rnorm_ptr,        # (num_blocks, bs, H_kv)          fp32  prod only
     boundaries_ptr,         # (K_CB - 1,) fp32
     codebook_ptr,           # (K_CB,)     fp32  (we cast inside)
     S_ptr,                  # (d, d)      bf16/fp16    prod only
@@ -56,9 +56,10 @@ def _store_quant_kernel(
     idx_dim,
     qjl_dim,
     BLOCK_D: tl.constexpr,           # next_pow2(head_size)
-    BLOCK_IDX_DIM: tl.constexpr,     # next_pow2(idx_dim), == BLOCK_D // 2
+    BLOCK_IDX_DIM: tl.constexpr,     # next_pow2(idx_dim)
     BLOCK_QJL_DIM: tl.constexpr,     # next_pow2(qjl_dim) or 1 when !USE_QJL
     K_CB: tl.constexpr,
+    PACK_BITS: tl.constexpr,         # 1, 2, 4, or 8
     USE_QJL: tl.constexpr,
 ):
     tok = tl.program_id(0)
@@ -86,10 +87,16 @@ def _store_quant_kernel(
         idx += (rot >= boundary).to(tl.int32)
     idx = tl.minimum(idx, K_CB - 1)
 
-    # --- 3) Pack 4-bit indices via mask-sum (two nibbles per byte) ---
-    d_byte_pos = d_idx // 2
-    d_nibble_shift = (d_idx % 2) * 4
-    idx_shifted = idx << d_nibble_shift
+    # --- 3) Pack PACK_BITS-bit indices into uint8 via mask-sum ---
+    # PACK_BITS in {1, 2, 4, 8} => N_PER_BYTE in {8, 4, 2, 1}.
+    # For a coord j landing in byte B=j // N_PER_BYTE at bit offset
+    # o=(j % N_PER_BYTE) * PACK_BITS, contrib = idx[j] << o; packed
+    # byte = sum of contribs from all j mapping to B (non-overlapping
+    # bits by construction so the sum equals the bitwise OR).
+    N_PER_BYTE: tl.constexpr = 8 // PACK_BITS
+    d_byte_pos = d_idx // N_PER_BYTE
+    d_bit_shift = (d_idx % N_PER_BYTE) * PACK_BITS
+    idx_shifted = idx << d_bit_shift
     pair_pos = tl.arange(0, BLOCK_IDX_DIM)
     pack_match = d_byte_pos[:, None] == pair_pos[None, :]
     pack_contrib = tl.where(pack_match, idx_shifted[:, None], 0)
@@ -200,10 +207,17 @@ def _rotate_and_store(
     codebook_f = state.codebook.to(torch.float32)
 
     K_CB = int(state.codebook.shape[0])
-    assert K_CB <= 16, (
-        f"Triton store kernel is b=4 only (K_CB<=16); got K_CB={K_CB}"
+    pack_bits = state.pack_bits
+    assert (d * pack_bits) % 8 == 0, (
+        f"head_dim * pack_bits must be byte-aligned; got "
+        f"head_dim={d} pack_bits={pack_bits}"
     )
+    expected_idx_dim = d * pack_bits // 8
     idx_dim = int(cache_idx.shape[-1])
+    assert idx_dim == expected_idx_dim, (
+        f"cache_idx last dim {idx_dim} != expected {expected_idx_dim} "
+        f"(head_dim={d}, pack_bits={pack_bits})"
+    )
     qjl_dim = int(cache_qjl_sign.shape[-1]) if use_qjl else 1
 
     BLOCK_D = triton.next_power_of_2(d)
@@ -235,6 +249,7 @@ def _rotate_and_store(
         BLOCK_IDX_DIM=BLOCK_IDX_DIM,
         BLOCK_QJL_DIM=BLOCK_QJL_DIM,
         K_CB=K_CB,
+        PACK_BITS=pack_bits,
         USE_QJL=use_qjl,
     )
 

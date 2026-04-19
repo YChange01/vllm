@@ -64,7 +64,7 @@ _AUTOTUNE_CONFIGS = [
 
 @triton.autotune(
     configs=_AUTOTUNE_CONFIGS,
-    key=["head_size", "K_CB", "USE_QJL", "BLOCK_M", "GQA_GROUP"],
+    key=["head_size", "K_CB", "PACK_BITS", "USE_QJL", "BLOCK_M", "GQA_GROUP"],
 )
 @triton.jit
 def _tc_attend_kernel(
@@ -99,6 +99,7 @@ def _tc_attend_kernel(
     BLOCK_N: tl.constexpr,          # autotuned KV-tile
     BLOCK_D: tl.constexpr,          # next_power_of_2(head_size)
     K_CB: tl.constexpr,
+    PACK_BITS: tl.constexpr,        # 1, 2, 4, or 8
     USE_QJL: tl.constexpr,
     GQA_GROUP: tl.constexpr,
 ):
@@ -141,9 +142,11 @@ def _tc_attend_kernel(
     if USE_QJL:
         acc_qjl = tl.zeros((BLOCK_M, BLOCK_D), dtype=tl.float32)
 
-    # 4-bit nibble-pack layout: two indices per byte.
-    d_pack = d_off // 2
-    is_high = (d_off % 2) == 1
+    # Variable-bit unpack layout. PACK_BITS in {1, 2, 4, 8}.
+    N_PER_BYTE: tl.constexpr = 8 // PACK_BITS
+    UNPACK_MASK: tl.constexpr = (1 << PACK_BITS) - 1
+    d_pack = d_off // N_PER_BYTE
+    d_bit_shift = (d_off % N_PER_BYTE) * PACK_BITS
 
     num_tiles = (kv_end + BLOCK_N - 1) // BLOCK_N
 
@@ -180,9 +183,9 @@ def _tc_attend_kernel(
             mask=mask_n[:, None] & mask_d[None, :],
             other=0,
         ).to(tl.uint8)
-        k_low = packed_k & 0xF
-        k_high = (packed_k >> 4) & 0xF
-        k_idx_full = tl.where(is_high[None, :], k_high, k_low).to(tl.int32)
+        k_idx_full = (
+            (packed_k.to(tl.int32) >> d_bit_shift[None, :]) & UNPACK_MASK
+        )
         k_tile = tl.load(codebook_ptr + k_idx_full)
 
         k_norm = tl.load(cache_k_norm_ptr + meta_addrs, mask=mask_n, other=0.0)
@@ -251,9 +254,9 @@ def _tc_attend_kernel(
             mask=mask_n[:, None] & mask_d[None, :],
             other=0,
         ).to(tl.uint8)
-        v_low = packed_v & 0xF
-        v_high = (packed_v >> 4) & 0xF
-        v_idx_full = tl.where(is_high[None, :], v_high, v_low).to(tl.int32)
+        v_idx_full = (
+            (packed_v.to(tl.int32) >> d_bit_shift[None, :]) & UNPACK_MASK
+        )
         v_tile = tl.load(codebook_ptr + v_idx_full)
 
         v_norm = tl.load(cache_v_norm_ptr + meta_addrs, mask=mask_n, other=0.0)
@@ -338,11 +341,11 @@ def turboquant_paged_attention_tc(
         assert cache_v_qjl_sign is not None and cache_v_rnorm is not None
 
     K_CB = int(state.codebook.shape[0])
-    assert K_CB <= 16, (
-        f"TC kernel is b=4 only (K_CB <= 16); got K_CB={K_CB}"
-    )
-    assert idx_dim == head_size // 2, (
-        f"cache_k_idx last dim {idx_dim} != head_size/2 -- b=4 only"
+    pack_bits = state.pack_bits
+    expected_idx_dim = head_size * pack_bits // 8
+    assert idx_dim == expected_idx_dim, (
+        f"cache_k_idx last dim {idx_dim} != head_size*pack_bits/8 = "
+        f"{expected_idx_dim} (head_size={head_size}, pack_bits={pack_bits})"
     )
     assert q.dtype in (torch.bfloat16, torch.float16), (
         f"TC kernel requires bf16 or fp16 queries for tensor-core dot; "
@@ -448,6 +451,7 @@ def turboquant_paged_attention_tc(
         BLOCK_M=BLOCK_M,
         BLOCK_D=BLOCK_D,
         K_CB=K_CB,
+        PACK_BITS=pack_bits,
         USE_QJL=use_qjl,
         GQA_GROUP=gqa_group,
     )

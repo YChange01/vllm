@@ -155,6 +155,12 @@ class QuantState:
         contiguously so downstream matmuls see a fresh layout.
     S : (d, d) tensor, prod only
         Independent iid-N(0, 1) QJL projection matrix (Definition 1).
+    pack_bits : int
+        Storage bits per coordinate for the Lloyd-Max idx. Always a
+        power of two >= main_bits so the kernel can read whole bytes:
+        main_bits=1 -> pack=1, =2 -> 2, =3 -> 4 (wastes 1 bit),
+        =4 -> 4, =5..8 -> 8. The wasted bits are unavoidable unless
+        we cross byte boundaries in the kernel.
     """
 
     def __init__(
@@ -177,6 +183,18 @@ class QuantState:
         self.bits = bits
         self.head_dim = head_dim
         self.main_bits = bits - 1 if algo == "prod" else bits
+        self.pack_bits = _pow2_ceil(self.main_bits)
+        if self.pack_bits not in (1, 2, 4, 8):
+            raise ValueError(
+                f"pack_bits must be 1, 2, 4, or 8; got {self.pack_bits} "
+                f"from main_bits={self.main_bits}"
+            )
+        if (head_dim * self.pack_bits) % 8 != 0:
+            raise ValueError(
+                f"head_dim * pack_bits must be divisible by 8 for "
+                f"byte-aligned storage; got head_dim={head_dim} "
+                f"pack_bits={self.pack_bits}"
+            )
 
         centroids = _lloyd_max_beta(self.main_bits, head_dim)
         self.codebook = torch.tensor(centroids, dtype=dtype, device=device)
@@ -194,3 +212,10 @@ class QuantState:
             )
         else:
             self.S = None
+
+
+def _pow2_ceil(n: int) -> int:
+    """Smallest power of two >= max(1, n)."""
+    if n <= 1:
+        return 1
+    return 1 << (n - 1).bit_length()

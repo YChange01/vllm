@@ -56,7 +56,7 @@ vllm/v1/attention/backends/
 | var | default | meaning |
 |---|---|---|
 | `TURBOQUANT_ALGO` | `prod` | `mse` (Algorithm 1) or `prod` (Algorithm 2) |
-| `TURBOQUANT_BITS` | `4`    | total bit budget per coord; `prod` requires >=2. This branch is b=4 only |
+| `TURBOQUANT_BITS` | `4`    | total bit budget per coord; `prod` in {2..5}, `mse` in {1..4} on this branch |
 | `TURBOQUANT_USE_CUDA` | `0` | rejected on this branch (pending CUDA kernel rewrite) |
 
 ## Test scripts
@@ -100,9 +100,11 @@ positional args of `test/baseline.sh`.
 
 ## Known limitations (paper-repro branch)
 
-- b=4 only. Stage 2 will lift this to b in {2, 3, 4, 5}.
-- No outlier channel splitting yet; paper's 2.5-bit / 3.5-bit modes
-  (Table 1) require per-head, per-layer outlier masks -- Stage 3.
+- Homogeneous bit width across channels. Paper's 2.5-bit / 3.5-bit
+  modes (Table 1) require per-head, per-layer outlier channel
+  splitting (Stage 3).
+- b in {2, 3, 4, 5} for prod; {1, 2, 3, 4} for mse. main_bits=5..8
+  (pack_bits=8) is not tuned on this branch.
 - CUDA WMMA kernel is disabled; only the Triton TC path is updated
   for paper-faithful scaling and the V-QJL accumulator split.
 - ALiBi, sliding window, and `logits_soft_cap` are not supported.

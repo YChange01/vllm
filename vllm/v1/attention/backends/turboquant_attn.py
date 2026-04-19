@@ -83,15 +83,17 @@ if TURBOQUANT_ALGO not in ("mse", "prod"):
     raise ValueError(
         f"TURBOQUANT_ALGO must be 'mse' or 'prod', got {TURBOQUANT_ALGO!r}"
     )
-# b=4 only on this branch (K_CB <= 16 for 4-bit nibble pack).
-_K_CB = 1 << (
+_MAIN_BITS = (
     TURBOQUANT_BITS - 1 if TURBOQUANT_ALGO == "prod" else TURBOQUANT_BITS
 )
-if _K_CB > 16:
+# Triton kernel supports PACK_BITS in {1, 2, 4, 8}. main_bits in {1..4}
+# keep pack_bits<=4 on this branch -- main_bits>=5 would need byte-wide
+# storage (pack_bits=8) plus corresponding autotune re-tuning.
+if _MAIN_BITS < 1 or _MAIN_BITS > 4:
     raise ValueError(
-        f"turboquant-paper-repro branch is b=4 only on first pass "
-        f"(K_CB <= 16); got algo={TURBOQUANT_ALGO} bits={TURBOQUANT_BITS} "
-        f"-> K_CB={_K_CB}. Use TURBOQUANT_BITS=4."
+        f"turboquant-paper-repro branch supports bits in {{1..5}} "
+        f"(main_bits {{1..4}}); got algo={TURBOQUANT_ALGO} "
+        f"bits={TURBOQUANT_BITS} -> main_bits={_MAIN_BITS}."
     )
 if TURBOQUANT_USE_CUDA:
     raise ValueError(
@@ -282,14 +284,14 @@ class TurboQuantAttentionImpl(AttentionImpl):
         block_size = kv_cache.shape[2]
         device = kv_cache.device
 
-        K_CB = 1 << (
-            TURBOQUANT_BITS - 1
-            if TURBOQUANT_ALGO == "prod"
-            else TURBOQUANT_BITS
+        # pack_bits only depends on main_bits; compute it directly so
+        # buffer allocation does not depend on the (possibly bf16)
+        # QuantState instance.
+        main_bits = _MAIN_BITS
+        pack_bits = 1 if main_bits == 1 else (
+            2 if main_bits == 2 else 4
         )
-        idx_last_dim = (
-            self.head_size // 2 if K_CB <= 16 else self.head_size
-        )
+        idx_last_dim = self.head_size * pack_bits // 8
 
         shape_idx = (num_blocks, block_size, self.num_kv_heads, idx_last_dim)
         shape_meta = (num_blocks, block_size, self.num_kv_heads)
