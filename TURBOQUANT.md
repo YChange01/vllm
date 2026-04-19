@@ -62,6 +62,31 @@ vllm/v1/attention/backends/
 | `TURBOQUANT_BITS_OUTLIER` | `TURBOQUANT_BITS` | bit budget for outlier slice when split mode is on |
 | `TURBOQUANT_BITS_REGULAR` | `TURBOQUANT_BITS` | bit budget for regular slice when split mode is on |
 
+## Preflight parity check
+
+Before running NIAH or LongBench, verify the Triton kernel matches the
+pure-PyTorch reference (catches any kernel regression in under a minute):
+
+```bash
+python3 test/test_kernel_vs_reference.py
+```
+
+Expected output (bf16 noise is ~1.5e-2):
+
+```
+  homog b=4: max_abs_diff=0.005  cos_sim=0.99995
+  homog b=2: max_abs_diff=0.012  cos_sim=0.99990
+  homog b=5: max_abs_diff=0.004  cos_sim=0.99998
+  split 3.5-bit (64@4 + 64@3) no outliers: ...
+  split 2.5-bit (32@4 + 96@2) w/ outliers: ...
+  split high-precision (32@5 + 96@4): ...
+
+All parity checks PASSED.
+```
+
+If any check fails, inspect ``vllm/turboquant/reference.py`` as the
+algorithm ground truth and diff against the Triton kernel.
+
 ## Test scripts
 
 ```
