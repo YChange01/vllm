@@ -2,35 +2,32 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Triton-backed K/V quantization store for TurboQuant.
 
-Pipeline per store call (one Triton kernel per ``(token, kv_head)``
-program, one extra cuBLAS matmul for the Hadamard rotation):
+Paper-faithful reading of Algorithm 1 / Algorithm 2 in
+arXiv:2504.19874:
 
-    Python (per call):
-        1. norm   = ||x||                 # fp32 reduction
-        2. scaled = x * (sqrt(d) / norm)  # bf16 elementwise
-        3. signed = scaled * signs        # bf16 elementwise
-        4. rotated = signed @ H           # bf16 matmul (tensor core)
-    Triton (one program per (token, kv_head)):
-        5. searchsorted rotated through Lloyd-Max boundaries -> idx
-        6. 4-bit nibble-pack idx and write cache_idx at paged slot
-        7. write cache_norm (fp32) at meta slot
-        8. (prod only) residual r = rotated - codebook[idx]; r_norm;
-           qjl_raw = S @ r_unit; qjl_bit = (qjl_raw < 0); bit-pack 8
-           signs/byte and write cache_qjl_sign + cache_k_rnorm.
+    y        = Pi @ (x / ||x||)          # unit-norm rotated vector
+    idx_j    = argmin_k |y_j - c_k|      # Lloyd-Max per coord
+    r        = y - codebook[idx]         # residual in rotated space
+    qjl_sign = sign(S @ (r / ||r||))     # 1-bit QJL of unit residual
 
-This replaces the previous pure-PyTorch path that launched ~11 kernels
-per store call and did a fp32 SIMT SGEMM for the Hadamard. Concretely,
-the old version spent ~3-4 ms/step in a ``slot_mapping >= 0`` nonzero/
-select filter that was never needed for decode (slot_mapping has no
-padding at decode). The Triton kernel uses ``if slot < 0: return``
-per-program instead, with no CPU-sync roundtrip.
+We store (idx, ||x||, qjl_sign, ||r||) per (token, kv_head); dequant
+reconstructs y_approx = codebook[idx] + (sqrt(pi/2)/d) * ||r|| * S^T @ qjl
+in rotated-unit-sphere space, then multiplies by ||x|| to recover the
+original-scale vector after applying Pi^T.
 
-Scope: b=4 only. ``K_CB`` must be <= 16 (4-bit nibble packing).
+Both K and V follow the same quantizer (Q_mse or Q_prod) determined
+by ``state.algo``; the paper does not separate K and V treatment.
+
+The Python wrapper performs the rotation (bf16 matmul -> tensor core)
+and unit-norm scaling; the Triton kernel does the scalar quantizer,
+nibble/bit packing, and the per-slot paged scatter.
+
+Scope: b=4 only in this first cut (K_CB <= 16, nibble-packed idx).
+Stage 2 will add variable bit-widths.
 """
 
 from __future__ import annotations
 
-import math
 from typing import TYPE_CHECKING
 
 import torch
@@ -43,15 +40,15 @@ if TYPE_CHECKING:
 
 @triton.jit
 def _store_quant_kernel(
-    rotated_ptr,            # (T, H_kv, d) bf16/fp16   Hadamard-rotated input
-    x_norm_ptr,             # (T, H_kv)    fp32        ||x|| per (tok, head)
+    rotated_ptr,            # (T, H_kv, d) bf16/fp16  unit-norm rotated input
+    x_norm_ptr,             # (T, H_kv)    fp32       ||x|| per (tok, head)
     slot_mapping_ptr,       # (T,)         int64
     cache_idx_ptr,          # (num_blocks, bs, H_kv, d/2) uint8
     cache_norm_ptr,         # (num_blocks, bs, H_kv)      fp32
     cache_qjl_sign_ptr,     # (num_blocks, bs, H_kv, d/8) uint8 prod only
     cache_rnorm_ptr,        # (num_blocks, bs, H_kv)      fp32  prod only
     boundaries_ptr,         # (K_CB - 1,) fp32
-    codebook_ptr,           # (K_CB,)     fp32 or bf16 (we cast inside)
+    codebook_ptr,           # (K_CB,)     fp32  (we cast inside)
     S_ptr,                  # (d, d)      bf16/fp16    prod only
     block_size,
     num_heads_kv,
@@ -77,22 +74,19 @@ def _store_quant_kernel(
     d_idx = tl.arange(0, BLOCK_D)
     mask_d = d_idx < head_size
 
-    # --- 1) Load rotated value, promote to fp32 for comparisons ---
+    # --- 1) Load rotated value (unit-norm), promote to fp32 ---
     rot_base = (tok * num_heads_kv + kvh) * head_size
     rot_ct = tl.load(rotated_ptr + rot_base + d_idx, mask=mask_d, other=0.0)
     rot = rot_ct.to(tl.float32)
 
-    # --- 2) Searchsorted via K_CB-1 branchless comparisons ---
+    # --- 2) Scalar Lloyd-Max: searchsorted against K_CB-1 boundaries ---
     idx = tl.zeros((BLOCK_D,), dtype=tl.int32)
     for c in tl.static_range(0, K_CB - 1):
         boundary = tl.load(boundaries_ptr + c)
         idx += (rot >= boundary).to(tl.int32)
     idx = tl.minimum(idx, K_CB - 1)
 
-    # --- 3) Pack 4-bit indices via mask-sum: two 4-bit idx per byte ---
-    # Contribution of d_idx -> byte (d // 2), nibble (d % 2):
-    #   contrib[d] = idx[d] << (4 * (d % 2))
-    #   packed[p]  = sum_{d : d//2 == p} contrib[d]
+    # --- 3) Pack 4-bit indices via mask-sum (two nibbles per byte) ---
     d_byte_pos = d_idx // 2
     d_nibble_shift = (d_idx % 2) * 4
     idx_shifted = idx << d_nibble_shift
@@ -118,9 +112,8 @@ def _store_quant_kernel(
     )
     tl.store(cache_norm_ptr + meta_out, norm_val)
 
-    # --- 5) Prod path: QJL on residual ---
+    # --- 5) Prod path: QJL on residual r = rot - codebook[idx] ---
     if USE_QJL:
-        # r = rotated - codebook[idx]    (fp32)
         rk = tl.load(codebook_ptr + idx).to(tl.float32)
         r = rot - rk
 
@@ -131,8 +124,7 @@ def _store_quant_kernel(
 
         tl.store(cache_rnorm_ptr + meta_out, r_norm)
 
-        # qjl_raw = S @ r_unit (d-dim matvec).
-        # Load S tile (BLOCK_D, BLOCK_D) and broadcast-multiply-sum.
+        # qjl_raw = S @ r_unit (d-dim matvec, on-chip fp32).
         S_tile = tl.load(
             S_ptr + d_idx[:, None] * head_size + d_idx[None, :],
             mask=mask_d[:, None] & mask_d[None, :],
@@ -173,30 +165,37 @@ def _rotate_and_store(
     block_size: int,
     use_qjl: bool,
 ) -> None:
-    """Common core for K and V: Hadamard rotate (Python) + Triton store."""
+    """Paper-faithful quant store for one tensor (K or V).
+
+    Steps:
+      1. norm   = ||x||                 # fp32 reduction
+      2. scaled = x / norm              # unit-sphere rescale, bf16
+      3. rotated = scaled @ Pi          # bf16 matmul (tensor core)
+      4. Triton kernel: searchsorted -> idx, pack, store; and (prod)
+         residual -> QJL sign-pack.
+    """
     if new_x.shape[0] == 0:
         return
     T, H_kv, d = new_x.shape
     device = new_x.device
     dtype = new_x.dtype
 
-    # ||x||: use fp32 for the reduction (Hadamard-invariant, so we
-    # read from the original x).
-    x_norm = new_x.float().pow(2).sum(dim=-1).clamp_min(1e-12).sqrt()
-    # ``clamp_min(1e-6)`` on the norm itself rather than on the squared
-    # sum preserves the eps semantics from the previous implementation.
-    x_norm = x_norm.clamp_min(1e-6)  # (T, H_kv) fp32
+    # ||x|| in fp32 for numerical stability. clamp_min matches the
+    # previous implementation's eps handling and guards against zero
+    # V rows at the prefill boundary.
+    x_norm = (
+        new_x.float().pow(2).sum(dim=-1).clamp_min(1e-12).sqrt().clamp_min(1e-6)
+    )  # (T, H_kv)
 
-    # Scale + signs + Hadamard: bf16 matmul -> tensor core.
-    scale = (math.sqrt(float(d)) / x_norm).to(dtype)               # (T, H_kv)
-    x_scaled = new_x * scale.unsqueeze(-1)                         # bf16
-    x_signed = x_scaled * state.signs                              # bf16
-    # H is symmetric so H.T == H; one matmul.
+    # Unit-sphere rescale + random orthogonal rotation. Pi is not
+    # symmetric, unlike the old Hadamard path; we always multiply on
+    # the right here.
+    inv_norm = (1.0 / x_norm).to(dtype)                            # (T, H_kv)
+    x_scaled = new_x * inv_norm.unsqueeze(-1)                      # bf16 unit norm
     rotated = (
-        x_signed.reshape(T * H_kv, d) @ state.H
-    ).view(T, H_kv, d).contiguous()                                # bf16
+        x_scaled.reshape(T * H_kv, d) @ state.Pi
+    ).view(T, H_kv, d).contiguous()                                # bf16 on S^{d-1}
 
-    # Boundaries stay fp32 (they are tiny and used directly by searchsorted).
     boundaries_f = state.boundaries.to(torch.float32)
     codebook_f = state.codebook.to(torch.float32)
 
@@ -211,11 +210,9 @@ def _rotate_and_store(
     BLOCK_IDX_DIM = triton.next_power_of_2(idx_dim)
     BLOCK_QJL_DIM = triton.next_power_of_2(qjl_dim) if use_qjl else 1
 
-    # Dummy pointers for the USE_QJL=False case; the kernel never
-    # dereferences them (constexpr-guarded branch).
     qjl_sign_buf = cache_qjl_sign if use_qjl else cache_idx
     rnorm_buf = cache_rnorm if use_qjl else cache_norm
-    S_buf = state.S if use_qjl else state.H  # any same-dtype tensor works
+    S_buf = state.S if use_qjl else state.Pi  # any same-dtype tensor works
 
     grid = (T, H_kv)
     _store_quant_kernel[grid](
@@ -252,7 +249,7 @@ def turboquant_store_kv(
     cache_k_qjl_sign: torch.Tensor | None = None,
     cache_k_rnorm: torch.Tensor | None = None,
 ) -> None:
-    """Quantize K into the paged caches via a single Triton kernel."""
+    """Quantize K into the paged caches via the shared store kernel."""
     use_qjl = state.algo == "prod"
     if use_qjl:
         assert cache_k_qjl_sign is not None and cache_k_rnorm is not None, (
@@ -278,16 +275,25 @@ def turboquant_store_v(
     slot_mapping: torch.Tensor,
     state: "QuantState",
     block_size: int,
+    cache_v_qjl_sign: torch.Tensor | None = None,
+    cache_v_rnorm: torch.Tensor | None = None,
 ) -> None:
-    """Quantize V via Q_mse only (no QJL). Same kernel, USE_QJL=False."""
+    """Quantize V with the same quantizer as K (paper Section 4.2 applies
+    TurboQuant uniformly to the KV cache). prod mode stores (idx, norm,
+    qjl_sign, r_norm) just like K."""
+    use_qjl = state.algo == "prod"
+    if use_qjl:
+        assert cache_v_qjl_sign is not None and cache_v_rnorm is not None, (
+            "prod requires cache_v_qjl_sign and cache_v_rnorm"
+        )
     _rotate_and_store(
         new_v,
         cache_v_idx,
         cache_v_norm,
-        None,
-        None,
+        cache_v_qjl_sign,
+        cache_v_rnorm,
         slot_mapping,
         state,
         block_size,
-        use_qjl=False,
+        use_qjl=use_qjl,
     )

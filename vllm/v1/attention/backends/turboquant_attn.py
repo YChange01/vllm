@@ -1,35 +1,31 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""TurboQuant attention backend (paper arXiv:2504.19874).
+"""TurboQuant attention backend (paper arXiv:2504.19874, paper-faithful).
 
-Quantizes K (Lloyd-Max + Hadamard, optionally with 1-bit QJL on the
-residual) and stores V raw. Each attention layer owns its own
-``QuantState`` so every layer has a distinct random rotation.
+Quantizes both K and V with the same Q_mse or Q_prod algorithm. The
+paper applies TurboQuant uniformly to the KV cache (Section 4.2 / 4.3)
+and does not separate K and V treatment, so each layer owns one
+``QuantState`` (shared Pi, codebook, and QJL projection S for both K
+and V).
 
 Environment variables
 ---------------------
 ``TURBOQUANT_ALGO`` : ``"mse" | "prod"``  (default ``"prod"``)
     ``mse`` -> Algorithm 1 (b-bit Lloyd-Max).
     ``prod`` -> Algorithm 2 (b-1 bits Lloyd-Max + 1-bit QJL residual).
-``TURBOQUANT_BITS`` : int  (default 8; ``prod`` requires >=2)
+``TURBOQUANT_BITS`` : int  (default 4; ``prod`` requires >=2)
 
 Storage layout per layer (allocated lazily on first forward):
 
     _k_idx       : (num_blocks, bs, H_kv, idx_d)  uint8  K Lloyd-Max bucket
-                   idx_d = d // 2 when K_CB <= 16 (4-bit nibble pack), else d
+                   idx_d = d // 2 when K_CB <= 16 (4-bit nibble pack)
     _k_norm      : (num_blocks, bs, H_kv)         fp32   ||k||
     _v_idx       : (num_blocks, bs, H_kv, idx_d)  uint8  V Lloyd-Max bucket
     _v_norm      : (num_blocks, bs, H_kv)         fp32   ||v||
-    _k_qjl_sign  : (num_blocks, bs, H_kv, d/8)    uint8  K QJL 1-bit sign
-                                                         (prod only, 8 signs/byte)
-    _k_rnorm     : (num_blocks, bs, H_kv)         fp32   K residual ||r||
-                                                         (prod only)
-
-V is quantized via Q_mse only (no QJL on V). K and V share the same
-``QuantState`` (H, signs, codebook). V reconstruction in the attend
-kernel is done in rotated/sqrt(d)-normalized space; the inverse
-Hadamard + signs + 1/sqrt(d) is applied once per (query, head) in the
-attend wrapper, not per attended KV slot.
+    _k_qjl_sign  : (num_blocks, bs, H_kv, d/8)    uint8  K QJL 1-bit sign  (prod)
+    _k_rnorm     : (num_blocks, bs, H_kv)         fp32   ||r_k||           (prod)
+    _v_qjl_sign  : (num_blocks, bs, H_kv, d/8)    uint8  V QJL 1-bit sign  (prod)
+    _v_rnorm     : (num_blocks, bs, H_kv)         fp32   ||r_v||           (prod)
 
 vLLM integration
 ----------------
@@ -38,6 +34,13 @@ buffers (not vLLM's native ``kv_cache``). The async scheduler's fast
 path writes to ``kv_cache`` but skips ``unified_kv_cache_update`` on
 some decode steps; with the flag set, ``forward()`` always receives
 ``key`` / ``value`` and we store them ourselves -- no missed writes.
+
+Attend kernel selection
+-----------------------
+This branch ships the Triton tensor-core attend only. The CUDA WMMA
+path (``attend_cuda.cu``) does not yet implement the V-QJL accumulator
+split needed for paper-faithful Q_prod on V, so ``TURBOQUANT_USE_CUDA=1``
+is rejected when ``TURBOQUANT_ALGO=prod``.
 """
 
 from __future__ import annotations
@@ -67,41 +70,45 @@ from vllm.v1.attention.backend import (
 from vllm.v1.attention.backends.utils import set_kv_cache_layout
 from vllm.v1.kv_cache_interface import AttentionSpec
 
-# Force NHD so cache offset math matches the paged allocation.
+# NHD so cache offset math matches the paged allocation.
 set_kv_cache_layout("NHD")
 
 logger = init_logger(__name__)
 
 TURBOQUANT_ALGO = os.environ.get("TURBOQUANT_ALGO", "prod").lower()
 TURBOQUANT_BITS = int(os.environ.get("TURBOQUANT_BITS", "4"))
-# Attend kernel selection:
-#   default              -> Triton tensor-core (attend_tc.py, tl.dot over
-#                           BLOCK_N KV tiles)
-#   TURBOQUANT_USE_CUDA=1 -> raw CUDA / WMMA kernel (attend_cuda.cu)
 TURBOQUANT_USE_CUDA = os.environ.get("TURBOQUANT_USE_CUDA", "0") == "1"
 
 if TURBOQUANT_ALGO not in ("mse", "prod"):
     raise ValueError(
         f"TURBOQUANT_ALGO must be 'mse' or 'prod', got {TURBOQUANT_ALGO!r}"
     )
-# b=4 only on this branch. mse b=4 -> K_CB=16; prod b=4 -> K_CB=8.
-# Both satisfy K_CB <= 16 (4-bit nibble pack + tensor-core kernel).
-_K_CB = 1 << (TURBOQUANT_BITS - 1 if TURBOQUANT_ALGO == "prod" else TURBOQUANT_BITS)
+# b=4 only on this branch (K_CB <= 16 for 4-bit nibble pack).
+_K_CB = 1 << (
+    TURBOQUANT_BITS - 1 if TURBOQUANT_ALGO == "prod" else TURBOQUANT_BITS
+)
 if _K_CB > 16:
     raise ValueError(
-        f"turboquant-cuda branch is b=4 only (K_CB <= 16); got "
-        f"algo={TURBOQUANT_ALGO} bits={TURBOQUANT_BITS} -> K_CB={_K_CB}. "
-        f"Use TURBOQUANT_BITS=4 (mse) or TURBOQUANT_BITS=4/5 (prod)."
+        f"turboquant-paper-repro branch is b=4 only on first pass "
+        f"(K_CB <= 16); got algo={TURBOQUANT_ALGO} bits={TURBOQUANT_BITS} "
+        f"-> K_CB={_K_CB}. Use TURBOQUANT_BITS=4."
+    )
+if TURBOQUANT_USE_CUDA:
+    raise ValueError(
+        "TURBOQUANT_USE_CUDA=1 is not supported on the paper-repro "
+        "branch. The CUDA WMMA kernel has not been updated for the "
+        "paper-faithful rotation (QR Gaussian Pi, unit-norm input, "
+        "1/sqrt(d) scale) or the V-QJL accumulator split. Use the "
+        "Triton TC kernel (unset the env var)."
     )
 
 logger.info(
-    "TurboQuant backend: algo=%s bits=%d use_cuda=%s",
+    "TurboQuant backend (paper-repro): algo=%s bits=%d use_cuda=%s",
     TURBOQUANT_ALGO, TURBOQUANT_BITS, TURBOQUANT_USE_CUDA,
 )
 
 
-# CUDA extension is imported lazily. JIT compile takes ~30-60 seconds on
-# first call; defer until TURBOQUANT_USE_CUDA=1 is actually chosen.
+# CUDA extension is imported lazily only if the user explicitly opts in.
 _cuda_attend_fn = None
 
 
@@ -205,12 +212,7 @@ class TurboQuantAttentionBackend(AttentionBackend):
 
 
 class TurboQuantAttentionImpl(AttentionImpl):
-    """Per-attention-layer TurboQuant impl.
-
-    Each instance owns a ``QuantState`` (so every layer's H, signs, S
-    are independent) and lazily-allocated paged K/V buffers sized to
-    match vLLM's ``kv_cache`` shape.
-    """
+    """Per-attention-layer TurboQuant impl."""
 
     _layer_counter: ClassVar[int] = 0
 
@@ -243,21 +245,18 @@ class TurboQuantAttentionImpl(AttentionImpl):
         self.kv_sharing_target_layer_name = kv_sharing_target_layer_name
         self.num_queries_per_kv = self.num_heads // self.num_kv_heads
 
-        # Class-level counter -- gives every layer a distinct seed so
-        # H/signs/S differ across layers. Profile-pass instantiation may
-        # bump the counter beyond `num_layers`; that's harmless because
-        # store and attend always use the same instance's QuantState.
         self._layer_seed = TurboQuantAttentionImpl._layer_counter
         TurboQuantAttentionImpl._layer_counter += 1
 
         self._state: QuantState | None = None
-        # Lazily allocated in _ensure_buffers.
         self._k_idx: torch.Tensor | None = None
         self._k_norm: torch.Tensor | None = None
         self._v_idx: torch.Tensor | None = None
         self._v_norm: torch.Tensor | None = None
         self._k_qjl_sign: torch.Tensor | None = None  # prod only
         self._k_rnorm: torch.Tensor | None = None     # prod only
+        self._v_qjl_sign: torch.Tensor | None = None  # prod only
+        self._v_rnorm: torch.Tensor | None = None     # prod only
 
     # ------------------------------------------------------------------
     # Lazy state / buffer allocation
@@ -283,11 +282,11 @@ class TurboQuantAttentionImpl(AttentionImpl):
         block_size = kv_cache.shape[2]
         device = kv_cache.device
 
-        # Pack two 4-bit indices per byte when the codebook fits in 4
-        # bits. ``QuantState.codebook`` size is 2^bits for mse and
-        # 2^(bits-1) for prod.
-        K_CB = 1 << (TURBOQUANT_BITS - 1 if TURBOQUANT_ALGO == "prod"
-                     else TURBOQUANT_BITS)
+        K_CB = 1 << (
+            TURBOQUANT_BITS - 1
+            if TURBOQUANT_ALGO == "prod"
+            else TURBOQUANT_BITS
+        )
         idx_last_dim = (
             self.head_size // 2 if K_CB <= 16 else self.head_size
         )
@@ -314,6 +313,13 @@ class TurboQuantAttentionImpl(AttentionImpl):
             self._k_rnorm = torch.zeros(
                 shape_meta, dtype=torch.float32, device=device
             )
+            # V mirrors K exactly (paper applies Q_prod uniformly to KV).
+            self._v_qjl_sign = torch.zeros(
+                shape_qjl, dtype=torch.uint8, device=device
+            )
+            self._v_rnorm = torch.zeros(
+                shape_meta, dtype=torch.float32, device=device
+            )
 
     # ------------------------------------------------------------------
     # vLLM hooks
@@ -337,7 +343,6 @@ class TurboQuantAttentionImpl(AttentionImpl):
         block_size = kv_cache.shape[2]
         state = self._ensure_state(key.dtype, key.device)
 
-        # K quant: Lloyd-Max + Hadamard (+ QJL residual if prod).
         turboquant_store_kv(
             new_k=k,
             cache_k_idx=self._k_idx,
@@ -348,7 +353,6 @@ class TurboQuantAttentionImpl(AttentionImpl):
             cache_k_qjl_sign=self._k_qjl_sign,
             cache_k_rnorm=self._k_rnorm,
         )
-        # V quant: Q_mse only (no QJL).
         turboquant_store_v(
             new_v=v,
             cache_v_idx=self._v_idx,
@@ -356,6 +360,8 @@ class TurboQuantAttentionImpl(AttentionImpl):
             slot_mapping=slot_mapping,
             state=state,
             block_size=block_size,
+            cache_v_qjl_sign=self._v_qjl_sign,
+            cache_v_rnorm=self._v_rnorm,
         )
 
     def forward(
@@ -378,9 +384,6 @@ class TurboQuantAttentionImpl(AttentionImpl):
             output.zero_()
             return output
 
-        # forward_includes_kv_cache_update is True, so the wrapper does
-        # NOT call unified_kv_cache_update. We must store K/V here on
-        # every forward (including every decode step).
         if key is not None and value is not None:
             self.do_kv_cache_update(
                 layer, key, value, kv_cache, attn_metadata.slot_mapping
@@ -407,6 +410,8 @@ class TurboQuantAttentionImpl(AttentionImpl):
             state=state,
             cache_k_qjl_sign=self._k_qjl_sign,
             cache_k_rnorm=self._k_rnorm,
+            cache_v_qjl_sign=self._v_qjl_sign,
+            cache_v_rnorm=self._v_rnorm,
         )
         output.copy_(attn_out.reshape_as(output))
         return output

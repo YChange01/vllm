@@ -1,38 +1,37 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Tensor-core attend kernel for TurboQuant.
+"""Tensor-core attend kernel for TurboQuant (paper-faithful).
 
-Replaces the per-slot fp32 scalar inner-product of ``attend.py`` with a
-tiled matmul formulation so the attention compute runs on tensor cores:
+Paper arXiv:2504.19874, Algorithm 2 applied uniformly to K and V in
+the KV cache.
 
-    for each KV tile of BLOCK_N slots:
-        K_tile = codebook[k_idx[tile]] * k_norm[tile]      # (BLOCK_N, d) bf16
-        qk     = tl.dot(Q, K_tile.T)                       # (BLOCK_M, BLOCK_N)
-        V_tile = codebook[v_idx[tile]] * v_norm[tile]      # (BLOCK_N, d) bf16
-        acc    = acc * rescale + tl.dot(softmax(qk), V_tile)   # (BLOCK_M, d)
+Data layout per stored (token, kv_head) slot:
+    cache_k_idx        uint8 (d/2)       4-bit nibble-packed Lloyd-Max idx
+    cache_k_norm       fp32            ||k||
+    cache_k_qjl_sign   uint8 (d/8)       1-bit-packed sign(S @ r_unit)  (prod)
+    cache_k_rnorm      fp32            ||r_k||                        (prod)
+    same fields for V (cache_v_*).
 
-Dequantization happens inline per tile: load nibble-packed idx, unpack
-to int32, gather the (small, cached) bf16 codebook, scale by the
-per-slot ``norm``. K/V dequant each produce a (BLOCK_N, d) bf16 tile --
-exactly the operand shape ``tl.dot`` wants.
+Reconstruction, in rotated-unit-sphere space:
+    y_approx = codebook[idx] + (sqrt(pi/2)/d) * ||r|| * S^T @ qjl_sign
 
-Grid: ``(num_query_tokens, num_heads_kv)``. Each program handles one
-GQA group (``gqa_group`` q_heads sharing one kv_head). BLOCK_M is
-padded to 16 (Triton tensor-core tile minimum) even when gqa_group < 16
--- for Llama-3 8B gqa_group=4, so 3/4 of the matmul rows are masked
-waste, but tensor cores are ~50x faster than fp32 scalar so net gain
-is still ~10x per tile.
+For the Q @ K inner product we never need to materialize the QJL
+contribution to K in full d-dim; we contract it against the
+pre-projected Sq = Q_rot @ S^T as in the main-text formula:
 
-QJL path (prod): the ``Sq @ qjl_sign.T`` term is also turned into a
-``tl.dot`` by unpacking 1-bit qjl signs into a (BLOCK_N, d) bf16
-``{+1, -1}`` tile.
+    <q, y_k_approx> = <q, codebook[idx]>
+                    + (sqrt(pi/2)/d) * ||r_k|| * <Sq, qjl_k>
 
-Post-rotation of V (``(out @ H.T) * signs / sqrt(d)``) still runs in
-Python on the kernel output -- fusing it is a separate follow-up.
-Store path (K/V quantization write) also stays in Python for now.
+For the weighted-sum output with V the paper requires the full
+reconstruction. Doing the d x d matvec per slot inside the kernel is
+too expensive, so we split the V accumulator into two halves --
+``acc_main`` from ``codebook[v_idx]`` and ``acc_qjl`` from the 1-bit
+signs -- and apply ``S^T`` once in Python post-kernel. The Python
+post-pass also folds in the inverse rotation ``Pi^T``; both fit into
+a single cuBLAS bf16 matmul.
 
-Scope: b=4 only (K_CB <= 16, 4-bit nibble-packed K/V idx, 1-bit-packed
-QJL sign for prod).
+Scope: b=4 only on this branch (K_CB <= 16, 4-bit nibble-packed idx,
+1-bit-packed QJL sign). Stage 2 will add variable bit widths.
 """
 
 from __future__ import annotations
@@ -49,16 +48,9 @@ if TYPE_CHECKING:
 
 
 _NEG_LARGE = tl.constexpr(-1.0e30)
-
-
-# Tensor-core tl.dot wants M, N, K multiples of 16. Our head_size = 128
-# is already a power of 2. BLOCK_M is forced to at least 16.
 _BLOCK_M_MIN = 16
 
 
-# ---------------------------------------------------------------------------
-# Autotuned tensor-core attend kernel
-# ---------------------------------------------------------------------------
 _AUTOTUNE_CONFIGS = [
     triton.Config({"BLOCK_N": 32}, num_warps=2, num_stages=2),
     triton.Config({"BLOCK_N": 32}, num_warps=4, num_stages=2),
@@ -84,12 +76,15 @@ def _tc_attend_kernel(
     cache_v_norm_ptr,               # (num_blocks, bs, H_kv) fp32
     cache_k_qjl_sign_ptr,           # (num_blocks, bs, H_kv, d/8) uint8 prod
     cache_k_rnorm_ptr,              # (num_blocks, bs, H_kv) fp32  prod
+    cache_v_qjl_sign_ptr,           # (num_blocks, bs, H_kv, d/8) uint8 prod
+    cache_v_rnorm_ptr,              # (num_blocks, bs, H_kv) fp32  prod
     block_table_ptr,                # (num_seqs, stride) int32
     seq_id_per_query_ptr,           # (T_q,) int32
     kv_end_per_query_ptr,           # (T_q,) int32
     codebook_ptr,                   # (K_CB,) bf16 (same dtype as Q)
-    out_ptr,                        # (T_q, H_q, d) OUT_DTYPE
-    inv_d,
+    out_main_ptr,                   # (T_q, H_q, d) bf16  main V accumulator
+    out_qjl_ptr,                    # (T_q, H_q, d) bf16  QJL V accumulator (prod)
+    inv_sqrt_d,
     qjl_coef,
     block_table_stride,
     OUT_DTYPE: tl.constexpr,
@@ -120,7 +115,7 @@ def _tc_attend_kernel(
     mask_m = m_off < GQA_GROUP
     mask_d = d_off < head_size
 
-    # Load Q tile (BLOCK_M, BLOCK_D) in compute dtype (bf16/fp16).
+    # Load Q tile (BLOCK_M, BLOCK_D) in compute dtype.
     q_base = q_idx * num_heads_q * head_size
     q_offs_2d = (
         q_base
@@ -142,7 +137,9 @@ def _tc_attend_kernel(
 
     m_i = tl.full((BLOCK_M,), _NEG_LARGE, dtype=tl.float32)
     l_i = tl.zeros((BLOCK_M,), dtype=tl.float32)
-    acc = tl.zeros((BLOCK_M, BLOCK_D), dtype=tl.float32)
+    acc_main = tl.zeros((BLOCK_M, BLOCK_D), dtype=tl.float32)
+    if USE_QJL:
+        acc_qjl = tl.zeros((BLOCK_M, BLOCK_D), dtype=tl.float32)
 
     # 4-bit nibble-pack layout: two indices per byte.
     d_pack = d_off // 2
@@ -152,30 +149,31 @@ def _tc_attend_kernel(
 
     for tile_i in range(0, num_tiles):
         kv_start = tile_i * BLOCK_N
-        n_pos = kv_start + n_off             # (BLOCK_N,)
+        n_pos = kv_start + n_off
         mask_n = n_pos < kv_end
 
-        # Paged addressing for this KV tile.
         block_idx = n_pos // block_size
         tok_in_block = n_pos % block_size
 
         phys_blocks = tl.load(
             block_table_ptr + seq_idx * block_table_stride + block_idx,
             mask=mask_n, other=0,
-        )                                    # (BLOCK_N,) int32
+        )
 
         base_idx = (
             phys_blocks * (block_size * num_heads_kv * idx_dim)
             + tok_in_block * (num_heads_kv * idx_dim)
             + kvh_idx * idx_dim
-        )                                    # (BLOCK_N,) int32
+        )
         meta_addrs = (
             phys_blocks * (block_size * num_heads_kv)
             + tok_in_block * num_heads_kv
             + kvh_idx
-        )                                    # (BLOCK_N,)
+        )
 
-        # ---- K dequant tile (BLOCK_N, BLOCK_D) bf16 ----
+        # ------------------------------------------------------------------
+        # K dequant tile: codebook[idx_k] (unit-sphere rotated), scaled by ||k||
+        # ------------------------------------------------------------------
         addrs_k = base_idx[:, None] + d_pack[None, :]
         packed_k = tl.load(
             cache_k_idx_ptr + addrs_k,
@@ -185,24 +183,20 @@ def _tc_attend_kernel(
         k_low = packed_k & 0xF
         k_high = (packed_k >> 4) & 0xF
         k_idx_full = tl.where(is_high[None, :], k_high, k_low).to(tl.int32)
-        # Gather from codebook (tiny, cached in L1/const).
-        k_tile = tl.load(codebook_ptr + k_idx_full)   # (BLOCK_N, BLOCK_D) bf16
+        k_tile = tl.load(codebook_ptr + k_idx_full)
 
-        # Scale by k_norm (broadcast along last dim). Going through fp32
-        # keeps the scale-then-tensor-core sequence numerically clean.
         k_norm = tl.load(cache_k_norm_ptr + meta_addrs, mask=mask_n, other=0.0)
+        # k_tile_scaled approximates ||k|| * (Pi @ k/||k||) = (Pi @ k);
+        # the extra Pi^T in recovery cancels in <q_rot, k_tile_scaled>.
         k_tile_scaled = (
             k_tile.to(tl.float32) * k_norm[:, None]
         ).to(COMPUTE_DTYPE)
 
-        # ---- QK via tensor core ----
-        # (BLOCK_M, BLOCK_D) x (BLOCK_D, BLOCK_N) -> (BLOCK_M, BLOCK_N)
-        qk = tl.dot(q_rot, tl.trans(k_tile_scaled))   # fp32 accumulator
-        # qk == (sum_d q_rot[m,d] * codebook[k_idx[n,d]] * k_norm[n])
-        #     == main_dot_{m,n} * k_norm[n]
+        # Q @ K^T (tensor core)
+        qk = tl.dot(q_rot, tl.trans(k_tile_scaled))
 
         if USE_QJL:
-            # ---- QJL sign tile (BLOCK_N, BLOCK_D) bf16 with +/-1 ----
+            # QJL on K: unpack 1-bit signs into +/-1 bf16 tile.
             bit_pos = d_off % 8
             byte_pos = d_off // 8
             base_qjl = (
@@ -210,42 +204,47 @@ def _tc_attend_kernel(
                 + tok_in_block * (num_heads_kv * qjl_dim)
                 + kvh_idx * qjl_dim
             )
-            addrs_qjl = base_qjl[:, None] + byte_pos[None, :]
-            qjl_byte = tl.load(
-                cache_k_qjl_sign_ptr + addrs_qjl,
+            addrs_qjl_k = base_qjl[:, None] + byte_pos[None, :]
+            qjl_byte_k = tl.load(
+                cache_k_qjl_sign_ptr + addrs_qjl_k,
                 mask=mask_n[:, None] & mask_d[None, :],
                 other=0,
             ).to(tl.int32)
-            bit = (qjl_byte >> bit_pos[None, :]) & 1
-            qjl_sign_tile = (
-                1.0 - 2.0 * bit.to(tl.float32)
+            bit_k = (qjl_byte_k >> bit_pos[None, :]) & 1
+            qjl_sign_tile_k = (
+                1.0 - 2.0 * bit_k.to(tl.float32)
             ).to(COMPUTE_DTYPE)
 
-            r_norm = tl.load(
+            r_norm_k = tl.load(
                 cache_k_rnorm_ptr + meta_addrs, mask=mask_n, other=0.0
             )
-            # Sq @ qjl_sign.T via tensor core
-            qjl_dot = tl.dot(sq, tl.trans(qjl_sign_tile))  # (BLOCK_M, BLOCK_N) fp32
+            # Sq @ qjl_k^T via tensor core -> (BLOCK_M, BLOCK_N) fp32.
+            qjl_dot_k = tl.dot(sq, tl.trans(qjl_sign_tile_k))
 
-            # logit = (main_dot + qjl_coef * r_norm * qjl_dot) * k_norm * inv_d
-            #       = (qk + qjl_coef * r_norm * qjl_dot * k_norm) * inv_d
-            # (qk already includes k_norm via the scaled K tile.)
+            # logit = (<q_rot, k_tile> + (sqrt(pi/2)/d) * r_norm_k * <Sq,qjl_k>)
+            #         * k_norm ... but k_norm is already in k_tile_scaled, so:
+            #         = (qk + qjl_coef * r_norm_k * qjl_dot_k * k_norm) / sqrt(d)
             logit = (
-                qk + qjl_coef * r_norm[None, :] * qjl_dot * k_norm[None, :]
-            ) * inv_d
+                qk
+                + qjl_coef * r_norm_k[None, :] * qjl_dot_k * k_norm[None, :]
+            ) * inv_sqrt_d
         else:
-            logit = qk * inv_d
+            logit = qk * inv_sqrt_d
 
-        # Mask out-of-range slots before softmax.
         logit = tl.where(mask_n[None, :], logit, _NEG_LARGE)
 
-        # ---- Online softmax update ----
+        # Online softmax update.
         m_new = tl.maximum(m_i, tl.max(logit, axis=1))
         alpha = tl.exp(m_i - m_new)
-        probs = tl.exp(logit - m_new[:, None])        # (BLOCK_M, BLOCK_N) fp32
+        probs = tl.exp(logit - m_new[:, None])
         l_i = l_i * alpha + tl.sum(probs, axis=1)
+        acc_main = acc_main * alpha[:, None]
+        if USE_QJL:
+            acc_qjl = acc_qjl * alpha[:, None]
 
-        # ---- V dequant tile (BLOCK_N, BLOCK_D) bf16 ----
+        # ------------------------------------------------------------------
+        # V dequant main: codebook[v_idx] * v_norm (tensor-core P @ V_main)
+        # ------------------------------------------------------------------
         addrs_v = base_idx[:, None] + d_pack[None, :]
         packed_v = tl.load(
             cache_v_idx_ptr + addrs_v,
@@ -255,36 +254,63 @@ def _tc_attend_kernel(
         v_low = packed_v & 0xF
         v_high = (packed_v >> 4) & 0xF
         v_idx_full = tl.where(is_high[None, :], v_high, v_low).to(tl.int32)
-        v_tile = tl.load(codebook_ptr + v_idx_full)    # (BLOCK_N, BLOCK_D) bf16
+        v_tile = tl.load(codebook_ptr + v_idx_full)
 
         v_norm = tl.load(cache_v_norm_ptr + meta_addrs, mask=mask_n, other=0.0)
         v_tile_scaled = (
             v_tile.to(tl.float32) * v_norm[:, None]
         ).to(COMPUTE_DTYPE)
 
-        # ---- acc update: acc * alpha + probs @ V via tensor core ----
         probs_cast = probs.to(COMPUTE_DTYPE)
-        acc = acc * alpha[:, None] + tl.dot(probs_cast, v_tile_scaled)
+        acc_main = acc_main + tl.dot(probs_cast, v_tile_scaled)
+
+        if USE_QJL:
+            # V QJL: 1-bit signs scaled by ||r_v|| * ||v||. The Python
+            # post-pass applies Sv^T and then Pi^T to acc_qjl.
+            addrs_qjl_v = base_qjl[:, None] + byte_pos[None, :]
+            qjl_byte_v = tl.load(
+                cache_v_qjl_sign_ptr + addrs_qjl_v,
+                mask=mask_n[:, None] & mask_d[None, :],
+                other=0,
+            ).to(tl.int32)
+            bit_v = (qjl_byte_v >> bit_pos[None, :]) & 1
+            qjl_sign_tile_v = (
+                1.0 - 2.0 * bit_v.to(tl.float32)
+            ).to(COMPUTE_DTYPE)
+
+            r_norm_v = tl.load(
+                cache_v_rnorm_ptr + meta_addrs, mask=mask_n, other=0.0
+            )
+            v_qjl_scaled = (
+                qjl_sign_tile_v.to(tl.float32)
+                * r_norm_v[:, None]
+                * v_norm[:, None]
+            ).to(COMPUTE_DTYPE)
+            acc_qjl = acc_qjl + tl.dot(probs_cast, v_qjl_scaled)
 
         m_i = m_new
 
-    # Normalize V accumulator and write out.
-    out = acc / tl.maximum(l_i[:, None], 1e-12)
+    # Normalize and write out. The caller handles Pi^T and (for prod)
+    # the Sv^T matmul on acc_qjl.
+    inv_l = 1.0 / tl.maximum(l_i[:, None], 1e-12)
     out_offs = (
         q_base
         + (q_head_start + m_off[:, None]) * head_size
         + d_off[None, :]
     )
     tl.store(
-        out_ptr + out_offs,
-        out.to(OUT_DTYPE),
+        out_main_ptr + out_offs,
+        (acc_main * inv_l).to(OUT_DTYPE),
         mask=mask_m[:, None] & mask_d[None, :],
     )
+    if USE_QJL:
+        tl.store(
+            out_qjl_ptr + out_offs,
+            (acc_qjl * inv_l).to(OUT_DTYPE),
+            mask=mask_m[:, None] & mask_d[None, :],
+        )
 
 
-# ---------------------------------------------------------------------------
-# Python wrapper
-# ---------------------------------------------------------------------------
 def turboquant_paged_attention_tc(
     q: torch.Tensor,
     cache_k_idx: torch.Tensor,
@@ -297,6 +323,8 @@ def turboquant_paged_attention_tc(
     state: "QuantState",
     cache_k_qjl_sign: torch.Tensor | None = None,
     cache_k_rnorm: torch.Tensor | None = None,
+    cache_v_qjl_sign: torch.Tensor | None = None,
+    cache_v_rnorm: torch.Tensor | None = None,
 ) -> torch.Tensor:
     num_query_tokens, num_heads_q, head_size = q.shape
     _, block_size, num_heads_kv, idx_dim = cache_k_idx.shape
@@ -307,6 +335,7 @@ def turboquant_paged_attention_tc(
     use_qjl = state.algo == "prod"
     if use_qjl:
         assert cache_k_qjl_sign is not None and cache_k_rnorm is not None
+        assert cache_v_qjl_sign is not None and cache_v_rnorm is not None
 
     K_CB = int(state.codebook.shape[0])
     assert K_CB <= 16, (
@@ -337,65 +366,75 @@ def turboquant_paged_attention_tc(
     seq_id_per_query = seq_id_per_query_i64.to(torch.int32).contiguous()
     kv_end_per_query = kv_end_per_query_i64.to(torch.int32).contiguous()
 
-    # Pre-rotate Q in Python, in the query's native dtype so the matmul
-    # hits tensor cores (cuBLAS sgemm_f32 was dominating the prior
-    # profile). H is symmetric so H.T == H.
-    q_signed = q * state.signs                                       # bf16 elementwise
-    q_rotated_k = (
-        q_signed.reshape(-1, head_size) @ state.H
-    ).view(num_query_tokens, num_heads_q, head_size).contiguous()    # bf16
+    # Pre-rotate Q via Pi (bf16 cuBLAS). Pi is not symmetric -- always
+    # multiply on the right.
+    q_rotated = (
+        q.reshape(-1, head_size) @ state.Pi
+    ).view(num_query_tokens, num_heads_q, head_size).contiguous()
 
     if use_qjl:
-        Sq_k = (
-            q_rotated_k.reshape(-1, head_size) @ state.S.T
+        # Sq = q_rotated @ S^T matches <q_rot, S^T @ qjl> = <Sq, qjl>
+        # used inside the kernel.
+        Sq = (
+            q_rotated.reshape(-1, head_size) @ state.S.t()
         ).view(num_query_tokens, num_heads_q, head_size).contiguous()
     else:
-        Sq_k = q_rotated_k
+        Sq = q_rotated  # unused by the kernel when USE_QJL=False
 
     qjl_dim = head_size // 8 if use_qjl else 1
     if use_qjl:
-        qjl_sign_buf = cache_k_qjl_sign
-        assert qjl_sign_buf.dtype == torch.uint8
-        assert qjl_sign_buf.shape[-1] == qjl_dim
+        assert cache_k_qjl_sign.dtype == torch.uint8
+        assert cache_k_qjl_sign.shape[-1] == qjl_dim
+        assert cache_v_qjl_sign.shape[-1] == qjl_dim
+        k_qjl_buf = cache_k_qjl_sign
+        v_qjl_buf = cache_v_qjl_sign
+        k_rnorm_buf = cache_k_rnorm
+        v_rnorm_buf = cache_v_rnorm
     else:
-        qjl_sign_buf = cache_k_idx
-    rnorm_buf = cache_k_rnorm if use_qjl else cache_k_norm
+        k_qjl_buf = cache_k_idx
+        v_qjl_buf = cache_k_idx
+        k_rnorm_buf = cache_k_norm
+        v_rnorm_buf = cache_k_norm
 
-    # Codebook in the query's compute dtype (bf16 or fp16) so the
-    # gather inside the kernel directly produces tensor-core operands.
     codebook_ct = state.codebook.to(q.dtype)
 
     gqa_group = num_heads_q // num_heads_kv
     BLOCK_M = max(gqa_group, _BLOCK_M_MIN)
-    # Round BLOCK_M up to next power of two to keep tl.dot happy.
     BLOCK_M = 1 << (BLOCK_M - 1).bit_length()
     BLOCK_D = triton.next_power_of_2(head_size)
 
-    out = torch.empty_like(q)
+    out_main = torch.empty_like(q)
+    if use_qjl:
+        out_qjl = torch.empty_like(q)
+    else:
+        out_qjl = out_main  # unused
 
     OUT_DTYPE = tl.bfloat16 if q.dtype == torch.bfloat16 else tl.float16
     COMPUTE_DTYPE = OUT_DTYPE
 
-    inv_d = 1.0 / float(head_size)
+    inv_sqrt_d = 1.0 / math.sqrt(float(head_size))
     qjl_coef = math.sqrt(math.pi / 2.0) / float(head_size)
     block_table_stride = int(block_table.shape[1])
 
     grid = (num_query_tokens, num_heads_kv)
     _tc_attend_kernel[grid](
-        q_rotated_k,
-        Sq_k,
+        q_rotated,
+        Sq,
         cache_k_idx,
         cache_k_norm,
         cache_v_idx,
         cache_v_norm,
-        qjl_sign_buf,
-        rnorm_buf,
+        k_qjl_buf,
+        k_rnorm_buf,
+        v_qjl_buf,
+        v_rnorm_buf,
         block_table,
         seq_id_per_query,
         kv_end_per_query,
         codebook_ct,
-        out,
-        inv_d,
+        out_main,
+        out_qjl,
+        inv_sqrt_d,
         qjl_coef,
         block_table_stride,
         OUT_DTYPE=OUT_DTYPE,
@@ -413,11 +452,15 @@ def turboquant_paged_attention_tc(
         GQA_GROUP=gqa_group,
     )
 
-    # Post-rotate V back to original space in bf16 (tensor core matmul).
-    # H symmetric so H.T == H. Do it in place in the query's dtype.
-    inv_sqrt_d = 1.0 / math.sqrt(float(head_size))
-    output = (
-        out.reshape(-1, head_size) @ state.H
-    ).view(num_query_tokens, num_heads_q, head_size)
-    output = output * state.signs * inv_sqrt_d
-    return output.contiguous()
+    # Post-process: un-rotate with Pi^T. For prod, also resolve the V
+    # QJL residual via S^T before adding to the main output. Both
+    # reductions are one bf16 matmul each via cuBLAS.
+    if use_qjl:
+        qjl_contribution = (
+            out_qjl.reshape(-1, head_size) @ state.S
+        ) * qjl_coef
+        combined = out_main.reshape(-1, head_size) + qjl_contribution
+        output = combined @ state.Pi_T
+    else:
+        output = out_main.reshape(-1, head_size) @ state.Pi_T
+    return output.view(num_query_tokens, num_heads_q, head_size).contiguous()

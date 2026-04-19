@@ -149,8 +149,23 @@ def turboquant_paged_attention_cuda(
     state: "QuantState",
     cache_k_qjl_sign: torch.Tensor | None = None,
     cache_k_rnorm: torch.Tensor | None = None,
+    cache_v_qjl_sign: torch.Tensor | None = None,
+    cache_v_rnorm: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """CUDA-backed paged attention (WMMA + cp.async). Supports mse and prod."""
+    """CUDA-backed paged attention (WMMA + cp.async). Supports mse and prod.
+
+    NOT UPDATED for the turboquant-paper-repro branch. The in-kernel
+    logit scaling and the Python wrapper both still expect the old
+    Hadamard + signs rotation and ``1/d`` attention scale; they also
+    lack the V-QJL accumulator split needed for paper-faithful Q_prod
+    on V. The backend rejects ``TURBOQUANT_USE_CUDA=1`` at module load
+    so this function is not reachable from vLLM on this branch.
+    """
+    raise NotImplementedError(
+        "turboquant_paged_attention_cuda is not supported on the "
+        "paper-repro branch (Pi/unit-norm/1/sqrt(d) scale and V-QJL "
+        "split not implemented). Use the Triton TC kernel instead."
+    )
     use_qjl = state.algo == "prod"
     if use_qjl:
         assert cache_k_qjl_sign is not None and cache_k_rnorm is not None, (

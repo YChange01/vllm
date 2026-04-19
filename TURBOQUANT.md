@@ -1,40 +1,50 @@
 # TurboQuant backend for vLLM
 
-K-side KV cache quantization for vLLM, based on
+KV cache quantization for vLLM, based on
 [TurboQuant (Zandieh et al., arXiv:2504.19874)](https://arxiv.org/abs/2504.19874).
 Algorithm prototype lives in [tqlite](https://github.com/YChange01/tqlite).
 
-## What's implemented
+## What's implemented (turboquant-paper-repro branch)
 
-- **Algorithm 1 (`Q_mse`)**: per-coord b-bit Lloyd-Max on
-  `H @ diag(signs) @ k_normed` (Hadamard rotation of the unit-sphere-
-  scaled K).
-- **Algorithm 2 (`Q_prod`)**: Q_mse + 1-bit QJL on the residual,
-  giving an unbiased inner-product estimate (paper Lemma 4).
+Paper-faithful Algorithm 1 / Algorithm 2 on both K and V:
+
+- **Random orthogonal rotation Π** via QR decomposition of a Gaussian
+  matrix (paper §3.1). Works for any `head_dim`, including non-powers
+  of two -- required for Stage 3 outlier channel splitting.
+- **Unit-sphere input**: ``x̂ = x / ||x||`` before rotation, matching
+  the paper's Lemma 1 support of the Beta coordinate distribution.
+- **Beta-trained Lloyd-Max codebook**: centroids in ``[-1, 1]``, trained
+  on the exact distribution of a single coordinate of a uniformly
+  random unit vector (first coord of normalized Gaussian draws). No
+  Gaussian approximation -- b=1 centroids match paper's
+  ``sqrt(2/pi)/sqrt(d)`` formula within 1%.
+- **Algorithm 1 (`Q_mse`)**: b-bit Lloyd-Max on ``Pi @ x_hat``.
+- **Algorithm 2 (`Q_prod`)**: (b-1)-bit Q_mse + 1-bit QJL on the
+  residual, giving an unbiased inner-product estimator (Theorem 2 /
+  Lemma 4). Applied uniformly to K and V.
+- **Triton tensor-core attend kernel**: accumulates two V outputs --
+  ``acc_main`` from the codebook gather and ``acc_qjl`` from the 1-bit
+  QJL signs -- and resolves the QJL residual post-kernel in Python
+  via a single bf16 matmul against ``S`` followed by ``Pi_T``.
 - vLLM v1 attention backend (`TurboQuantAttentionBackend`,
-  `TurboQuantAttentionImpl`).
-- Triton attend kernel (per-query, on-the-fly K dequant, varlen +
-  causal flash softmax). Pre-rotation of Q on-device via `torch.matmul`.
-- Pure-PyTorch K store (Lloyd-Max bucket via `torch.searchsorted`,
-  Hadamard rotation via cuBLAS matmul, scatter into paged cache via
-  advanced indexing).
+  `TurboQuantAttentionImpl`) with per-layer distinct seeds so every
+  layer uses an independent rotation and QJL projection.
 
-V is stored **raw** in the model dtype (no quantization). The paper
-also quantizes V; an int8 V quant was attempted here but produced
-`|attn|.max > max|v|` on Llama prefill -- mathematically impossible
-for a correct softmax-weighted sum -- which traced to a Triton multi-
-program write corruption on B200. K-only quant gives ~8x compression
-on K (b=8) without that failure mode; V quant can be re-added later
-with a different store path.
+Scope of this branch: b=4 only, Triton TC kernel only. The CUDA WMMA
+kernel has not been updated for the paper-faithful scaling or the
+V-QJL accumulator split; ``TURBOQUANT_USE_CUDA=1`` is rejected at
+backend load.
 
 ## Files
 
 ```
 vllm/turboquant/
 ├── __init__.py
-├── codebook.py            QuantState: Lloyd-Max + Hadamard + QJL S
-├── store.py               turboquant_store_kv (pure PyTorch on GPU)
-└── attend.py              Triton attend kernel + Python wrapper
+├── codebook.py            QuantState: QR(Gaussian) Pi + Beta Lloyd-Max + QJL S
+├── store.py               turboquant_store_{kv,v}: unit-norm rotate + Triton store
+├── attend_tc.py           Triton tensor-core attend (supports V-QJL split)
+├── attend_cuda.py         CUDA WMMA attend (disabled on this branch)
+└── csrc/                  CUDA sources (not built on this branch)
 
 vllm/v1/attention/backends/
 ├── turboquant_attn.py     Backend + Impl + MetadataBuilder
@@ -46,7 +56,8 @@ vllm/v1/attention/backends/
 | var | default | meaning |
 |---|---|---|
 | `TURBOQUANT_ALGO` | `prod` | `mse` (Algorithm 1) or `prod` (Algorithm 2) |
-| `TURBOQUANT_BITS` | `8`    | total bit budget per coord; `prod` requires `>=2` |
+| `TURBOQUANT_BITS` | `4`    | total bit budget per coord; `prod` requires >=2. This branch is b=4 only |
+| `TURBOQUANT_USE_CUDA` | `0` | rejected on this branch (pending CUDA kernel rewrite) |
 
 ## Test scripts
 
@@ -87,11 +98,15 @@ TURBOQUANT_ALGO=prod TURBOQUANT_BITS=8 \
 For a longer prompt or different model, edit the `MODEL` env var or
 positional args of `test/baseline.sh`.
 
-## Known limitations
+## Known limitations (paper-repro branch)
 
-- V is not quantized (see "What's implemented" above).
-- The Triton store kernel was removed; K store is pure PyTorch on the
-  GPU. Slower than a fused Triton store would be, but only runs during
-  prefill and during single-token storage on each decode step.
+- b=4 only. Stage 2 will lift this to b in {2, 3, 4, 5}.
+- No outlier channel splitting yet; paper's 2.5-bit / 3.5-bit modes
+  (Table 1) require per-head, per-layer outlier masks -- Stage 3.
+- CUDA WMMA kernel is disabled; only the Triton TC path is updated
+  for paper-faithful scaling and the V-QJL accumulator split.
 - ALiBi, sliding window, and `logits_soft_cap` are not supported.
 - `cache_dtype` is fixed to `auto` (matches model dtype).
+- QJL projection ``S`` is shared between K and V per layer. Using
+  independent ``S_k`` / ``S_v`` is not required by the paper and
+  would double S storage for no measured benefit.
