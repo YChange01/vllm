@@ -54,9 +54,17 @@ import torch
 from vllm.config import VllmConfig
 from vllm.config.cache import CacheDType
 from vllm.logger import init_logger
+from vllm.turboquant.attend_split_tc import (
+    turboquant_paged_attention_split_tc,
+)
 from vllm.turboquant.attend_tc import turboquant_paged_attention_tc
 from vllm.turboquant.codebook import QuantState
-from vllm.turboquant.store import turboquant_store_kv, turboquant_store_v
+from vllm.turboquant.outlier import OutlierMask, SplitQuantState
+from vllm.turboquant.store import (
+    turboquant_store_kv,
+    turboquant_store_split,
+    turboquant_store_v,
+)
 from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionCGSupport,
@@ -78,6 +86,18 @@ logger = init_logger(__name__)
 TURBOQUANT_ALGO = os.environ.get("TURBOQUANT_ALGO", "prod").lower()
 TURBOQUANT_BITS = int(os.environ.get("TURBOQUANT_BITS", "4"))
 TURBOQUANT_USE_CUDA = os.environ.get("TURBOQUANT_USE_CUDA", "0") == "1"
+# Outlier channel splitting (paper §4.3). When set, the mask file is
+# loaded once at module init and the backend switches from homogeneous
+# quantization to two-slice quantization. BITS_OUTLIER / BITS_REGULAR
+# control the per-slice bit budgets (e.g., 3+2 for 2.5-bit effective on
+# Llama's 128-dim heads with 32 outliers).
+TURBOQUANT_OUTLIER_MASK = os.environ.get("TURBOQUANT_OUTLIER_MASK", "")
+TURBOQUANT_BITS_OUTLIER = int(
+    os.environ.get("TURBOQUANT_BITS_OUTLIER", str(TURBOQUANT_BITS))
+)
+TURBOQUANT_BITS_REGULAR = int(
+    os.environ.get("TURBOQUANT_BITS_REGULAR", str(TURBOQUANT_BITS))
+)
 
 if TURBOQUANT_ALGO not in ("mse", "prod"):
     raise ValueError(
@@ -104,9 +124,33 @@ if TURBOQUANT_USE_CUDA:
         "Triton TC kernel (unset the env var)."
     )
 
+_OUTLIER_MASK: OutlierMask | None = None
+if TURBOQUANT_OUTLIER_MASK:
+    _OUTLIER_MASK = OutlierMask.load(TURBOQUANT_OUTLIER_MASK)
+    for b, name in [
+        (TURBOQUANT_BITS_OUTLIER, "TURBOQUANT_BITS_OUTLIER"),
+        (TURBOQUANT_BITS_REGULAR, "TURBOQUANT_BITS_REGULAR"),
+    ]:
+        main_b = b - 1 if TURBOQUANT_ALGO == "prod" else b
+        if main_b < 1 or main_b > 4:
+            raise ValueError(
+                f"{name}={b} -> main_bits={main_b} outside supported "
+                f"range {{1..4}} on this branch."
+            )
+    logger.info(
+        "TurboQuant split-mode: mask=%s, bits_outlier=%d, bits_regular=%d, "
+        "d_out=%d, d_reg=%d",
+        TURBOQUANT_OUTLIER_MASK,
+        TURBOQUANT_BITS_OUTLIER,
+        TURBOQUANT_BITS_REGULAR,
+        _OUTLIER_MASK.num_outliers,
+        _OUTLIER_MASK.head_dim - _OUTLIER_MASK.num_outliers,
+    )
+
 logger.info(
-    "TurboQuant backend (paper-repro): algo=%s bits=%d use_cuda=%s",
-    TURBOQUANT_ALGO, TURBOQUANT_BITS, TURBOQUANT_USE_CUDA,
+    "TurboQuant backend (paper-repro): algo=%s bits=%d split=%s use_cuda=%s",
+    TURBOQUANT_ALGO, TURBOQUANT_BITS,
+    bool(_OUTLIER_MASK), TURBOQUANT_USE_CUDA,
 )
 
 
@@ -214,7 +258,18 @@ class TurboQuantAttentionBackend(AttentionBackend):
 
 
 class TurboQuantAttentionImpl(AttentionImpl):
-    """Per-attention-layer TurboQuant impl."""
+    """Per-attention-layer TurboQuant impl.
+
+    Two modes:
+
+    * Homogeneous (``_OUTLIER_MASK is None``): one ``QuantState`` per
+      layer, four buffers for K (idx, norm, qjl_sign, rnorm) mirrored
+      for V in prod mode.
+    * Split (``_OUTLIER_MASK is not None``): two ``SplitQuantState``
+      instances per layer (one for K, one for V -- same outlier
+      channel indices but independent Pi/S/codebooks), eight buffers
+      each for K and V.
+    """
 
     _layer_counter: ClassVar[int] = 0
 
@@ -249,48 +304,123 @@ class TurboQuantAttentionImpl(AttentionImpl):
 
         self._layer_seed = TurboQuantAttentionImpl._layer_counter
         TurboQuantAttentionImpl._layer_counter += 1
+        self._split = _OUTLIER_MASK is not None
+        if self._split:
+            if _OUTLIER_MASK.head_dim != head_size:
+                raise ValueError(
+                    f"Outlier mask head_dim {_OUTLIER_MASK.head_dim} != "
+                    f"layer head_size {head_size}. Re-run calibration "
+                    f"against the current model."
+                )
 
+        # Homogeneous state/buffers
         self._state: QuantState | None = None
         self._k_idx: torch.Tensor | None = None
         self._k_norm: torch.Tensor | None = None
         self._v_idx: torch.Tensor | None = None
         self._v_norm: torch.Tensor | None = None
-        self._k_qjl_sign: torch.Tensor | None = None  # prod only
-        self._k_rnorm: torch.Tensor | None = None     # prod only
-        self._v_qjl_sign: torch.Tensor | None = None  # prod only
-        self._v_rnorm: torch.Tensor | None = None     # prod only
+        self._k_qjl_sign: torch.Tensor | None = None
+        self._k_rnorm: torch.Tensor | None = None
+        self._v_qjl_sign: torch.Tensor | None = None
+        self._v_rnorm: torch.Tensor | None = None
+
+        # Split state/buffers
+        self._k_split: SplitQuantState | None = None
+        self._v_split: SplitQuantState | None = None
+        # K: outlier + regular each with (idx, norm, qjl_sign, rnorm)
+        self._k_idx_out: torch.Tensor | None = None
+        self._k_norm_out: torch.Tensor | None = None
+        self._k_qjl_sign_out: torch.Tensor | None = None
+        self._k_rnorm_out: torch.Tensor | None = None
+        self._k_idx_reg: torch.Tensor | None = None
+        self._k_norm_reg: torch.Tensor | None = None
+        self._k_qjl_sign_reg: torch.Tensor | None = None
+        self._k_rnorm_reg: torch.Tensor | None = None
+        # V same shape as K
+        self._v_idx_out: torch.Tensor | None = None
+        self._v_norm_out: torch.Tensor | None = None
+        self._v_qjl_sign_out: torch.Tensor | None = None
+        self._v_rnorm_out: torch.Tensor | None = None
+        self._v_idx_reg: torch.Tensor | None = None
+        self._v_norm_reg: torch.Tensor | None = None
+        self._v_qjl_sign_reg: torch.Tensor | None = None
+        self._v_rnorm_reg: torch.Tensor | None = None
 
     # ------------------------------------------------------------------
     # Lazy state / buffer allocation
     # ------------------------------------------------------------------
-    def _ensure_state(
-        self, dtype: torch.dtype, device: torch.device
-    ) -> QuantState:
-        if self._state is None:
-            self._state = QuantState(
-                algo=TURBOQUANT_ALGO,
-                bits=TURBOQUANT_BITS,
-                head_dim=self.head_size,
-                seed=self._layer_seed,
-                dtype=dtype,
-                device=device,
-            )
-        return self._state
+    def _ensure_state(self, dtype: torch.dtype, device: torch.device):
+        if self._split:
+            if self._k_split is None:
+                # K and V share the outlier channel positions (same
+                # calibration used for both sides within a layer) but
+                # each side has an independent QuantState so its Pi/S
+                # are distinct.
+                assert _OUTLIER_MASK is not None
+                k_outlier_idx = _OUTLIER_MASK.for_layer(
+                    self._layer_seed % _OUTLIER_MASK.num_layers, "k"
+                ).to(device)
+                v_outlier_idx = _OUTLIER_MASK.for_layer(
+                    self._layer_seed % _OUTLIER_MASK.num_layers, "v"
+                ).to(device)
+                # For the current split kernel, K and V must use the
+                # same outlier index set (see assertion in attend
+                # wrapper). Union of K and V top-N is the safe choice
+                # when they disagree, but that increases d_out; instead
+                # we default to the K mask for both sides, as the K
+                # side drives the kernel's layout. V calibration is
+                # still useful for future per-side splits.
+                v_outlier_idx = k_outlier_idx
+                self._k_split = SplitQuantState(
+                    algo=TURBOQUANT_ALGO,
+                    bits_outlier=TURBOQUANT_BITS_OUTLIER,
+                    bits_regular=TURBOQUANT_BITS_REGULAR,
+                    head_dim=self.head_size,
+                    outlier_idx=k_outlier_idx,
+                    seed=self._layer_seed,
+                    dtype=dtype,
+                    device=device,
+                )
+                self._v_split = SplitQuantState(
+                    algo=TURBOQUANT_ALGO,
+                    bits_outlier=TURBOQUANT_BITS_OUTLIER,
+                    bits_regular=TURBOQUANT_BITS_REGULAR,
+                    head_dim=self.head_size,
+                    outlier_idx=v_outlier_idx,
+                    seed=self._layer_seed ^ 0x7FFFFFFF,
+                    dtype=dtype,
+                    device=device,
+                )
+            return self._k_split  # not actually used by callers
+        else:
+            if self._state is None:
+                self._state = QuantState(
+                    algo=TURBOQUANT_ALGO,
+                    bits=TURBOQUANT_BITS,
+                    head_dim=self.head_size,
+                    seed=self._layer_seed,
+                    dtype=dtype,
+                    device=device,
+                )
+            return self._state
 
     def _ensure_buffers(self, kv_cache: torch.Tensor) -> None:
-        if self._k_idx is not None:
-            return
+        if self._split:
+            if self._k_idx_out is not None:
+                return
+            self._allocate_split_buffers(kv_cache)
+        else:
+            if self._k_idx is not None:
+                return
+            self._allocate_homogeneous_buffers(kv_cache)
+
+    def _allocate_homogeneous_buffers(self, kv_cache: torch.Tensor) -> None:
         num_blocks = kv_cache.shape[1]
         block_size = kv_cache.shape[2]
         device = kv_cache.device
 
-        # pack_bits only depends on main_bits; compute it directly so
-        # buffer allocation does not depend on the (possibly bf16)
-        # QuantState instance.
         main_bits = _MAIN_BITS
-        pack_bits = 1 if main_bits == 1 else (
-            2 if main_bits == 2 else 4
-        )
+        pack_bits = _pow2_ceil(main_bits)
         idx_last_dim = self.head_size * pack_bits // 8
 
         shape_idx = (num_blocks, block_size, self.num_kv_heads, idx_last_dim)
@@ -302,11 +432,7 @@ class TurboQuantAttentionImpl(AttentionImpl):
         self._v_norm = torch.zeros(shape_meta, dtype=torch.float32, device=device)
 
         if TURBOQUANT_ALGO == "prod":
-            # QJL sign is bit-packed: 8 +/-1 signs per byte, bit_j = (sign_j < 0).
-            assert self.head_size % 8 == 0, (
-                f"head_size {self.head_size} must be divisible by 8 for "
-                f"QJL bit-packing"
-            )
+            assert self.head_size % 8 == 0
             shape_qjl = (num_blocks, block_size, self.num_kv_heads,
                          self.head_size // 8)
             self._k_qjl_sign = torch.zeros(
@@ -315,13 +441,81 @@ class TurboQuantAttentionImpl(AttentionImpl):
             self._k_rnorm = torch.zeros(
                 shape_meta, dtype=torch.float32, device=device
             )
-            # V mirrors K exactly (paper applies Q_prod uniformly to KV).
             self._v_qjl_sign = torch.zeros(
                 shape_qjl, dtype=torch.uint8, device=device
             )
             self._v_rnorm = torch.zeros(
                 shape_meta, dtype=torch.float32, device=device
             )
+
+    def _allocate_split_buffers(self, kv_cache: torch.Tensor) -> None:
+        num_blocks = kv_cache.shape[1]
+        block_size = kv_cache.shape[2]
+        device = kv_cache.device
+
+        assert _OUTLIER_MASK is not None
+        d_out = _OUTLIER_MASK.num_outliers
+        d_reg = self.head_size - d_out
+
+        main_out = TURBOQUANT_BITS_OUTLIER - 1 if TURBOQUANT_ALGO == "prod" \
+            else TURBOQUANT_BITS_OUTLIER
+        main_reg = TURBOQUANT_BITS_REGULAR - 1 if TURBOQUANT_ALGO == "prod" \
+            else TURBOQUANT_BITS_REGULAR
+        pack_out = _pow2_ceil(main_out)
+        pack_reg = _pow2_ceil(main_reg)
+
+        if (d_out * pack_out) % 8 != 0:
+            raise ValueError(
+                f"d_out={d_out} * pack_bits={pack_out} must be byte-aligned"
+            )
+        if (d_reg * pack_reg) % 8 != 0:
+            raise ValueError(
+                f"d_reg={d_reg} * pack_bits={pack_reg} must be byte-aligned"
+            )
+        if TURBOQUANT_ALGO == "prod":
+            if d_out % 8 != 0:
+                raise ValueError(
+                    f"d_out={d_out} must be divisible by 8 for QJL bit-packing"
+                )
+            if d_reg % 8 != 0:
+                raise ValueError(
+                    f"d_reg={d_reg} must be divisible by 8 for QJL bit-packing"
+                )
+
+        idx_last_out = d_out * pack_out // 8
+        idx_last_reg = d_reg * pack_reg // 8
+        shape_idx_out = (num_blocks, block_size, self.num_kv_heads, idx_last_out)
+        shape_idx_reg = (num_blocks, block_size, self.num_kv_heads, idx_last_reg)
+        shape_meta = (num_blocks, block_size, self.num_kv_heads)
+
+        def _uzeros(shape):
+            return torch.zeros(shape, dtype=torch.uint8, device=device)
+
+        def _fzeros(shape):
+            return torch.zeros(shape, dtype=torch.float32, device=device)
+
+        self._k_idx_out = _uzeros(shape_idx_out)
+        self._k_norm_out = _fzeros(shape_meta)
+        self._k_idx_reg = _uzeros(shape_idx_reg)
+        self._k_norm_reg = _fzeros(shape_meta)
+        self._v_idx_out = _uzeros(shape_idx_out)
+        self._v_norm_out = _fzeros(shape_meta)
+        self._v_idx_reg = _uzeros(shape_idx_reg)
+        self._v_norm_reg = _fzeros(shape_meta)
+
+        if TURBOQUANT_ALGO == "prod":
+            shape_qjl_out = (num_blocks, block_size, self.num_kv_heads,
+                             d_out // 8)
+            shape_qjl_reg = (num_blocks, block_size, self.num_kv_heads,
+                             d_reg // 8)
+            self._k_qjl_sign_out = _uzeros(shape_qjl_out)
+            self._k_rnorm_out = _fzeros(shape_meta)
+            self._k_qjl_sign_reg = _uzeros(shape_qjl_reg)
+            self._k_rnorm_reg = _fzeros(shape_meta)
+            self._v_qjl_sign_out = _uzeros(shape_qjl_out)
+            self._v_rnorm_out = _fzeros(shape_meta)
+            self._v_qjl_sign_reg = _uzeros(shape_qjl_reg)
+            self._v_rnorm_reg = _fzeros(shape_meta)
 
     # ------------------------------------------------------------------
     # vLLM hooks
@@ -342,29 +536,57 @@ class TurboQuantAttentionImpl(AttentionImpl):
         v = value.view(num_tokens, self.num_kv_heads, self.head_size)
 
         self._ensure_buffers(kv_cache)
+        self._ensure_state(key.dtype, key.device)
         block_size = kv_cache.shape[2]
-        state = self._ensure_state(key.dtype, key.device)
 
-        turboquant_store_kv(
-            new_k=k,
-            cache_k_idx=self._k_idx,
-            cache_k_norm=self._k_norm,
-            slot_mapping=slot_mapping,
-            state=state,
-            block_size=block_size,
-            cache_k_qjl_sign=self._k_qjl_sign,
-            cache_k_rnorm=self._k_rnorm,
-        )
-        turboquant_store_v(
-            new_v=v,
-            cache_v_idx=self._v_idx,
-            cache_v_norm=self._v_norm,
-            slot_mapping=slot_mapping,
-            state=state,
-            block_size=block_size,
-            cache_v_qjl_sign=self._v_qjl_sign,
-            cache_v_rnorm=self._v_rnorm,
-        )
+        if self._split:
+            turboquant_store_split(
+                new_x=k, state_split=self._k_split,
+                cache_idx_out=self._k_idx_out,
+                cache_norm_out=self._k_norm_out,
+                cache_qjl_sign_out=self._k_qjl_sign_out,
+                cache_rnorm_out=self._k_rnorm_out,
+                cache_idx_reg=self._k_idx_reg,
+                cache_norm_reg=self._k_norm_reg,
+                cache_qjl_sign_reg=self._k_qjl_sign_reg,
+                cache_rnorm_reg=self._k_rnorm_reg,
+                slot_mapping=slot_mapping,
+                block_size=block_size,
+            )
+            turboquant_store_split(
+                new_x=v, state_split=self._v_split,
+                cache_idx_out=self._v_idx_out,
+                cache_norm_out=self._v_norm_out,
+                cache_qjl_sign_out=self._v_qjl_sign_out,
+                cache_rnorm_out=self._v_rnorm_out,
+                cache_idx_reg=self._v_idx_reg,
+                cache_norm_reg=self._v_norm_reg,
+                cache_qjl_sign_reg=self._v_qjl_sign_reg,
+                cache_rnorm_reg=self._v_rnorm_reg,
+                slot_mapping=slot_mapping,
+                block_size=block_size,
+            )
+        else:
+            turboquant_store_kv(
+                new_k=k,
+                cache_k_idx=self._k_idx,
+                cache_k_norm=self._k_norm,
+                slot_mapping=slot_mapping,
+                state=self._state,
+                block_size=block_size,
+                cache_k_qjl_sign=self._k_qjl_sign,
+                cache_k_rnorm=self._k_rnorm,
+            )
+            turboquant_store_v(
+                new_v=v,
+                cache_v_idx=self._v_idx,
+                cache_v_norm=self._v_norm,
+                slot_mapping=slot_mapping,
+                state=self._state,
+                block_size=block_size,
+                cache_v_qjl_sign=self._v_qjl_sign,
+                cache_v_rnorm=self._v_rnorm,
+            )
 
     def forward(
         self,
@@ -394,26 +616,55 @@ class TurboQuantAttentionImpl(AttentionImpl):
         num_tokens = query.shape[0]
         q = query.view(num_tokens, self.num_heads, self.head_size)
         self._ensure_buffers(kv_cache)
-        state = self._ensure_state(query.dtype, query.device)
+        self._ensure_state(query.dtype, query.device)
 
-        attend_fn = (
-            _get_cuda_attend() if TURBOQUANT_USE_CUDA
-            else turboquant_paged_attention_tc
-        )
-        attn_out = attend_fn(
-            q=q,
-            cache_k_idx=self._k_idx,
-            cache_k_norm=self._k_norm,
-            cache_v_idx=self._v_idx,
-            cache_v_norm=self._v_norm,
-            block_table=attn_metadata.block_table,
-            seq_lens=attn_metadata.seq_lens,
-            query_start_loc=attn_metadata.query_start_loc,
-            state=state,
-            cache_k_qjl_sign=self._k_qjl_sign,
-            cache_k_rnorm=self._k_rnorm,
-            cache_v_qjl_sign=self._v_qjl_sign,
-            cache_v_rnorm=self._v_rnorm,
-        )
+        if self._split:
+            attn_out = turboquant_paged_attention_split_tc(
+                q=q,
+                cache_k_idx_out=self._k_idx_out,
+                cache_k_norm_out=self._k_norm_out,
+                cache_v_idx_out=self._v_idx_out,
+                cache_v_norm_out=self._v_norm_out,
+                cache_k_qjl_sign_out=self._k_qjl_sign_out,
+                cache_k_rnorm_out=self._k_rnorm_out,
+                cache_v_qjl_sign_out=self._v_qjl_sign_out,
+                cache_v_rnorm_out=self._v_rnorm_out,
+                cache_k_idx_reg=self._k_idx_reg,
+                cache_k_norm_reg=self._k_norm_reg,
+                cache_v_idx_reg=self._v_idx_reg,
+                cache_v_norm_reg=self._v_norm_reg,
+                cache_k_qjl_sign_reg=self._k_qjl_sign_reg,
+                cache_k_rnorm_reg=self._k_rnorm_reg,
+                cache_v_qjl_sign_reg=self._v_qjl_sign_reg,
+                cache_v_rnorm_reg=self._v_rnorm_reg,
+                block_table=attn_metadata.block_table,
+                seq_lens=attn_metadata.seq_lens,
+                query_start_loc=attn_metadata.query_start_loc,
+                state_k=self._k_split,
+                state_v=self._v_split,
+            )
+        else:
+            attn_out = turboquant_paged_attention_tc(
+                q=q,
+                cache_k_idx=self._k_idx,
+                cache_k_norm=self._k_norm,
+                cache_v_idx=self._v_idx,
+                cache_v_norm=self._v_norm,
+                block_table=attn_metadata.block_table,
+                seq_lens=attn_metadata.seq_lens,
+                query_start_loc=attn_metadata.query_start_loc,
+                state=self._state,
+                cache_k_qjl_sign=self._k_qjl_sign,
+                cache_k_rnorm=self._k_rnorm,
+                cache_v_qjl_sign=self._v_qjl_sign,
+                cache_v_rnorm=self._v_rnorm,
+            )
         output.copy_(attn_out.reshape_as(output))
         return output
+
+
+def _pow2_ceil(n: int) -> int:
+    """Smallest power of two >= max(1, n)."""
+    if n <= 1:
+        return 1
+    return 1 << (n - 1).bit_length()

@@ -212,6 +212,53 @@ def test_variable_bit_width_packing(
     assert state.codebook.max() < 1.01
 
 
+# ---------------------------------------------------------------------------
+# Stage 3: outlier channel splitting
+# ---------------------------------------------------------------------------
+def test_split_quant_state_complementary_indices() -> None:
+    from vllm.turboquant.outlier import SplitQuantState
+
+    head_dim = 128
+    outlier_idx = torch.tensor(
+        sorted([3, 17, 50, 77, 100, 120, 4, 90]), dtype=torch.int64
+    )
+    s = SplitQuantState(
+        algo="prod", bits_outlier=3, bits_regular=2,
+        head_dim=head_dim, outlier_idx=outlier_idx, seed=0,
+        dtype=torch.float32, device=torch.device("cpu"),
+    )
+    assert s.d_outlier == 8
+    assert s.d_regular == 120
+    # Regular indices should be the exact complement.
+    union = torch.cat([outlier_idx, s.regular_idx]).sort().values
+    assert torch.equal(union, torch.arange(head_dim, dtype=torch.int64))
+    # The two inner QuantStates should have the right dimensions.
+    assert s.state_out.Pi.shape == (8, 8)
+    assert s.state_reg.Pi.shape == (120, 120)
+
+
+@pytest.mark.parametrize(
+    "d_out,b_out,b_reg,expected",
+    [
+        (32, 3, 2, 2.25),   # paper's "2.5-bit" recipe actually sums to 2.25
+        (32, 4, 2, 2.5),    # true 2.5-bit
+        (64, 4, 3, 3.5),    # true 3.5-bit
+    ],
+)
+def test_split_effective_bits(
+    d_out: int, b_out: int, b_reg: int, expected: float
+) -> None:
+    from vllm.turboquant.outlier import SplitQuantState
+
+    outlier_idx = torch.arange(d_out, dtype=torch.int64)
+    s = SplitQuantState(
+        algo="prod", bits_outlier=b_out, bits_regular=b_reg,
+        head_dim=128, outlier_idx=outlier_idx, seed=0,
+        dtype=torch.float32, device=torch.device("cpu"),
+    )
+    assert abs(s.effective_bits() - expected) < 1e-6
+
+
 @pytest.mark.parametrize("d", [64, 128])
 def test_q_mse_reconstruction_bounded(d: int) -> None:
     """Paper Theorem 1: D_mse <= sqrt(3)*pi/2 * 1/4^b for unit-norm x."""

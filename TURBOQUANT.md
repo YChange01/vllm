@@ -58,6 +58,9 @@ vllm/v1/attention/backends/
 | `TURBOQUANT_ALGO` | `prod` | `mse` (Algorithm 1) or `prod` (Algorithm 2) |
 | `TURBOQUANT_BITS` | `4`    | total bit budget per coord; `prod` in {2..5}, `mse` in {1..4} on this branch |
 | `TURBOQUANT_USE_CUDA` | `0` | rejected on this branch (pending CUDA kernel rewrite) |
+| `TURBOQUANT_OUTLIER_MASK` | `""` | path to `.pt` produced by `scripts/calibrate_outliers.py`; enables outlier channel split |
+| `TURBOQUANT_BITS_OUTLIER` | `TURBOQUANT_BITS` | bit budget for outlier slice when split mode is on |
+| `TURBOQUANT_BITS_REGULAR` | `TURBOQUANT_BITS` | bit budget for regular slice when split mode is on |
 
 ## Test scripts
 
@@ -98,13 +101,38 @@ TURBOQUANT_ALGO=prod TURBOQUANT_BITS=8 \
 For a longer prompt or different model, edit the `MODEL` env var or
 positional args of `test/baseline.sh`.
 
+## Outlier channel splitting (paper §4.3)
+
+Enable by running calibration first:
+
+```bash
+python3 scripts/calibrate_outliers.py \
+    --model meta-llama/Llama-3.1-8B-Instruct \
+    --dataset wikitext2 --num-samples 128 --seq-len 2048 \
+    --num-outliers 32 --output /tmp/outliers_llama3_8b_32.pt
+```
+
+Then point the backend at the mask and pick per-slice bit budgets:
+
+```bash
+export TURBOQUANT_ALGO=prod
+export TURBOQUANT_OUTLIER_MASK=/tmp/outliers_llama3_8b_32.pt
+export TURBOQUANT_BITS_OUTLIER=4    # 32 channels at 4 bits
+export TURBOQUANT_BITS_REGULAR=2    # 96 channels at 2 bits
+# -> effective (32*4 + 96*2)/128 = 2.5 bits/coord
+```
+
+Note: paper's §4.3 "2.5-bit example (32 outlier @ 3 + 96 regular @ 2)"
+actually computes to 2.25 bits; the arithmetic in the paper has a
+typo. True 2.5-bit is 32@4 + 96@2 or 64@3 + 64@2.
+
 ## Known limitations (paper-repro branch)
 
-- Homogeneous bit width across channels. Paper's 2.5-bit / 3.5-bit
-  modes (Table 1) require per-head, per-layer outlier channel
-  splitting (Stage 3).
 - b in {2, 3, 4, 5} for prod; {1, 2, 3, 4} for mse. main_bits=5..8
   (pack_bits=8) is not tuned on this branch.
+- Split mode uses per-layer (not per-kv_head) outlier channels; K and
+  V share the same channel indices for compatibility with the split
+  kernel's shape assumptions.
 - CUDA WMMA kernel is disabled; only the Triton TC path is updated
   for paper-faithful scaling and the V-QJL accumulator split.
 - ALiBi, sliding window, and `logits_soft_cap` are not supported.

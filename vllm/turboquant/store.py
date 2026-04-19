@@ -312,3 +312,56 @@ def turboquant_store_v(
         block_size,
         use_qjl=use_qjl,
     )
+
+
+def turboquant_store_split(
+    new_x: torch.Tensor,
+    state_split,  # SplitQuantState
+    cache_idx_out: torch.Tensor,
+    cache_norm_out: torch.Tensor,
+    cache_qjl_sign_out: torch.Tensor | None,
+    cache_rnorm_out: torch.Tensor | None,
+    cache_idx_reg: torch.Tensor,
+    cache_norm_reg: torch.Tensor,
+    cache_qjl_sign_reg: torch.Tensor | None,
+    cache_rnorm_reg: torch.Tensor | None,
+    slot_mapping: torch.Tensor,
+    block_size: int,
+) -> None:
+    """Quantize one tensor (K or V) by gathering outlier vs regular
+    channels and running two independent TurboQuant instances.
+
+    Applies paper §4.3's "two independent instances of TurboQuant"
+    split. Each slice is normalized independently -- its ``||x||`` is
+    the L2 norm of its own channel subset, not the whole head. This
+    matches the paper's Algorithm 2 applied to each slice.
+    """
+    if new_x.shape[0] == 0:
+        return
+    use_qjl = state_split.algo == "prod"
+    if use_qjl:
+        assert cache_qjl_sign_out is not None and cache_rnorm_out is not None
+        assert cache_qjl_sign_reg is not None and cache_rnorm_reg is not None
+
+    # Gather the two channel subsets along the last dim.
+    x_out = new_x.index_select(dim=-1, index=state_split.outlier_idx)
+    x_reg = new_x.index_select(dim=-1, index=state_split.regular_idx)
+
+    _rotate_and_store(
+        x_out,
+        cache_idx_out, cache_norm_out,
+        cache_qjl_sign_out, cache_rnorm_out,
+        slot_mapping,
+        state_split.state_out,
+        block_size,
+        use_qjl=use_qjl,
+    )
+    _rotate_and_store(
+        x_reg,
+        cache_idx_reg, cache_norm_reg,
+        cache_qjl_sign_reg, cache_rnorm_reg,
+        slot_mapping,
+        state_split.state_reg,
+        block_size,
+        use_qjl=use_qjl,
+    )
