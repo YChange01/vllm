@@ -220,9 +220,11 @@ def main() -> None:
     tokenizer = AutoTokenizer.from_pretrained(args.model)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
-    model = AutoModelForCausalLM.from_pretrained(
-        args.model, torch_dtype=dtype, device_map=args.device,
-    )
+    # Don't pass device_map -- that triggers a transformers requirement
+    # on the `accelerate` package. Load to CPU in the target dtype, then
+    # move to the target CUDA device ourselves.
+    model = AutoModelForCausalLM.from_pretrained(args.model, dtype=dtype)
+    model = model.to(args.device)
     model.eval()
 
     cfg = model.config
