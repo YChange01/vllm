@@ -61,6 +61,7 @@ def _store_quant_kernel(
     K_CB: tl.constexpr,
     PACK_BITS: tl.constexpr,         # 1, 2, 4, or 8
     USE_QJL: tl.constexpr,
+    USE_TIGHT: tl.constexpr,         # b=4 prod only: pack qjl_bit into nibble
 ):
     tok = tl.program_id(0)
     kvh = tl.program_id(1)
@@ -86,6 +87,29 @@ def _store_quant_kernel(
         boundary = tl.load(boundaries_ptr + c)
         idx += (rot >= boundary).to(tl.int32)
     idx = tl.minimum(idx, K_CB - 1)
+
+    # --- 2.5) (USE_TIGHT only) Pre-compute QJL sign and merge into idx ---
+    # In tight pack mode (only valid for b=4 prod, main_bits=3), the
+    # 4-bit nibble that would normally hold a 3-bit idx + 1 wasted bit
+    # instead holds [qjl_bit | idx]. We compute qjl here so we can OR
+    # it into the nibble before the standard pack.
+    if USE_TIGHT:
+        rk = tl.load(codebook_ptr + idx).to(tl.float32)
+        r = rot - rk
+        r_norm_sq = tl.sum(r * r)
+        r_norm = tl.sqrt(r_norm_sq)
+        r_norm = tl.maximum(r_norm, 1e-6)
+        r_unit = r / r_norm
+        S_tile = tl.load(
+            S_ptr + d_idx[:, None] * head_size + d_idx[None, :],
+            mask=mask_d[:, None] & mask_d[None, :],
+            other=0.0,
+        ).to(tl.float32)
+        qjl_raw = tl.sum(S_tile * r_unit[None, :], axis=1)
+        qjl_bit_tight = (qjl_raw < 0).to(tl.int32)
+        # Merge: pack idx into low 3 bits, qjl into bit 3.
+        # PACK_BITS is 4, so each idx already has 4 bits to play with.
+        idx = idx | (qjl_bit_tight << 3)
 
     # --- 3) Pack PACK_BITS-bit indices into uint8 via mask-sum ---
     # PACK_BITS in {1, 2, 4, 8} => N_PER_BYTE in {8, 4, 2, 1}.
@@ -119,8 +143,18 @@ def _store_quant_kernel(
     )
     tl.store(cache_norm_ptr + meta_out, norm_val)
 
-    # --- 5) Prod path: QJL on residual r = rot - codebook[idx] ---
-    if USE_QJL:
+    # --- 5) Prod path ---
+    # Tight mode: qjl_bit was already merged into the idx nibble at
+    # step 2.5; we only need to recompute r_norm here for storage.
+    # Non-tight: full computation + write to separate qjl byte buffer.
+    if USE_TIGHT:
+        rk = tl.load(codebook_ptr + (idx & 7)).to(tl.float32)
+        r = rot - rk
+        r_norm_sq = tl.sum(r * r)
+        r_norm = tl.sqrt(r_norm_sq)
+        r_norm = tl.maximum(r_norm, 1e-6)
+        tl.store(cache_rnorm_ptr + meta_out, r_norm)
+    elif USE_QJL:
         rk = tl.load(codebook_ptr + idx).to(tl.float32)
         r = rot - rk
 
@@ -218,14 +252,29 @@ def _rotate_and_store(
         f"cache_idx last dim {idx_dim} != expected {expected_idx_dim} "
         f"(head_dim={d}, pack_bits={pack_bits})"
     )
-    qjl_dim = int(cache_qjl_sign.shape[-1]) if use_qjl else 1
+    use_tight = bool(getattr(state, "tight_pack", False))
+    if use_tight:
+        # Tight packs qjl_bit into the idx nibble; cache_qjl_sign is
+        # not allocated by the backend in this mode. cache_rnorm is
+        # still required (rnorm magnitude isn't merged).
+        assert cache_rnorm is not None, "tight_pack requires cache_rnorm"
+        qjl_dim = 1   # dummy; kernel won't write to qjl buffer
+    else:
+        qjl_dim = int(cache_qjl_sign.shape[-1]) if use_qjl else 1
 
     BLOCK_D = triton.next_power_of_2(d)
     BLOCK_IDX_DIM = triton.next_power_of_2(idx_dim)
     BLOCK_QJL_DIM = triton.next_power_of_2(qjl_dim) if use_qjl else 1
 
-    qjl_sign_buf = cache_qjl_sign if use_qjl else cache_idx
-    rnorm_buf = cache_rnorm if use_qjl else cache_norm
+    # Buffer routing. In tight mode the kernel ignores qjl_sign_buf
+    # but still needs a valid pointer for the kernel signature; reuse
+    # cache_idx as a same-dtype dummy.
+    if use_tight:
+        qjl_sign_buf = cache_idx
+        rnorm_buf = cache_rnorm
+    else:
+        qjl_sign_buf = cache_qjl_sign if use_qjl else cache_idx
+        rnorm_buf = cache_rnorm if use_qjl else cache_norm
     S_buf = state.S if use_qjl else state.Pi  # any same-dtype tensor works
 
     grid = (T, H_kv)
@@ -251,6 +300,7 @@ def _rotate_and_store(
         K_CB=K_CB,
         PACK_BITS=pack_bits,
         USE_QJL=use_qjl,
+        USE_TIGHT=use_tight,
     )
 
 
@@ -266,10 +316,13 @@ def turboquant_store_kv(
 ) -> None:
     """Quantize K into the paged caches via the shared store kernel."""
     use_qjl = state.algo == "prod"
-    if use_qjl:
+    use_tight = bool(getattr(state, "tight_pack", False))
+    if use_qjl and not use_tight:
         assert cache_k_qjl_sign is not None and cache_k_rnorm is not None, (
             "prod requires cache_k_qjl_sign and cache_k_rnorm"
         )
+    if use_tight:
+        assert cache_k_rnorm is not None, "tight_pack requires cache_k_rnorm"
     _rotate_and_store(
         new_k,
         cache_k_idx,
@@ -295,12 +348,16 @@ def turboquant_store_v(
 ) -> None:
     """Quantize V with the same quantizer as K (paper Section 4.2 applies
     TurboQuant uniformly to the KV cache). prod mode stores (idx, norm,
-    qjl_sign, r_norm) just like K."""
+    qjl_sign, r_norm) just like K. In tight_pack mode the qjl_sign byte
+    is merged into the idx nibble; only (idx, norm, r_norm) are stored."""
     use_qjl = state.algo == "prod"
-    if use_qjl:
+    use_tight = bool(getattr(state, "tight_pack", False))
+    if use_qjl and not use_tight:
         assert cache_v_qjl_sign is not None and cache_v_rnorm is not None, (
             "prod requires cache_v_qjl_sign and cache_v_rnorm"
         )
+    if use_tight:
+        assert cache_v_rnorm is not None, "tight_pack requires cache_v_rnorm"
     _rotate_and_store(
         new_v,
         cache_v_idx,

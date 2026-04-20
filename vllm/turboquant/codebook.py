@@ -171,6 +171,7 @@ class QuantState:
         seed: int,
         dtype: torch.dtype,
         device: torch.device,
+        tight_pack: bool = False,
     ) -> None:
         if algo not in ("mse", "prod"):
             raise ValueError(f"algo must be 'mse' or 'prod', got {algo!r}")
@@ -178,12 +179,27 @@ class QuantState:
             raise ValueError(
                 f"prod requires bits >= 2 (1 bit reserved for QJL); got {bits}"
             )
+        # tight_pack merges the QJL sign bit into the high bit of each
+        # idx nibble, eliminating the 1-bit pack waste that plagues
+        # b=4 prod (main_bits=3 -> pack_bits=4 leaves bit 3 unused).
+        # Only meaningful when prod + main_bits=3 + pack_bits=4.
+        if tight_pack:
+            if algo != "prod":
+                raise ValueError("tight_pack requires algo='prod'")
+            main_bits_check = bits - 1
+            if main_bits_check != 3:
+                raise ValueError(
+                    f"tight_pack only valid for b=4 prod "
+                    f"(main_bits=3); got bits={bits} -> "
+                    f"main_bits={main_bits_check}"
+                )
 
         self.algo = algo
         self.bits = bits
         self.head_dim = head_dim
         self.main_bits = bits - 1 if algo == "prod" else bits
         self.pack_bits = _pow2_ceil(self.main_bits)
+        self.tight_pack = tight_pack
         if self.pack_bits not in (1, 2, 4, 8):
             raise ValueError(
                 f"pack_bits must be 1, 2, 4, or 8; got {self.pack_bits} "

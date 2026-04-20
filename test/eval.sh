@@ -3,7 +3,9 @@
 #
 # Available stages:
 #   FLASH_ATTN                 (fp baseline)
-#   TURBOQUANT_b4              (homog prod b=4; ~5-bit actual storage)
+#   TURBOQUANT_b4              (homog prod b=4; 5-bit actual storage)
+#   TURBOQUANT_b4_r            (homog prod b=4 tight nibble; honest
+#                               4-bit/coord, no pack waste)
 #   TURBOQUANT_b2              (homog prod b=2; 2-bit quality floor)
 #   TURBOQUANT_split_2_25bit   (paper 4.3 literal: 32@b=3 + 96@b=2;
 #                               2.25-bit effective; requires OUTLIER_MASK)
@@ -165,6 +167,11 @@ stage_config() {
             ;;
         TURBOQUANT_b4)
             echo "$TQ_PORT TURBOQUANT 'TURBOQUANT_ALGO=prod TURBOQUANT_BITS=4' tq4_server.log tq4_eval.log"
+            ;;
+        TURBOQUANT_b4_r)
+            # Tight nibble pack: 3-bit Lloyd-Max idx + 1-bit QJL into
+            # one 4-bit nibble (no pack waste). Honest 4 bit/coord.
+            echo "$TQ_PORT TURBOQUANT 'TURBOQUANT_ALGO=prod TURBOQUANT_BITS=4 TURBOQUANT_TIGHT_PACK=1' tq4r_server.log tq4r_eval.log"
             ;;
         TURBOQUANT_b2)
             echo "$TQ_PORT TURBOQUANT 'TURBOQUANT_ALGO=prod TURBOQUANT_BITS=2' tq2_server.log tq2_eval.log"

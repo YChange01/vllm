@@ -153,6 +153,7 @@ stage_args() {
         FLASH_ATTN)             echo "FLASH_ATTN  " ;;
         TURBOQUANT_mse_b4)      echo "TURBOQUANT  TURBOQUANT_ALGO=mse TURBOQUANT_BITS=4" ;;
         TURBOQUANT_prod_b4)     echo "TURBOQUANT  TURBOQUANT_ALGO=prod TURBOQUANT_BITS=4" ;;
+        TURBOQUANT_prod_b4_r)   echo "TURBOQUANT  TURBOQUANT_ALGO=prod TURBOQUANT_BITS=4 TURBOQUANT_TIGHT_PACK=1" ;;
         TURBOQUANT_split_3_5bit)
             if [ ! -f "${OUTLIER_MASK:-}" ]; then
                 echo "[fig4] stage $1 needs OUTLIER_MASK at $OUTLIER_MASK" >&2

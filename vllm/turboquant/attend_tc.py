@@ -64,7 +64,8 @@ _AUTOTUNE_CONFIGS = [
 
 @triton.autotune(
     configs=_AUTOTUNE_CONFIGS,
-    key=["head_size", "K_CB", "PACK_BITS", "USE_QJL", "BLOCK_M", "GQA_GROUP"],
+    key=["head_size", "K_CB", "PACK_BITS", "USE_QJL", "USE_TIGHT",
+         "BLOCK_M", "GQA_GROUP"],
 )
 @triton.jit
 def _tc_attend_kernel(
@@ -101,6 +102,7 @@ def _tc_attend_kernel(
     K_CB: tl.constexpr,
     PACK_BITS: tl.constexpr,        # 1, 2, 4, or 8
     USE_QJL: tl.constexpr,
+    USE_TIGHT: tl.constexpr,        # b=4 prod tight nibble (idx+qjl)
     GQA_GROUP: tl.constexpr,
 ):
     q_idx = tl.program_id(0)
@@ -145,6 +147,9 @@ def _tc_attend_kernel(
     # Variable-bit unpack layout. PACK_BITS in {1, 2, 4, 8}.
     N_PER_BYTE: tl.constexpr = 8 // PACK_BITS
     UNPACK_MASK: tl.constexpr = (1 << PACK_BITS) - 1
+    # In tight mode the high bit of each 4-bit nibble is the QJL sign;
+    # the low 3 bits are the Lloyd-Max idx. Otherwise full nibble = idx.
+    IDX_MASK: tl.constexpr = 7 if USE_TIGHT else UNPACK_MASK
     d_pack = d_off // N_PER_BYTE
     d_bit_shift = (d_off % N_PER_BYTE) * PACK_BITS
 
@@ -183,9 +188,9 @@ def _tc_attend_kernel(
             mask=mask_n[:, None] & mask_d[None, :],
             other=0,
         ).to(tl.uint8)
-        k_idx_full = (
-            (packed_k.to(tl.int32) >> d_bit_shift[None, :]) & UNPACK_MASK
-        )
+        # In tight mode the nibble = (qjl_bit << 3) | idx; we need both.
+        nibble_k = (packed_k.to(tl.int32) >> d_bit_shift[None, :]) & UNPACK_MASK
+        k_idx_full = nibble_k & IDX_MASK
         k_tile = tl.load(codebook_ptr + k_idx_full)
 
         k_norm = tl.load(cache_k_norm_ptr + meta_addrs, mask=mask_n, other=0.0)
@@ -200,20 +205,26 @@ def _tc_attend_kernel(
 
         if USE_QJL:
             # QJL on K: unpack 1-bit signs into +/-1 bf16 tile.
-            bit_pos = d_off % 8
-            byte_pos = d_off // 8
-            base_qjl = (
-                phys_blocks * (block_size * num_heads_kv * qjl_dim)
-                + tok_in_block * (num_heads_kv * qjl_dim)
-                + kvh_idx * qjl_dim
-            )
-            addrs_qjl_k = base_qjl[:, None] + byte_pos[None, :]
-            qjl_byte_k = tl.load(
-                cache_k_qjl_sign_ptr + addrs_qjl_k,
-                mask=mask_n[:, None] & mask_d[None, :],
-                other=0,
-            ).to(tl.int32)
-            bit_k = (qjl_byte_k >> bit_pos[None, :]) & 1
+            if USE_TIGHT:
+                # Sign was packed at bit 3 of each idx nibble; reuse
+                # nibble_k (already loaded above) instead of a second
+                # buffer load.
+                bit_k = (nibble_k >> 3) & 1
+            else:
+                bit_pos = d_off % 8
+                byte_pos = d_off // 8
+                base_qjl = (
+                    phys_blocks * (block_size * num_heads_kv * qjl_dim)
+                    + tok_in_block * (num_heads_kv * qjl_dim)
+                    + kvh_idx * qjl_dim
+                )
+                addrs_qjl_k = base_qjl[:, None] + byte_pos[None, :]
+                qjl_byte_k = tl.load(
+                    cache_k_qjl_sign_ptr + addrs_qjl_k,
+                    mask=mask_n[:, None] & mask_d[None, :],
+                    other=0,
+                ).to(tl.int32)
+                bit_k = (qjl_byte_k >> bit_pos[None, :]) & 1
             qjl_sign_tile_k = (
                 1.0 - 2.0 * bit_k.to(tl.float32)
             ).to(COMPUTE_DTYPE)
@@ -254,9 +265,8 @@ def _tc_attend_kernel(
             mask=mask_n[:, None] & mask_d[None, :],
             other=0,
         ).to(tl.uint8)
-        v_idx_full = (
-            (packed_v.to(tl.int32) >> d_bit_shift[None, :]) & UNPACK_MASK
-        )
+        nibble_v = (packed_v.to(tl.int32) >> d_bit_shift[None, :]) & UNPACK_MASK
+        v_idx_full = nibble_v & IDX_MASK
         v_tile = tl.load(codebook_ptr + v_idx_full)
 
         v_norm = tl.load(cache_v_norm_ptr + meta_addrs, mask=mask_n, other=0.0)
@@ -270,13 +280,16 @@ def _tc_attend_kernel(
         if USE_QJL:
             # V QJL: 1-bit signs scaled by ||r_v|| * ||v||. The Python
             # post-pass applies Sv^T and then Pi^T to acc_qjl.
-            addrs_qjl_v = base_qjl[:, None] + byte_pos[None, :]
-            qjl_byte_v = tl.load(
-                cache_v_qjl_sign_ptr + addrs_qjl_v,
-                mask=mask_n[:, None] & mask_d[None, :],
-                other=0,
-            ).to(tl.int32)
-            bit_v = (qjl_byte_v >> bit_pos[None, :]) & 1
+            if USE_TIGHT:
+                bit_v = (nibble_v >> 3) & 1
+            else:
+                addrs_qjl_v = base_qjl[:, None] + byte_pos[None, :]
+                qjl_byte_v = tl.load(
+                    cache_v_qjl_sign_ptr + addrs_qjl_v,
+                    mask=mask_n[:, None] & mask_d[None, :],
+                    other=0,
+                ).to(tl.int32)
+                bit_v = (qjl_byte_v >> bit_pos[None, :]) & 1
             qjl_sign_tile_v = (
                 1.0 - 2.0 * bit_v.to(tl.float32)
             ).to(COMPUTE_DTYPE)
@@ -336,9 +349,13 @@ def turboquant_paged_attention_tc(
     assert block_table.shape[0] >= num_seqs
 
     use_qjl = state.algo == "prod"
-    if use_qjl:
+    use_tight = bool(getattr(state, "tight_pack", False))
+    if use_qjl and not use_tight:
         assert cache_k_qjl_sign is not None and cache_k_rnorm is not None
         assert cache_v_qjl_sign is not None and cache_v_rnorm is not None
+    if use_tight:
+        # Tight: qjl bits are merged into idx nibbles; only need rnorm.
+        assert cache_k_rnorm is not None and cache_v_rnorm is not None
 
     K_CB = int(state.codebook.shape[0])
     pack_bits = state.pack_bits
@@ -384,8 +401,15 @@ def turboquant_paged_attention_tc(
     else:
         Sq = q_rotated  # unused by the kernel when USE_QJL=False
 
-    qjl_dim = head_size // 8 if use_qjl else 1
-    if use_qjl:
+    qjl_dim = head_size // 8 if (use_qjl and not use_tight) else 1
+    if use_tight:
+        # Kernel reads qjl from idx nibble; the qjl ptr is unused but
+        # needs to be a valid same-dtype tensor for the signature.
+        k_qjl_buf = cache_k_idx
+        v_qjl_buf = cache_v_idx
+        k_rnorm_buf = cache_k_rnorm
+        v_rnorm_buf = cache_v_rnorm
+    elif use_qjl:
         assert cache_k_qjl_sign.dtype == torch.uint8
         assert cache_k_qjl_sign.shape[-1] == qjl_dim
         assert cache_v_qjl_sign.shape[-1] == qjl_dim
@@ -453,6 +477,7 @@ def turboquant_paged_attention_tc(
         K_CB=K_CB,
         PACK_BITS=pack_bits,
         USE_QJL=use_qjl,
+        USE_TIGHT=use_tight,
         GQA_GROUP=gqa_group,
     )
 

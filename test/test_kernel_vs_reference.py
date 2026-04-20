@@ -99,7 +99,7 @@ def _cos_sim(a: torch.Tensor, b: torch.Tensor) -> float:
     ).mean().item()
 
 
-def check_homogeneous(bits: int) -> bool:
+def check_homogeneous(bits: int, tight_pack: bool = False) -> bool:
     torch.manual_seed(0)
     T_q, T_kv, H_q, H_kv, d = 4, 32, 8, 2, 128
     block_size = 16
@@ -107,7 +107,7 @@ def check_homogeneous(bits: int) -> bool:
 
     state = QuantState(
         algo="prod", bits=bits, head_dim=d, seed=0,
-        dtype=DTYPE, device=DEVICE,
+        dtype=DTYPE, device=DEVICE, tight_pack=tight_pack,
     )
 
     k = torch.randn(T_kv, H_kv, d, dtype=DTYPE, device=DEVICE)
@@ -181,8 +181,9 @@ def check_homogeneous(bits: int) -> bool:
     cos = _cos_sim(out_triton, out_ref)
     ok = diff < HOMOG_MAX_ABS and cos > HOMOG_COS
     status = "PASS" if ok else "FAIL"
+    label = f"homog b={bits}{'  [tight]' if tight_pack else ''}"
     print(
-        f"  [{status}] homog b={bits}: max_abs_diff={diff:.4f}  "
+        f"  [{status}] {label}: max_abs_diff={diff:.4f}  "
         f"cos_sim={cos:.5f}"
     )
     return ok
@@ -306,6 +307,7 @@ def main() -> int:
     # in one invocation, even when early cases fail.
     results: list[bool] = [
         check_homogeneous(bits=4),
+        check_homogeneous(bits=4, tight_pack=True),    # b4_r honest 4-bit
         check_homogeneous(bits=2),
         check_homogeneous(bits=5),
         check_split(bits_out=4, bits_reg=3, d_out=64, with_outliers=False,

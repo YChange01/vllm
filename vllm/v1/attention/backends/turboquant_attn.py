@@ -99,6 +99,12 @@ TURBOQUANT_BITS_OUTLIER = int(
 TURBOQUANT_BITS_REGULAR = int(
     os.environ.get("TURBOQUANT_BITS_REGULAR", str(TURBOQUANT_BITS))
 )
+# Tight pack: merge the QJL sign bit into the high bit of each idx
+# nibble. Eliminates the 1-bit pack waste of b=4 prod (main=3 padded
+# to pack=4) so storage matches paper density of 4 bit/coord. Only
+# valid for homog prod b=4; ignored otherwise. Split mode unaffected
+# (split's b=5+b=3 are already clean).
+TURBOQUANT_TIGHT_PACK = os.environ.get("TURBOQUANT_TIGHT_PACK", "0") == "1"
 
 if TURBOQUANT_ALGO not in ("mse", "prod"):
     raise ValueError(
@@ -148,10 +154,26 @@ if TURBOQUANT_OUTLIER_MASK:
         _OUTLIER_MASK.head_dim - _OUTLIER_MASK.num_outliers,
     )
 
+# Validate tight pack: only b=4 prod; split mode incompatible.
+_HOMOG_TIGHT = (
+    TURBOQUANT_TIGHT_PACK
+    and TURBOQUANT_ALGO == "prod"
+    and TURBOQUANT_BITS == 4
+    and _OUTLIER_MASK is None
+)
+if TURBOQUANT_TIGHT_PACK and not _HOMOG_TIGHT:
+    raise ValueError(
+        f"TURBOQUANT_TIGHT_PACK=1 only valid for homog prod b=4 "
+        f"(got algo={TURBOQUANT_ALGO} bits={TURBOQUANT_BITS} "
+        f"split={bool(_OUTLIER_MASK)}). Unset the flag for other "
+        f"configs."
+    )
+
 logger.info(
-    "TurboQuant backend (paper-repro): algo=%s bits=%d split=%s use_cuda=%s",
+    "TurboQuant backend (paper-repro): algo=%s bits=%d split=%s "
+    "use_cuda=%s tight_pack=%s",
     TURBOQUANT_ALGO, TURBOQUANT_BITS,
-    bool(_OUTLIER_MASK), TURBOQUANT_USE_CUDA,
+    bool(_OUTLIER_MASK), TURBOQUANT_USE_CUDA, _HOMOG_TIGHT,
 )
 
 
@@ -402,6 +424,7 @@ class TurboQuantAttentionImpl(AttentionImpl):
                     seed=self._layer_seed,
                     dtype=dtype,
                     device=device,
+                    tight_pack=_HOMOG_TIGHT,
                 )
             return self._state
 
@@ -434,20 +457,23 @@ class TurboQuantAttentionImpl(AttentionImpl):
 
         if TURBOQUANT_ALGO == "prod":
             assert self.head_size % 8 == 0
-            shape_qjl = (num_blocks, block_size, self.num_kv_heads,
-                         self.head_size // 8)
-            self._k_qjl_sign = torch.zeros(
-                shape_qjl, dtype=torch.uint8, device=device
-            )
+            # rnorm always allocated; qjl_sign skipped in tight mode
+            # (merged into the high bit of each idx nibble).
             self._k_rnorm = torch.zeros(
                 shape_meta, dtype=torch.float32, device=device
-            )
-            self._v_qjl_sign = torch.zeros(
-                shape_qjl, dtype=torch.uint8, device=device
             )
             self._v_rnorm = torch.zeros(
                 shape_meta, dtype=torch.float32, device=device
             )
+            if not _HOMOG_TIGHT:
+                shape_qjl = (num_blocks, block_size, self.num_kv_heads,
+                             self.head_size // 8)
+                self._k_qjl_sign = torch.zeros(
+                    shape_qjl, dtype=torch.uint8, device=device
+                )
+                self._v_qjl_sign = torch.zeros(
+                    shape_qjl, dtype=torch.uint8, device=device
+                )
 
     def _allocate_split_buffers(self, kv_cache: torch.Tensor) -> None:
         num_blocks = kv_cache.shape[1]
