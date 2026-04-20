@@ -37,8 +37,8 @@ SEED="${SEED:-42}"
 # Which stages to run. Space-separated tags.
 STAGES="${STAGES:-FLASH_ATTN TURBOQUANT_prod_b4 TURBOQUANT_split_3_5bit}"
 
-FP_PORT=8010
-TQ_PORT=8009
+FP_PORT="${FP_PORT:-8010}"
+TQ_PORT="${TQ_PORT:-8009}"
 
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 TS="$(date +%Y%m%d_%H%M%S)"
