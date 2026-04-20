@@ -59,6 +59,7 @@ from vllm.turboquant.attend_split_tc import (
 )
 from vllm.turboquant.attend_tc import turboquant_paged_attention_tc
 from vllm.turboquant.codebook import QuantState
+from vllm.turboquant.config import TurboQuantConfig
 from vllm.turboquant.outlier import OutlierMask, SplitQuantState
 from vllm.turboquant.store import (
     turboquant_store_kv,
@@ -83,56 +84,15 @@ set_kv_cache_layout("NHD")
 
 logger = init_logger(__name__)
 
-TURBOQUANT_ALGO = os.environ.get("TURBOQUANT_ALGO", "prod").lower()
-TURBOQUANT_BITS = int(os.environ.get("TURBOQUANT_BITS", "4"))
-TURBOQUANT_USE_CUDA = os.environ.get("TURBOQUANT_USE_CUDA", "0") == "1"
-# Outlier channel splitting (paper §4.3). When set, the mask file is
-# loaded once at module init and the backend switches from homogeneous
-# quantization to two-slice quantization. BITS_OUTLIER / BITS_REGULAR
-# control the per-slice bit budgets (e.g., 3+2 for paper's literal
-# "2.5-bit" config -- arithmetically 2.25 -- on Llama's 128-dim heads
-# with 32 outliers).
-TURBOQUANT_OUTLIER_MASK = os.environ.get("TURBOQUANT_OUTLIER_MASK", "")
-TURBOQUANT_BITS_OUTLIER = int(
-    os.environ.get("TURBOQUANT_BITS_OUTLIER", str(TURBOQUANT_BITS))
-)
-TURBOQUANT_BITS_REGULAR = int(
-    os.environ.get("TURBOQUANT_BITS_REGULAR", str(TURBOQUANT_BITS))
-)
-# Tight pack: merge the QJL sign bit into the high bit of each idx
-# nibble. Eliminates the 1-bit pack waste of b=4 prod (main=3 padded
-# to pack=4) so storage matches paper density of 4 bit/coord. Only
-# valid for homog prod b=4; ignored otherwise. Split mode unaffected
-# (split's b=5+b=3 are already clean).
-TURBOQUANT_TIGHT_PACK = os.environ.get("TURBOQUANT_TIGHT_PACK", "0") == "1"
-# Store norm/rnorm scalars as fp16 instead of fp32. Cuts the per-slot
-# metadata in half (4 fp32 -> 4 fp16 per K side; 32 B -> 16 B per K+V
-# in split mode). Math inside the kernel stays fp32 -- only the cache
-# buffer dtype changes. Loss: ~0.1% relative error in the rescale,
-# negligible vs Lloyd-Max + QJL noise.
-TURBOQUANT_FP16_NORMS = os.environ.get("TURBOQUANT_FP16_NORMS", "0") == "1"
-# Quantize rnorm to uint8 in [0, RNORM_MAX=2.0] (1 B/slot vs 4 B fp32
-# or 2 B fp16). ~1% relative precision loss in rnorm dequant. Combined
-# with FP16_NORMS, K-side metadata drops 16 B -> 6 B in split mode.
-TURBOQUANT_UINT8_RNORM = os.environ.get("TURBOQUANT_UINT8_RNORM", "0") == "1"
+# Single source of truth for all axes of TurboQuant configuration.
+# See vllm/turboquant/config.py for the dataclass and env-var schema.
+_CFG = TurboQuantConfig.from_env()
+_CFG.validate()
 
-if TURBOQUANT_ALGO not in ("mse", "prod"):
-    raise ValueError(
-        f"TURBOQUANT_ALGO must be 'mse' or 'prod', got {TURBOQUANT_ALGO!r}"
-    )
-_MAIN_BITS = (
-    TURBOQUANT_BITS - 1 if TURBOQUANT_ALGO == "prod" else TURBOQUANT_BITS
-)
-# Triton kernel supports PACK_BITS in {1, 2, 4, 8}. main_bits in {1..4}
-# keep pack_bits<=4 on this branch -- main_bits>=5 would need byte-wide
-# storage (pack_bits=8) plus corresponding autotune re-tuning.
-if _MAIN_BITS < 1 or _MAIN_BITS > 4:
-    raise ValueError(
-        f"turboquant-paper-repro branch supports bits in {{1..5}} "
-        f"(main_bits {{1..4}}); got algo={TURBOQUANT_ALGO} "
-        f"bits={TURBOQUANT_BITS} -> main_bits={_MAIN_BITS}."
-    )
-if TURBOQUANT_USE_CUDA:
+# Branch-specific extra validation: paper-repro Triton TC kernel only
+# supports main_bits 1..4 and explicitly rejects the legacy CUDA WMMA
+# path (which hasn't been updated for paper-faithful Pi + V-QJL).
+if _CFG.use_cuda:
     raise ValueError(
         "TURBOQUANT_USE_CUDA=1 is not supported on the paper-repro "
         "branch. The CUDA WMMA kernel has not been updated for the "
@@ -140,54 +100,50 @@ if TURBOQUANT_USE_CUDA:
         "1/sqrt(d) scale) or the V-QJL accumulator split. Use the "
         "Triton TC kernel (unset the env var)."
     )
+if not _CFG.is_split:
+    if _CFG.main_bits < 1 or _CFG.main_bits > 4:
+        raise ValueError(
+            f"turboquant-paper-repro branch supports bits in {{1..5}} "
+            f"(main_bits {{1..4}}); got algo={_CFG.algo} "
+            f"bits={_CFG.bits} -> main_bits={_CFG.main_bits}."
+        )
 
+# Load outlier mask once (split mode only).
 _OUTLIER_MASK: OutlierMask | None = None
-if TURBOQUANT_OUTLIER_MASK:
-    _OUTLIER_MASK = OutlierMask.load(TURBOQUANT_OUTLIER_MASK)
-    for b, name in [
-        (TURBOQUANT_BITS_OUTLIER, "TURBOQUANT_BITS_OUTLIER"),
-        (TURBOQUANT_BITS_REGULAR, "TURBOQUANT_BITS_REGULAR"),
-    ]:
-        main_b = b - 1 if TURBOQUANT_ALGO == "prod" else b
-        if main_b < 1 or main_b > 4:
-            raise ValueError(
-                f"{name}={b} -> main_bits={main_b} outside supported "
-                f"range {{1..4}} on this branch."
-            )
+if _CFG.is_split:
+    _OUTLIER_MASK = OutlierMask.load(_CFG.outlier_mask_path)
     logger.info(
         "TurboQuant split-mode: mask=%s, bits_outlier=%d, bits_regular=%d, "
         "d_out=%d, d_reg=%d",
-        TURBOQUANT_OUTLIER_MASK,
-        TURBOQUANT_BITS_OUTLIER,
-        TURBOQUANT_BITS_REGULAR,
+        _CFG.outlier_mask_path,
+        _CFG.bits_outlier,
+        _CFG.bits_regular,
         _OUTLIER_MASK.num_outliers,
         _OUTLIER_MASK.head_dim - _OUTLIER_MASK.num_outliers,
     )
 
-# Validate tight pack: only b=4 prod; split mode incompatible.
-_HOMOG_TIGHT = (
-    TURBOQUANT_TIGHT_PACK
-    and TURBOQUANT_ALGO == "prod"
-    and TURBOQUANT_BITS == 4
-    and _OUTLIER_MASK is None
-)
-if TURBOQUANT_TIGHT_PACK and not _HOMOG_TIGHT:
-    raise ValueError(
-        f"TURBOQUANT_TIGHT_PACK=1 only valid for homog prod b=4 "
-        f"(got algo={TURBOQUANT_ALGO} bits={TURBOQUANT_BITS} "
-        f"split={bool(_OUTLIER_MASK)}). Unset the flag for other "
-        f"configs."
-    )
+# Derived globals kept for the rest of this module (and any external
+# code that imports them); future cleanup can rip these out and use
+# _CFG.* directly. They're maintained here as the *single derivation*
+# from _CFG so they cannot drift.
+TURBOQUANT_ALGO = _CFG.algo
+TURBOQUANT_BITS = _CFG.bits
+TURBOQUANT_USE_CUDA = _CFG.use_cuda
+TURBOQUANT_OUTLIER_MASK = _CFG.outlier_mask_path
+TURBOQUANT_BITS_OUTLIER = _CFG.bits_outlier
+TURBOQUANT_BITS_REGULAR = _CFG.bits_regular
+TURBOQUANT_TIGHT_PACK = _CFG.tight_pack
+TURBOQUANT_FP16_NORMS = _CFG.norm_dtype == "fp16"
+TURBOQUANT_UINT8_RNORM = _CFG.rnorm_dtype == "uint8"
 
-_NORM_DTYPE = torch.float16 if TURBOQUANT_FP16_NORMS else torch.float32
-_RNORM_DTYPE = torch.uint8 if TURBOQUANT_UINT8_RNORM else _NORM_DTYPE
+_MAIN_BITS = _CFG.main_bits
+_HOMOG_TIGHT = _CFG.tight_pack and _CFG.is_homog and _CFG.bits == 4
+_NORM_DTYPE = torch.float16 if _CFG.norm_dtype == "fp16" else torch.float32
+_RNORM_DTYPE = torch.uint8 if _CFG.rnorm_dtype == "uint8" else _NORM_DTYPE
 
 logger.info(
-    "TurboQuant backend (paper-repro): algo=%s bits=%d split=%s "
-    "use_cuda=%s tight_pack=%s norm_dtype=%s rnorm_dtype=%s",
-    TURBOQUANT_ALGO, TURBOQUANT_BITS,
-    bool(_OUTLIER_MASK), TURBOQUANT_USE_CUDA, _HOMOG_TIGHT,
-    _NORM_DTYPE, _RNORM_DTYPE,
+    "TurboQuant backend (paper-repro): %s, norm_dtype=%s rnorm_dtype=%s",
+    _CFG.summary(), _NORM_DTYPE, _RNORM_DTYPE,
 )
 
 
