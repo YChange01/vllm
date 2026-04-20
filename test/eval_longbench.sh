@@ -129,6 +129,9 @@ run_stage() {
     fi
 
     local details="$LOG_DIR/${tag}_details.json"
+    # Unbuffer Python stdout: when piped to tee (non-TTY), block-
+    # buffering can swallow progress prints for minutes at a time.
+    PYTHONUNBUFFERED=1 \
     python3 "$ROOT_DIR/test/eval_longbench.py" \
         --endpoint "http://localhost:${port}" \
         --model "$MODEL" \
