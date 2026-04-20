@@ -139,58 +139,17 @@ run_stage() {
 }
 
 stage_args() {
-    # Backward-compat aliases.
+    # Bridge to vllm/turboquant/stages.py via scripts/stage_env.py.
     local tag="$1"
-    case "$tag" in
-        TURBOQUANT_prod_b4_r)
-            echo "[bench] DEPRECATED: ${tag} -> TURBOQUANT_prod_b4_t" >&2
-            tag="TURBOQUANT_prod_b4_t" ;;
-        TURBOQUANT_split_3_5bit_r)
-            echo "[bench] DEPRECATED: ${tag} -> TURBOQUANT_split_3_5bit_f" >&2
-            tag="TURBOQUANT_split_3_5bit_f" ;;
-        TURBOQUANT_split_3_5bit_rr)
-            echo "[bench] DEPRECATED: ${tag} -> TURBOQUANT_split_3_5bit_fu" >&2
-            tag="TURBOQUANT_split_3_5bit_fu" ;;
-    esac
-
-    # echo "backend env" for the (possibly remapped) tag
-    case "$tag" in
-        FLASH_ATTN)              echo "FLASH_ATTN  " ;;
-        TURBOQUANT_mse_b4)       echo "TURBOQUANT  TURBOQUANT_ALGO=mse TURBOQUANT_BITS=4" ;;
-        TURBOQUANT_prod_b4)      echo "TURBOQUANT  TURBOQUANT_ALGO=prod TURBOQUANT_BITS=4" ;;
-        TURBOQUANT_prod_b4_t)    echo "TURBOQUANT  TURBOQUANT_ALGO=prod TURBOQUANT_BITS=4 TURBOQUANT_TIGHT_PACK=1" ;;
-        TURBOQUANT_mse_b4_cuda)  echo "TURBOQUANT  TURBOQUANT_ALGO=mse TURBOQUANT_BITS=4 TURBOQUANT_USE_CUDA=1" ;;
-        TURBOQUANT_prod_b4_cuda) echo "TURBOQUANT  TURBOQUANT_ALGO=prod TURBOQUANT_BITS=4 TURBOQUANT_USE_CUDA=1" ;;
-        TURBOQUANT_split_3_5bit)
-            if [ ! -f "${OUTLIER_MASK:-}" ]; then
-                echo "[bench] stage $tag needs OUTLIER_MASK at $OUTLIER_MASK" >&2
-                return 1
-            fi
-            echo "TURBOQUANT  TURBOQUANT_ALGO=prod TURBOQUANT_OUTLIER_MASK=$OUTLIER_MASK TURBOQUANT_BITS_OUTLIER=5 TURBOQUANT_BITS_REGULAR=3"
-            ;;
-        TURBOQUANT_split_3_5bit_f)
-            if [ ! -f "${OUTLIER_MASK:-}" ]; then
-                echo "[bench] stage $tag needs OUTLIER_MASK at $OUTLIER_MASK" >&2
-                return 1
-            fi
-            echo "TURBOQUANT  TURBOQUANT_ALGO=prod TURBOQUANT_OUTLIER_MASK=$OUTLIER_MASK TURBOQUANT_BITS_OUTLIER=5 TURBOQUANT_BITS_REGULAR=3 TURBOQUANT_FP16_NORMS=1"
-            ;;
-        TURBOQUANT_split_3_5bit_fu)
-            if [ ! -f "${OUTLIER_MASK:-}" ]; then
-                echo "[bench] stage $tag needs OUTLIER_MASK at $OUTLIER_MASK" >&2
-                return 1
-            fi
-            echo "TURBOQUANT  TURBOQUANT_ALGO=prod TURBOQUANT_OUTLIER_MASK=$OUTLIER_MASK TURBOQUANT_BITS_OUTLIER=5 TURBOQUANT_BITS_REGULAR=3 TURBOQUANT_FP16_NORMS=1 TURBOQUANT_UINT8_RNORM=1"
-            ;;
-        TURBOQUANT_split_2_25bit)
-            if [ ! -f "${OUTLIER_MASK:-}" ]; then
-                echo "[bench] stage $tag needs OUTLIER_MASK at $OUTLIER_MASK" >&2
-                return 1
-            fi
-            echo "TURBOQUANT  TURBOQUANT_ALGO=prod TURBOQUANT_OUTLIER_MASK=$OUTLIER_MASK TURBOQUANT_BITS_OUTLIER=3 TURBOQUANT_BITS_REGULAR=2"
-            ;;
-        *) echo "[bench] unknown stage tag: $tag" >&2; return 1 ;;
-    esac
+    if [ "$tag" = "FLASH_ATTN" ]; then
+        echo "FLASH_ATTN  "
+        return 0
+    fi
+    local extra_env
+    extra_env=$(python3 "$ROOT_DIR/scripts/stage_env.py" "$tag" \
+                ${OUTLIER_MASK:+--outlier-mask "$OUTLIER_MASK"})
+    if [ $? -ne 0 ]; then return 1; fi
+    echo "TURBOQUANT  $extra_env"
 }
 
 export CUDA_VISIBLE_DEVICES="$GPU"
