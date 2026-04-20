@@ -136,14 +136,36 @@ echo "[eval] model=$MODEL gpu=$GPU"
 echo "[eval] ctx=$CTX positions=$POSITIONS trials=$TRIALS max_tokens=$MAX_TOKENS seed=$SEED"
 
 run_stage "FLASH_ATTN"     "$FP_PORT" "$LOG_DIR/fp_server.log"   "$LOG_DIR/fp_eval.log"   FLASH_ATTN  ""
-run_stage "TURBOQUANT_b4"  "$TQ_PORT" "$LOG_DIR/tq4_server.log"  "$LOG_DIR/tq4_eval.log"  TURBOQUANT  "TURBOQUANT_BITS=4"
+run_stage "TURBOQUANT_b4"  "$TQ_PORT" "$LOG_DIR/tq4_server.log"  "$LOG_DIR/tq4_eval.log"  TURBOQUANT  "TURBOQUANT_ALGO=prod TURBOQUANT_BITS=4"
+
+# Optional third stage: paper §4.3 2.25-bit split config (32@b=3 + 96@b=2).
+# Enabled when OUTLIER_MASK is set to an existing .pt from calibrate.sh.
+STAGES_RUN=("FLASH_ATTN" "TURBOQUANT_b4")
+if [ -n "${OUTLIER_MASK:-}" ]; then
+    if [ ! -f "$OUTLIER_MASK" ]; then
+        echo "[eval] OUTLIER_MASK set to $OUTLIER_MASK but file not found" >&2
+        exit 1
+    fi
+    SPLIT_ENV="TURBOQUANT_ALGO=prod TURBOQUANT_OUTLIER_MASK=$OUTLIER_MASK"
+    SPLIT_ENV="$SPLIT_ENV TURBOQUANT_BITS_OUTLIER=3 TURBOQUANT_BITS_REGULAR=2"
+    run_stage "TURBOQUANT_split_2_25bit" "$TQ_PORT" \
+        "$LOG_DIR/tq_split_server.log" "$LOG_DIR/tq_split_eval.log" \
+        TURBOQUANT "$SPLIT_ENV"
+    STAGES_RUN+=("TURBOQUANT_split_2_25bit")
+fi
 
 echo ""
 echo "=========================== AGGREGATE ============================"
-for tag in FLASH_ATTN TURBOQUANT_b4; do
-    f="$LOG_DIR/$(echo "$tag" | tr '[:upper:]' '[:lower:]' | sed 's/turboquant/tq/')_eval.log"
-    if [ -f "$f" ]; then
-        grep -E '=== NIAH grid|ctx|pos=|overall' "$f" | tail -n 20 || true
+for tag in "${STAGES_RUN[@]}"; do
+    # Map stage name -> eval log basename.
+    case "$tag" in
+        FLASH_ATTN)                 log="$LOG_DIR/fp_eval.log" ;;
+        TURBOQUANT_b4)              log="$LOG_DIR/tq4_eval.log" ;;
+        TURBOQUANT_split_2_25bit)   log="$LOG_DIR/tq_split_eval.log" ;;
+        *) continue ;;
+    esac
+    if [ -f "$log" ]; then
+        grep -E '=== NIAH grid|ctx|pos=|overall' "$log" | tail -n 20 || true
         echo ""
     fi
 done
