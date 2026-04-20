@@ -5,8 +5,10 @@
 #   FLASH_ATTN                 (fp baseline)
 #   TURBOQUANT_b4              (homog prod b=4; ~5-bit actual storage)
 #   TURBOQUANT_b2              (homog prod b=2; 2-bit quality floor)
-#   TURBOQUANT_split_2_25bit   (paper 4.3: 32@b=3 + 96@b=2 split;
-#                               requires OUTLIER_MASK=<.pt path>)
+#   TURBOQUANT_split_2_25bit   (paper 4.3 literal: 32@b=3 + 96@b=2;
+#                               2.25-bit effective; requires OUTLIER_MASK)
+#   TURBOQUANT_split_3_5bit    (32@b=5 + 96@b=3; clean 3.5-bit storage;
+#                               requires OUTLIER_MASK)
 #
 # Same prompt set, temperature=0, so any accuracy drop is attributable to
 # the quantization path. Each server is started via setsid in its own
@@ -32,7 +34,7 @@ GPU="${GPU:-2}"
 # Baseline stages (FLASH_ATTN, TURBOQUANT_b4) have already been validated;
 # default to running only the split 2.25-bit stage so iteration on the
 # split path is cheap. Override via STAGES=... to re-run anything else.
-STAGES="${STAGES:-TURBOQUANT_split_2_25bit}"
+STAGES="${STAGES:-TURBOQUANT_b2 TURBOQUANT_split_3_5bit}"
 # Default mask produced by scripts/calibrate.sh on this host.
 OUTLIER_MASK="${OUTLIER_MASK:-/tmp/outliers_llama-3_1-8b_32.pt}"
 # NOTE: TurboQuant currently allocates a SEPARATE uint8 _k_idx buffer per
@@ -174,7 +176,19 @@ stage_config() {
             fi
             local e="TURBOQUANT_ALGO=prod TURBOQUANT_OUTLIER_MASK=$OUTLIER_MASK"
             e="$e TURBOQUANT_BITS_OUTLIER=3 TURBOQUANT_BITS_REGULAR=2"
-            echo "$TQ_PORT TURBOQUANT '$e' tq_split_server.log tq_split_eval.log"
+            echo "$TQ_PORT TURBOQUANT '$e' tq_split_2_25_server.log tq_split_2_25_eval.log"
+            ;;
+        TURBOQUANT_split_3_5bit)
+            # 32 outlier @ b=5 + 96 regular @ b=3 -> effective 3.5 bit/coord,
+            # storage also 3.5 bit (both b values have main_bits that are
+            # powers of two -- no pack_bits waste).
+            if [ -z "${OUTLIER_MASK:-}" ] || [ ! -f "${OUTLIER_MASK:-}" ]; then
+                echo "[eval] stage $tag requires OUTLIER_MASK to point at an existing .pt file" >&2
+                return 1
+            fi
+            local e="TURBOQUANT_ALGO=prod TURBOQUANT_OUTLIER_MASK=$OUTLIER_MASK"
+            e="$e TURBOQUANT_BITS_OUTLIER=5 TURBOQUANT_BITS_REGULAR=3"
+            echo "$TQ_PORT TURBOQUANT '$e' tq_split_3_5_server.log tq_split_3_5_eval.log"
             ;;
         *)
             echo "[eval] unknown stage: $tag" >&2
