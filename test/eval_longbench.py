@@ -256,6 +256,55 @@ def _post_completion(
     return obj["choices"][0]["text"]
 
 
+def _tokenize(
+    endpoint: str, model: str, prompt: str, timeout: float,
+) -> tuple[int, list[int]]:
+    """Call vLLM's /tokenize endpoint. Returns (count, token_ids)."""
+    data = json.dumps({"model": model, "prompt": prompt}).encode("utf-8")
+    req = urllib.request.Request(
+        f"{endpoint}/tokenize",
+        data=data,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        obj = json.loads(resp.read().decode("utf-8"))
+    return obj["count"], obj["tokens"]
+
+
+def _detokenize(
+    endpoint: str, model: str, tokens: list[int], timeout: float,
+) -> str:
+    data = json.dumps({"model": model, "tokens": tokens}).encode("utf-8")
+    req = urllib.request.Request(
+        f"{endpoint}/detokenize",
+        data=data,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        obj = json.loads(resp.read().decode("utf-8"))
+    return obj["prompt"]
+
+
+def _truncate_middle(
+    endpoint: str, model: str, prompt: str,
+    max_prompt_tokens: int, timeout: float,
+) -> tuple[str, int]:
+    """LongBench-style middle truncation: keep first half + last half.
+
+    Returns the (possibly-truncated) prompt and its final token count.
+    Mirrors THUDM/LongBench/pred.py so overlong samples don't hit the
+    server's max_model_len check.
+    """
+    count, tokens = _tokenize(endpoint, model, prompt, timeout)
+    if count <= max_prompt_tokens:
+        return prompt, count
+    half = max_prompt_tokens // 2
+    keep = tokens[:half] + tokens[-half:]
+    return _detokenize(endpoint, model, keep, timeout), len(keep)
+
+
 def _build_prompt(template: str, row: dict) -> str:
     # LongBench rows have `input` (question/query) and `context` (long doc).
     return template.format(
@@ -268,6 +317,7 @@ def _run_task(
     task: str, meta: dict, rows: list[dict],
     endpoint: str, model: str, timeout: float,
     max_samples: int | None,
+    max_prompt_tokens: int | None,
 ) -> tuple[list[float], list[dict]]:
     """Run inference on each row; return per-row scores + detail log."""
     scores: list[float] = []
@@ -276,11 +326,26 @@ def _run_task(
     metric = meta["metric"]
     max_output = meta["max_output"]
     prompt_tmpl = meta["prompt_template"]
+    n_truncated = 0
 
     t_start = time.time()
     for i in range(n):
         row = rows[i]
         prompt = _build_prompt(prompt_tmpl, row)
+        if max_prompt_tokens is not None:
+            try:
+                prompt, final_tokens = _truncate_middle(
+                    endpoint, model, prompt, max_prompt_tokens, timeout,
+                )
+                if final_tokens == max_prompt_tokens:
+                    # was truncated to exact budget (LongBench: head+tail halves)
+                    n_truncated += 1
+            except Exception as e:
+                print(
+                    f"  [{task}] {i+1}/{n} tokenize failed "
+                    f"({type(e).__name__}); sending untruncated prompt",
+                    file=sys.stderr,
+                )
         try:
             pred = _post_completion(
                 endpoint, model, prompt, max_output, timeout
@@ -310,10 +375,13 @@ def _run_task(
         })
         if (i + 1) % 10 == 0 or (i + 1) == n:
             elapsed = time.time() - t_start
+            trunc_note = (
+                f" trunc={n_truncated}" if n_truncated else ""
+            )
             print(
                 f"  [{task}] {i+1:4d}/{n} "
                 f"avg={sum(scores)/len(scores):.4f}  "
-                f"({elapsed:.0f}s)",
+                f"({elapsed:.0f}s){trunc_note}",
                 flush=True,
             )
 
@@ -360,6 +428,23 @@ def main() -> int:
         help="Per-request HTTP timeout (seconds).",
     )
     ap.add_argument(
+        "--max-context", type=int, default=32768,
+        help=(
+            "Model's max_model_len. Prompts exceeding "
+            "max_context - task.max_output - margin are truncated "
+            "from the middle (LongBench convention)."
+        ),
+    )
+    ap.add_argument(
+        "--truncation-margin", type=int, default=32,
+        help="Safety margin in tokens; prompt_budget = max_context "
+             "- task.max_output - margin.",
+    )
+    ap.add_argument(
+        "--no-truncate", action="store_true",
+        help="Disable middle truncation (send prompts as-is).",
+    )
+    ap.add_argument(
         "--save-details", default=None,
         help="Optional JSON file to dump per-example pred/gold/score.",
     )
@@ -398,13 +483,31 @@ def main() -> int:
     for task in tasks:
         meta = config[task]
         rows = _load_task_rows(data_dir, task)
-        print(f"[{task}] {len(rows)} examples, metric={meta['metric']}")
+        if args.no_truncate:
+            budget = None
+        else:
+            budget = (
+                args.max_context - int(meta["max_output"])
+                - args.truncation_margin
+            )
+            if budget <= 0:
+                raise ValueError(
+                    f"[{task}] prompt budget <= 0 "
+                    f"(max_context={args.max_context}, "
+                    f"max_output={meta['max_output']}, "
+                    f"margin={args.truncation_margin})"
+                )
+        print(
+            f"[{task}] {len(rows)} examples, metric={meta['metric']}"
+            f"{f', prompt_budget={budget}' if budget else ''}"
+        )
         scores, details = _run_task(
             task, meta, rows,
             endpoint=args.endpoint,
             model=args.model,
             timeout=args.request_timeout,
             max_samples=args.max_samples,
+            max_prompt_tokens=budget,
         )
         avg = sum(scores) / len(scores) if scores else 0.0
         per_task[task] = avg

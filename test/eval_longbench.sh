@@ -135,6 +135,7 @@ run_stage() {
         --data-dir "$DATA_DIR" \
         --tag "$tag" \
         --request-timeout "$REQUEST_TIMEOUT" \
+        --max-context "$MAX_LEN" \
         ${TASKS:+--tasks "$TASKS"} \
         ${MAX_SAMPLES:+--max-samples "$MAX_SAMPLES"} \
         --save-details "$details" \
