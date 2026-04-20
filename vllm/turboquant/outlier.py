@@ -190,12 +190,22 @@ class SplitQuantState:
     def effective_bits(self) -> float:
         """Effective bits/coord = (d_out * b_out + d_reg * b_reg) / d.
 
-        Paper's §4.3 gives the example "32 outliers at 3 bits + 96
-        regular at 2 bits = 2.5 bits effective". The arithmetic
-        (32*3 + 96*2)/128 = 2.25, not 2.5 -- the paper has a typo.
-        True 2.5-bit is (32 outliers at 4 + 96 regular at 2) = 2.5, or
-        (64 outliers at 3 + 64 regular at 2) = 2.5. Pick bit budgets
-        to match the advertised effective rate you want.
+        This reports the paper's bit budget (``TURBOQUANT_BITS``,
+        i.e., main + QJL). Actual kernel storage can be larger if a
+        slice's ``main_bits`` is not a power of two, because
+        ``pack_bits`` rounds up to the next power of two:
+
+            b=2 (main=1) -> pack=1 + QJL 1 = 2 bit storage (clean)
+            b=3 (main=2) -> pack=2 + QJL 1 = 3 bit storage (clean)
+            b=4 (main=3) -> pack=4 + QJL 1 = 5 bit storage (1 bit waste)
+            b=5 (main=4) -> pack=4 + QJL 1 = 5 bit storage (clean)
+
+        Paper §4.3 names "32 outliers at 3 bits + 96 regular at 2
+        bits" as the 2.5-bit config. Arithmetically that's 2.25 bits,
+        not 2.5 -- the paper-stated rate and the actual arithmetic
+        disagree. Use this exact config to compare against the paper's
+        Table 1 numbers faithfully; use 64@3+64@2 or 32@5+96@2 if you
+        want storage density at the advertised 2.5-bit rate.
         """
         return (
             self.d_outlier * self.bits_outlier
