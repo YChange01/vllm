@@ -3,23 +3,25 @@
 """Preflight parity check: Triton kernels vs pure-PyTorch reference.
 
 Runs on B200 against a small synthetic KV cache. Reports max-abs and
-cosine-similarity diffs between each Triton kernel output and the
-corresponding ``vllm.turboquant.reference`` implementation. If these
-numbers are out of the bf16 noise range, don't bother running NIAH
--- a kernel bug needs fixing first.
+cosine-similarity diffs between each Triton kernel output (bf16) and
+the ``vllm.turboquant.reference`` implementation (fp32, the ideal
+algorithm). If these numbers are outside the empirical bf16 noise
+floor, don't bother running NIAH -- a kernel bug needs fixing first.
 
 Usage:
     python3 test/test_kernel_vs_reference.py
 
-Expected on correct kernel (bf16):
-    max_abs diff  ~ 1e-2
-    cosine sim    > 0.999
+Thresholds (see HOMOG_* / SPLIT_* constants for rationale):
+    homog paths   : max_abs < 0.25, cos_sim > 0.995
+    split paths   : max_abs < 0.40, cos_sim > 0.990
 
 Tests exercised:
-    homog_prod_b4             : turboquant_paged_attention_tc vs reference
-    homog_prod_b2             : same, variable-bit-width path
-    split_3.5bit              : turboquant_paged_attention_split_tc
-    split_2.5bit_w_outliers   : 2.5-bit with synthetic outliers
+    homog b=4                 : prod Q2, 3-bit main + 1-bit QJL
+    homog b=2                 : prod Q2, 1-bit main + 1-bit QJL
+    homog b=5                 : prod Q2, 4-bit main + 1-bit QJL
+    split 3.5-bit             : 64@b=4 + 64@b=3 (no outliers)
+    split 2.5-bit + outliers  : 32@b=4 + 96@b=2, first 32 chans *= 10
+    split high-precision      : 32@b=5 + 96@b=4 (no outliers)
 """
 
 from __future__ import annotations
@@ -36,7 +38,6 @@ from vllm.turboquant.attend_tc import turboquant_paged_attention_tc
 from vllm.turboquant.codebook import QuantState
 from vllm.turboquant.outlier import SplitQuantState
 from vllm.turboquant.reference import (
-    naive_attend,
     turboquant_attend_reference,
     turboquant_attend_split_reference,
 )
@@ -59,7 +60,10 @@ DTYPE = torch.bfloat16
 # locally small relative to the total inner product magnitude.
 HOMOG_MAX_ABS = 0.25
 HOMOG_COS = 0.995
-SPLIT_MAX_ABS = 0.40  # split path has two extra bf16 matmuls per slice
+# Split path runs one @ S and one @ Pi_T per slice -> 4 bf16 matmuls
+# total vs 2 for homog; plus the slice gather/scatter adds more
+# numerical drift.
+SPLIT_MAX_ABS = 0.40
 SPLIT_COS = 0.990
 
 
@@ -135,13 +139,11 @@ def check_homogeneous(bits: int) -> None:
         cache_v_qjl_sign=cache_v_qjl, cache_v_rnorm=cache_v_rn,
     )
 
-    seq_lens = torch.tensor([T_kv] * max(1, (T_q + T_kv - 1) // T_kv),
-                            dtype=torch.int32, device=DEVICE)
-    # Pack all queries into one sequence so seq_lens has length 1.
+    # Single sequence of length T_kv; the last T_q positions are the
+    # "new" queries in this step (prefix_len = T_kv - T_q preceding them
+    # are the cached prefix, visible under causal mask).
     seq_lens = torch.tensor([T_kv], dtype=torch.int32, device=DEVICE)
-    # Only use the last T_q positions as queries (they attend to full kv_end).
     query_start_loc = torch.tensor([0, T_q], dtype=torch.int32, device=DEVICE)
-    block_table = block_table.repeat(1, 1)  # already (1, num_blocks)
 
     # Triton path
     out_triton = turboquant_paged_attention_tc(
