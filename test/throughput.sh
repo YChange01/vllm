@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
 # Online throughput benchmark (``vllm bench serve``) across backends.
-# This branch is b=4 only. Default stages:
+# Default stages (b=4 paper-faithful comparison):
 #   - FLASH_ATTN                (bf16 reference, vLLM's own FA backend)
-#   - TURBOQUANT_mse_b4         (Triton TC attend kernel, mse)
-#   - TURBOQUANT_prod_b4        (Triton TC attend kernel, prod)
-# Opt-in CUDA stages (add to STAGES=...):
+#   - TURBOQUANT_prod_b4        (homog Q_prod, ~5-bit storage)
+#   - TURBOQUANT_split_3_5bit   (paper 4.3 split, 3.5-bit storage)
+# Other available stages (add to STAGES=...):
+#   - TURBOQUANT_mse_b4         (homog Q_mse, no QJL)
+#   - TURBOQUANT_split_2_25bit  (paper 4.3 literal '2.5-bit')
 #   - TURBOQUANT_mse_b4_cuda    (raw-CUDA WMMA attend kernel)
 #
 # Uses the ``random`` dataset with fixed input/output lengths. Each backend
@@ -19,9 +21,10 @@
 set -u
 
 MODEL="${MODEL:-/mnt/nvme3n1/g00872988/models/Llama-3.1-8B-Instruct}"
-GPU="${GPU:-3}"
+GPU="${GPU:-2}"
 MAX_LEN="${MAX_LEN:-4096}"
 GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.3}"
+OUTLIER_MASK="${OUTLIER_MASK:-/tmp/outliers_llama-3_1-8b_32.pt}"
 
 INPUT_LEN="${INPUT_LEN:-1024}"
 OUTPUT_LEN="${OUTPUT_LEN:-128}"
@@ -31,8 +34,8 @@ REQUEST_RATE="${REQUEST_RATE:-inf}"
 NUM_WARMUPS="${NUM_WARMUPS:-5}"
 SEED="${SEED:-42}"
 
-# Which stages to run. Space-separated tags. b=4 only on this branch.
-STAGES="${STAGES:-FLASH_ATTN TURBOQUANT_mse_b4 TURBOQUANT_prod_b4}"
+# Which stages to run. Space-separated tags.
+STAGES="${STAGES:-FLASH_ATTN TURBOQUANT_prod_b4 TURBOQUANT_split_3_5bit}"
 
 FP_PORT=8010
 TQ_PORT=8009
@@ -143,6 +146,20 @@ stage_args() {
         TURBOQUANT_prod_b4)      echo "TURBOQUANT  TURBOQUANT_ALGO=prod TURBOQUANT_BITS=4" ;;
         TURBOQUANT_mse_b4_cuda)  echo "TURBOQUANT  TURBOQUANT_ALGO=mse TURBOQUANT_BITS=4 TURBOQUANT_USE_CUDA=1" ;;
         TURBOQUANT_prod_b4_cuda) echo "TURBOQUANT  TURBOQUANT_ALGO=prod TURBOQUANT_BITS=4 TURBOQUANT_USE_CUDA=1" ;;
+        TURBOQUANT_split_3_5bit)
+            if [ ! -f "${OUTLIER_MASK:-}" ]; then
+                echo "[bench] stage $1 needs OUTLIER_MASK at $OUTLIER_MASK" >&2
+                return 1
+            fi
+            echo "TURBOQUANT  TURBOQUANT_ALGO=prod TURBOQUANT_OUTLIER_MASK=$OUTLIER_MASK TURBOQUANT_BITS_OUTLIER=5 TURBOQUANT_BITS_REGULAR=3"
+            ;;
+        TURBOQUANT_split_2_25bit)
+            if [ ! -f "${OUTLIER_MASK:-}" ]; then
+                echo "[bench] stage $1 needs OUTLIER_MASK at $OUTLIER_MASK" >&2
+                return 1
+            fi
+            echo "TURBOQUANT  TURBOQUANT_ALGO=prod TURBOQUANT_OUTLIER_MASK=$OUTLIER_MASK TURBOQUANT_BITS_OUTLIER=3 TURBOQUANT_BITS_REGULAR=2"
+            ;;
         *) echo "[bench] unknown stage tag: $1" >&2; return 1 ;;
     esac
 }
