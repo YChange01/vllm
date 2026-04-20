@@ -2,10 +2,13 @@
 # Needle-In-A-Haystack eval reproducing the setup of Figure 4 in the
 # TurboQuant paper (arXiv:2504.19874).
 #
-# Three configurations:
-#   - FLASH_ATTN           (bf16 full-precision reference)
-#   - TURBOQUANT mse b=4   (Algorithm 1, 4-bit)
-#   - TURBOQUANT prod b=4  (Algorithm 2, 4-bit)
+# Default three configurations (paper-faithful comparison):
+#   - FLASH_ATTN                  bf16 full-precision reference
+#   - TURBOQUANT prod b=4         Algorithm 2, ~5-bit storage
+#   - TURBOQUANT split 3.5-bit    Paper 4.3 split (32@5 + 96@3)
+# Other available stages (override via STAGES=...):
+#   - TURBOQUANT_mse_b4           Algorithm 1 (no QJL), 4-bit
+#   - TURBOQUANT_split_2_25bit    Paper 4.3 literal '2.5-bit'
 #
 # Grid matches Figure 4:
 #   - 15 context lengths, log-spaced from 4k to 104k tokens:
@@ -30,9 +33,10 @@
 set -u
 
 MODEL="${MODEL:-/mnt/nvme3n1/g00872988/models/Llama-3.1-8B-Instruct}"
-GPU="${GPU:-3}"
+GPU="${GPU:-2}"
 MAX_LEN="${MAX_LEN:-131072}"
 GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.85}"
+OUTLIER_MASK="${OUTLIER_MASK:-/tmp/outliers_llama-3_1-8b_32.pt}"
 
 # 15 log-spaced context lengths from 4k to 104k. Approximate integer token
 # counts matching the paper's visible x-axis labels (4/8/10/16/26/41/65/104)
@@ -46,7 +50,7 @@ MAX_TOKENS="${MAX_TOKENS:-16}"
 # 104k prefill + first-call Triton JIT can take minutes; bump generously.
 REQUEST_TIMEOUT="${REQUEST_TIMEOUT:-3600}"
 
-STAGES="${STAGES:-FLASH_ATTN TURBOQUANT_mse_b4 TURBOQUANT_prod_b4}"
+STAGES="${STAGES:-FLASH_ATTN TURBOQUANT_prod_b4 TURBOQUANT_split_3_5bit}"
 
 FP_PORT=8010
 TQ_PORT=8009
@@ -149,6 +153,20 @@ stage_args() {
         FLASH_ATTN)             echo "FLASH_ATTN  " ;;
         TURBOQUANT_mse_b4)      echo "TURBOQUANT  TURBOQUANT_ALGO=mse TURBOQUANT_BITS=4" ;;
         TURBOQUANT_prod_b4)     echo "TURBOQUANT  TURBOQUANT_ALGO=prod TURBOQUANT_BITS=4" ;;
+        TURBOQUANT_split_3_5bit)
+            if [ ! -f "${OUTLIER_MASK:-}" ]; then
+                echo "[fig4] stage $1 needs OUTLIER_MASK at $OUTLIER_MASK" >&2
+                return 1
+            fi
+            echo "TURBOQUANT  TURBOQUANT_ALGO=prod TURBOQUANT_OUTLIER_MASK=$OUTLIER_MASK TURBOQUANT_BITS_OUTLIER=5 TURBOQUANT_BITS_REGULAR=3"
+            ;;
+        TURBOQUANT_split_2_25bit)
+            if [ ! -f "${OUTLIER_MASK:-}" ]; then
+                echo "[fig4] stage $1 needs OUTLIER_MASK at $OUTLIER_MASK" >&2
+                return 1
+            fi
+            echo "TURBOQUANT  TURBOQUANT_ALGO=prod TURBOQUANT_OUTLIER_MASK=$OUTLIER_MASK TURBOQUANT_BITS_OUTLIER=3 TURBOQUANT_BITS_REGULAR=2"
+            ;;
         *) echo "[fig4] unknown stage tag: $1" >&2; return 1 ;;
     esac
 }
