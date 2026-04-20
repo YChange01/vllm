@@ -35,28 +35,31 @@ from pathlib import Path
 
 # Internal HF mirror endpoints (no auth, no SSL verify).
 # Extend here if more corporate mirrors are needed.
-_MIRRORS: dict[str, str] = {
-    "huawei": "http://mirrors.tools.huawei.com/huggingface",
+_MIRRORS: dict[str, tuple[str, bool, bool]] = {
+    # name: (endpoint, verify_ssl, trust_env_proxy)
+    "huawei":   ("http://mirrors.tools.huawei.com/huggingface", False, False),
+    "hfmirror": ("https://hf-mirror.com",                       True,  True),
 }
 
 
 def _apply_hf_mirror(name: str) -> None:
-    """Route huggingface_hub + datasets through an internal mirror.
+    """Route huggingface_hub + datasets through an alternative endpoint.
 
     Must be called before `from datasets import load_dataset` runs.
-    Disables SSL verification and ignores ambient proxy env vars —
-    matches the pattern used for B200 HF downloads inside Huawei's
-    network.
+    `huawei` targets the internal intranet mirror (no SSL, no proxy);
+    `hfmirror` targets the public hf-mirror.com (SSL on, honors env
+    proxy so HTTP_PROXY / HTTPS_PROXY still work).
     """
     import requests
     from huggingface_hub import configure_http_backend
 
-    os.environ["HF_ENDPOINT"] = _MIRRORS[name]
+    endpoint, verify_ssl, trust_env = _MIRRORS[name]
+    os.environ["HF_ENDPOINT"] = endpoint
 
     def _factory() -> requests.Session:
         session = requests.Session()
-        session.verify = False
-        session.trust_env = False
+        session.verify = verify_ssl
+        session.trust_env = trust_env
         return session
 
     configure_http_backend(backend_factory=_factory)
