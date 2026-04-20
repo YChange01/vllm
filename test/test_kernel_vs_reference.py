@@ -142,7 +142,12 @@ def check_homogeneous(bits: int) -> None:
         cache_v_qjl_sign=cache_v_qjl, cache_v_rnorm=cache_v_rn,
     )
 
-    # Reference path (full fp32 round-trip in Python).
+    # Reference path. Run in bf16 (same dtype as the kernel) so this is
+    # an apples-to-apples algorithm-correctness test, not an algorithm +
+    # precision-loss test. Otherwise fp32 reference + bf16 kernel would
+    # disagree on QJL sign bits near zero (residual ~ bf16 noise per
+    # coord at d=128), compounding to ~0.1 per-element error on output
+    # even though the algorithm is identical.
     # Use same state (same Pi / S / codebook) so numerics are aligned.
     # Match the kernel's causal semantics: the kernel treats the T_q
     # queries as the last T_q new tokens in a T_kv-long sequence, so
@@ -152,9 +157,7 @@ def check_homogeneous(bits: int) -> None:
         torch.arange(T_q, dtype=torch.int64, device=DEVICE)
         + prefix_len + 1
     )
-    out_ref = turboquant_attend_reference(
-        q.float(), k.float(), v.float(), state, kv_end,
-    ).to(DTYPE)
+    out_ref = turboquant_attend_reference(q, k, v, state, kv_end)
 
     diff = _max_abs_diff(out_triton, out_ref)
     cos = _cos_sim(out_triton, out_ref)
@@ -254,9 +257,10 @@ def check_split(bits_out: int, bits_reg: int, d_out: int,
         torch.arange(T_q, dtype=torch.int64, device=DEVICE)
         + prefix_len + 1
     )
+    # Apples-to-apples bf16 reference (see homog check for rationale).
     out_ref = turboquant_attend_split_reference(
-        q.float(), k.float(), v.float(), state_k, state_v, kv_end,
-    ).to(DTYPE)
+        q, k, v, state_k, state_v, kv_end,
+    )
 
     diff = _max_abs_diff(out_triton, out_ref)
     cos = _cos_sim(out_triton, out_ref)
