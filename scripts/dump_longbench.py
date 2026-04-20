@@ -284,6 +284,14 @@ def main() -> int:
         "--mirror", choices=sorted(_MIRRORS.keys()), default=None,
         help="Route HF through internal mirror (e.g. 'huawei' for B200).",
     )
+    ap.add_argument(
+        "--offline", action="store_true",
+        help=(
+            "Skip HF download; only write config.json. Expects .jsonl "
+            "files to be present already (copied from a machine with "
+            "HF access)."
+        ),
+    )
     args = ap.parse_args()
 
     if args.mirror:
@@ -304,10 +312,27 @@ def main() -> int:
     out_dir = Path(args.output)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"Downloading {len(tasks)} task(s) to {out_dir} ...")
     total_rows = 0
-    for t in tasks:
-        total_rows += _dump_one(t, out_dir)
+    if args.offline:
+        print(f"[offline] skipping HF; checking .jsonl files in {out_dir}")
+        missing = [t for t in tasks if not (out_dir / f"{t}.jsonl").exists()]
+        if missing:
+            raise FileNotFoundError(
+                f"Missing {len(missing)} .jsonl file(s): {missing}. "
+                "Download them on a machine with HF access and scp into "
+                f"{out_dir} before running --offline."
+            )
+        for t in tasks:
+            jl = out_dir / f"{t}.jsonl"
+            with jl.open("r", encoding="utf-8") as f:
+                n = sum(1 for _ in f)
+            size_mb = jl.stat().st_size / 1e6
+            print(f"  {t:28s} {n:4d} rows, {size_mb:5.2f} MB [present]")
+            total_rows += n
+    else:
+        print(f"Downloading {len(tasks)} task(s) to {out_dir} ...")
+        for t in tasks:
+            total_rows += _dump_one(t, out_dir)
 
     # Write task config (prompt template + max output + metric + lang).
     # The eval harness reads this to reconstruct prompts.
