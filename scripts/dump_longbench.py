@@ -14,6 +14,9 @@ Usage:
             --subset mini
     python3 scripts/dump_longbench.py --output calib_data/longbench_v1 \
             --tasks narrativeqa,qasper
+    # Inside Huawei network (B200), route through the internal mirror:
+    python3 scripts/dump_longbench.py --output calib_data/longbench_v1 \
+            --tasks narrativeqa --mirror huawei
 
 Each task emits <output>/<task>.jsonl, one row per test example. The
 script also writes <output>/config.json with per-task metadata
@@ -26,7 +29,37 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
+
+
+# Internal HF mirror endpoints (no auth, no SSL verify).
+# Extend here if more corporate mirrors are needed.
+_MIRRORS: dict[str, str] = {
+    "huawei": "http://mirrors.tools.huawei.com/huggingface",
+}
+
+
+def _apply_hf_mirror(name: str) -> None:
+    """Route huggingface_hub + datasets through an internal mirror.
+
+    Must be called before `from datasets import load_dataset` runs.
+    Disables SSL verification and ignores ambient proxy env vars —
+    matches the pattern used for B200 HF downloads inside Huawei's
+    network.
+    """
+    import requests
+    from huggingface_hub import configure_http_backend
+
+    os.environ["HF_ENDPOINT"] = _MIRRORS[name]
+
+    def _factory() -> requests.Session:
+        session = requests.Session()
+        session.verify = False
+        session.trust_env = False
+        return session
+
+    configure_http_backend(backend_factory=_factory)
 
 
 # Full set of 21 LongBench v1 tasks (HF config names).
@@ -244,7 +277,15 @@ def main() -> int:
         "--tasks", default=None,
         help="Comma-separated task names (overrides --subset).",
     )
+    ap.add_argument(
+        "--mirror", choices=sorted(_MIRRORS.keys()), default=None,
+        help="Route HF through internal mirror (e.g. 'huawei' for B200).",
+    )
     args = ap.parse_args()
+
+    if args.mirror:
+        _apply_hf_mirror(args.mirror)
+        print(f"[mirror] HF_ENDPOINT={os.environ['HF_ENDPOINT']} (verify=off)")
 
     if args.tasks:
         tasks = [t.strip() for t in args.tasks.split(",") if t.strip()]
