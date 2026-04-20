@@ -44,7 +44,7 @@ def quantize_prod(
     """
     d = x.shape[-1]
     x_norm = x.norm(dim=-1, keepdim=True).clamp_min(1e-6)
-    rotated = (x / x_norm) @ state.Pi
+    rotated = (x / x_norm) @ state.Pi.to(x.dtype)
 
     boundaries = state.boundaries.to(x.dtype)
     idx = torch.searchsorted(boundaries, rotated)
@@ -52,7 +52,7 @@ def quantize_prod(
 
     r = rotated - state.codebook.to(x.dtype)[idx]
     r_norm = r.norm(dim=-1, keepdim=True).clamp_min(1e-6)
-    qjl = ((r / r_norm) @ state.S.t()).sign()
+    qjl = ((r / r_norm) @ state.S.to(x.dtype).t()).sign()
     qjl = torch.where(qjl == 0, torch.ones_like(qjl), qjl).to(torch.int8)
     return idx, qjl, x_norm.squeeze(-1), r_norm.squeeze(-1)
 
@@ -62,7 +62,7 @@ def quantize_mse(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Algorithm 1 quantize. Returns (idx, x_norm)."""
     x_norm = x.norm(dim=-1, keepdim=True).clamp_min(1e-6)
-    rotated = (x / x_norm) @ state.Pi
+    rotated = (x / x_norm) @ state.Pi.to(x.dtype)
     boundaries = state.boundaries.to(x.dtype)
     idx = torch.searchsorted(boundaries, rotated)
     idx = idx.clamp(max=state.codebook.shape[0] - 1).to(torch.int32)
