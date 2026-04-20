@@ -252,7 +252,7 @@ def _split_attend_kernel(
 
         k_norm_out = tl.load(
             cache_k_norm_out_ptr + meta_addrs, mask=mask_n, other=0.0
-        )
+        ).to(tl.float32)
         k_tile_out_scaled = (
             k_tile_out.to(tl.float32) * k_norm_out[:, None]
         ).to(COMPUTE_DTYPE)
@@ -277,7 +277,7 @@ def _split_attend_kernel(
 
             r_norm_k_out = tl.load(
                 cache_k_rnorm_out_ptr + meta_addrs, mask=mask_n, other=0.0
-            )
+            ).to(tl.float32)
             qjl_dot_k_out = tl.dot(sq_out, tl.trans(qjl_sign_k_out))
             qk_out = qk_out + (
                 qjl_coef_out
@@ -308,7 +308,7 @@ def _split_attend_kernel(
 
         k_norm_reg = tl.load(
             cache_k_norm_reg_ptr + meta_addrs, mask=mask_n, other=0.0
-        )
+        ).to(tl.float32)
         k_tile_reg_scaled = (
             k_tile_reg.to(tl.float32) * k_norm_reg[:, None]
         ).to(COMPUTE_DTYPE)
@@ -333,7 +333,7 @@ def _split_attend_kernel(
 
             r_norm_k_reg = tl.load(
                 cache_k_rnorm_reg_ptr + meta_addrs, mask=mask_n, other=0.0
-            )
+            ).to(tl.float32)
             qjl_dot_k_reg = tl.dot(sq_reg, tl.trans(qjl_sign_k_reg))
             qk_reg = qk_reg + (
                 qjl_coef_reg
@@ -379,7 +379,7 @@ def _split_attend_kernel(
         v_tile_out = tl.load(codebook_out_ptr + v_idx_out)
         v_norm_out = tl.load(
             cache_v_norm_out_ptr + meta_addrs, mask=mask_n, other=0.0
-        )
+        ).to(tl.float32)
         v_tile_out_scaled = (
             v_tile_out.to(tl.float32) * v_norm_out[:, None]
         ).to(COMPUTE_DTYPE)
@@ -398,7 +398,7 @@ def _split_attend_kernel(
             ).to(COMPUTE_DTYPE)
             r_norm_v_out = tl.load(
                 cache_v_rnorm_out_ptr + meta_addrs, mask=mask_n, other=0.0
-            )
+            ).to(tl.float32)
             v_qjl_tile_out = (
                 qjl_sign_v_out.to(tl.float32)
                 * r_norm_v_out[:, None]
@@ -422,7 +422,7 @@ def _split_attend_kernel(
         v_tile_reg = tl.load(codebook_reg_ptr + v_idx_reg)
         v_norm_reg = tl.load(
             cache_v_norm_reg_ptr + meta_addrs, mask=mask_n, other=0.0
-        )
+        ).to(tl.float32)
         v_tile_reg_scaled = (
             v_tile_reg.to(tl.float32) * v_norm_reg[:, None]
         ).to(COMPUTE_DTYPE)
@@ -441,7 +441,7 @@ def _split_attend_kernel(
             ).to(COMPUTE_DTYPE)
             r_norm_v_reg = tl.load(
                 cache_v_rnorm_reg_ptr + meta_addrs, mask=mask_n, other=0.0
-            )
+            ).to(tl.float32)
             v_qjl_tile_reg = (
                 qjl_sign_v_reg.to(tl.float32)
                 * r_norm_v_reg[:, None]

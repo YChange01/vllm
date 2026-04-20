@@ -141,7 +141,10 @@ def _store_quant_kernel(
         + off * num_heads_kv
         + kvh
     )
-    tl.store(cache_norm_ptr + meta_out, norm_val)
+    tl.store(
+        cache_norm_ptr + meta_out,
+        norm_val.to(cache_norm_ptr.dtype.element_ty),
+    )
 
     # --- 5) Prod path ---
     # Tight mode: qjl_bit was already merged into the idx nibble at
@@ -153,7 +156,10 @@ def _store_quant_kernel(
         r_norm_sq = tl.sum(r * r)
         r_norm = tl.sqrt(r_norm_sq)
         r_norm = tl.maximum(r_norm, 1e-6)
-        tl.store(cache_rnorm_ptr + meta_out, r_norm)
+        tl.store(
+            cache_rnorm_ptr + meta_out,
+            r_norm.to(cache_rnorm_ptr.dtype.element_ty),
+        )
     elif USE_QJL:
         rk = tl.load(codebook_ptr + idx).to(tl.float32)
         r = rot - rk
@@ -163,7 +169,10 @@ def _store_quant_kernel(
         r_norm = tl.maximum(r_norm, 1e-6)
         r_unit = r / r_norm
 
-        tl.store(cache_rnorm_ptr + meta_out, r_norm)
+        tl.store(
+            cache_rnorm_ptr + meta_out,
+            r_norm.to(cache_rnorm_ptr.dtype.element_ty),
+        )
 
         # qjl_raw = S @ r_unit (d-dim matvec, on-chip fp32).
         S_tile = tl.load(
@@ -221,17 +230,21 @@ def _rotate_and_store(
     device = new_x.device
     dtype = new_x.dtype
 
-    # ||x|| in fp32 for numerical stability. clamp_min matches the
-    # previous implementation's eps handling and guards against zero
-    # V rows at the prefill boundary.
-    x_norm = (
+    # ||x|| computed in fp32 for numerical stability, then cast to the
+    # cache buffer dtype (fp32 by default; fp16 when the backend
+    # opted into FP16_NORMS for compression). clamp_min handles the
+    # zero-V-row prefill edge case.
+    x_norm_fp32 = (
         new_x.float().pow(2).sum(dim=-1).clamp_min(1e-12).sqrt().clamp_min(1e-6)
-    )  # (T, H_kv)
+    )  # (T, H_kv) fp32
+    x_norm = x_norm_fp32.to(cache_norm.dtype)
 
     # Unit-sphere rescale + random orthogonal rotation. Pi is not
     # symmetric, unlike the old Hadamard path; we always multiply on
     # the right here.
-    inv_norm = (1.0 / x_norm).to(dtype)                            # (T, H_kv)
+    # Use the fp32 source for the rescale division (avoids losing
+    # precision in low-magnitude norms when cache_norm is fp16).
+    inv_norm = (1.0 / x_norm_fp32).to(dtype)                       # (T, H_kv)
     x_scaled = new_x * inv_norm.unsqueeze(-1)                      # bf16 unit norm
     rotated = (
         x_scaled.reshape(T * H_kv, d) @ state.Pi

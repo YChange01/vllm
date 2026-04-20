@@ -99,11 +99,13 @@ def _cos_sim(a: torch.Tensor, b: torch.Tensor) -> float:
     ).mean().item()
 
 
-def check_homogeneous(bits: int, tight_pack: bool = False) -> bool:
+def check_homogeneous(bits: int, tight_pack: bool = False,
+                      fp16_norms: bool = False) -> bool:
     torch.manual_seed(0)
     T_q, T_kv, H_q, H_kv, d = 4, 32, 8, 2, 128
     block_size = 16
     assert T_kv % block_size == 0
+    norm_dtype = torch.float16 if fp16_norms else torch.float32
 
     state = QuantState(
         algo="prod", bits=bits, head_dim=d, seed=0,
@@ -123,7 +125,7 @@ def check_homogeneous(bits: int, tight_pack: bool = False) -> bool:
     cache_k_idx = torch.zeros(num_blocks, block_size, H_kv, idx_dim,
                               dtype=torch.uint8, device=DEVICE)
     cache_k_norm = torch.zeros(num_blocks, block_size, H_kv,
-                               dtype=torch.float32, device=DEVICE)
+                               dtype=norm_dtype, device=DEVICE)
     cache_v_idx = torch.zeros_like(cache_k_idx)
     cache_v_norm = torch.zeros_like(cache_k_norm)
     cache_k_qjl = torch.zeros(num_blocks, block_size, H_kv, qjl_dim,
@@ -181,7 +183,12 @@ def check_homogeneous(bits: int, tight_pack: bool = False) -> bool:
     cos = _cos_sim(out_triton, out_ref)
     ok = diff < HOMOG_MAX_ABS and cos > HOMOG_COS
     status = "PASS" if ok else "FAIL"
-    label = f"homog b={bits}{'  [tight]' if tight_pack else ''}"
+    flags = ""
+    if tight_pack:
+        flags += " [tight]"
+    if fp16_norms:
+        flags += " [fp16-norms]"
+    label = f"homog b={bits}{flags}"
     print(
         f"  [{status}] {label}: max_abs_diff={diff:.4f}  "
         f"cos_sim={cos:.5f}"
@@ -190,7 +197,8 @@ def check_homogeneous(bits: int, tight_pack: bool = False) -> bool:
 
 
 def check_split(bits_out: int, bits_reg: int, d_out: int,
-                with_outliers: bool, label: str) -> bool:
+                with_outliers: bool, label: str,
+                fp16_norms: bool = False) -> bool:
     torch.manual_seed(0)
     T_q, T_kv, H_q, H_kv, d = 4, 32, 8, 2, 128
     block_size = 16
@@ -221,6 +229,8 @@ def check_split(bits_out: int, bits_reg: int, d_out: int,
     pack_out = state_k.state_out.pack_bits
     pack_reg = state_k.state_reg.pack_bits
 
+    norm_dtype = torch.float16 if fp16_norms else torch.float32
+
     def _mk_bufs(d_slice: int, pack_bits: int):
         idx_d = d_slice * pack_bits // 8
         qjl_d = d_slice // 8
@@ -228,11 +238,11 @@ def check_split(bits_out: int, bits_reg: int, d_out: int,
             torch.zeros(num_blocks, block_size, H_kv, idx_d,
                         dtype=torch.uint8, device=DEVICE),
             torch.zeros(num_blocks, block_size, H_kv,
-                        dtype=torch.float32, device=DEVICE),
+                        dtype=norm_dtype, device=DEVICE),
             torch.zeros(num_blocks, block_size, H_kv, qjl_d,
                         dtype=torch.uint8, device=DEVICE),
             torch.zeros(num_blocks, block_size, H_kv,
-                        dtype=torch.float32, device=DEVICE),
+                        dtype=norm_dtype, device=DEVICE),
         )
 
     k_idx_out, k_norm_out, k_qjl_out, k_rn_out = _mk_bufs(d_out, pack_out)
@@ -307,11 +317,16 @@ def main() -> int:
     # in one invocation, even when early cases fail.
     results: list[bool] = [
         check_homogeneous(bits=4),
-        check_homogeneous(bits=4, tight_pack=True),    # b4_r honest 4-bit
+        check_homogeneous(bits=4, tight_pack=True),    # b4_r tight nibble
+        check_homogeneous(bits=4, tight_pack=True,     # b4_r + fp16 norms
+                          fp16_norms=True),
         check_homogeneous(bits=2),
         check_homogeneous(bits=5),
         check_split(bits_out=4, bits_reg=3, d_out=64, with_outliers=False,
                     label="split 3.5-bit (64@4 + 64@3) no outliers"),
+        check_split(bits_out=4, bits_reg=3, d_out=64, with_outliers=False,
+                    fp16_norms=True,
+                    label="split 3.5-bit_r (64@4 + 64@3) fp16 norms"),
         check_split(bits_out=3, bits_reg=2, d_out=32, with_outliers=True,
                     label="split 2.25-bit (32@3 + 96@2) w/ outliers"),
         check_split(bits_out=5, bits_reg=4, d_out=32, with_outliers=False,

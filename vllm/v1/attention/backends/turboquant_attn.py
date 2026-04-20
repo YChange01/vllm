@@ -105,6 +105,12 @@ TURBOQUANT_BITS_REGULAR = int(
 # valid for homog prod b=4; ignored otherwise. Split mode unaffected
 # (split's b=5+b=3 are already clean).
 TURBOQUANT_TIGHT_PACK = os.environ.get("TURBOQUANT_TIGHT_PACK", "0") == "1"
+# Store norm/rnorm scalars as fp16 instead of fp32. Cuts the per-slot
+# metadata in half (4 fp32 -> 4 fp16 per K side; 32 B -> 16 B per K+V
+# in split mode). Math inside the kernel stays fp32 -- only the cache
+# buffer dtype changes. Loss: ~0.1% relative error in the rescale,
+# negligible vs Lloyd-Max + QJL noise.
+TURBOQUANT_FP16_NORMS = os.environ.get("TURBOQUANT_FP16_NORMS", "0") == "1"
 
 if TURBOQUANT_ALGO not in ("mse", "prod"):
     raise ValueError(
@@ -169,11 +175,13 @@ if TURBOQUANT_TIGHT_PACK and not _HOMOG_TIGHT:
         f"configs."
     )
 
+_NORM_DTYPE = torch.float16 if TURBOQUANT_FP16_NORMS else torch.float32
+
 logger.info(
     "TurboQuant backend (paper-repro): algo=%s bits=%d split=%s "
-    "use_cuda=%s tight_pack=%s",
+    "use_cuda=%s tight_pack=%s norm_dtype=%s",
     TURBOQUANT_ALGO, TURBOQUANT_BITS,
-    bool(_OUTLIER_MASK), TURBOQUANT_USE_CUDA, _HOMOG_TIGHT,
+    bool(_OUTLIER_MASK), TURBOQUANT_USE_CUDA, _HOMOG_TIGHT, _NORM_DTYPE,
 )
 
 
@@ -451,19 +459,19 @@ class TurboQuantAttentionImpl(AttentionImpl):
         shape_meta = (num_blocks, block_size, self.num_kv_heads)
 
         self._k_idx = torch.zeros(shape_idx, dtype=torch.uint8, device=device)
-        self._k_norm = torch.zeros(shape_meta, dtype=torch.float32, device=device)
+        self._k_norm = torch.zeros(shape_meta, dtype=_NORM_DTYPE, device=device)
         self._v_idx = torch.zeros(shape_idx, dtype=torch.uint8, device=device)
-        self._v_norm = torch.zeros(shape_meta, dtype=torch.float32, device=device)
+        self._v_norm = torch.zeros(shape_meta, dtype=_NORM_DTYPE, device=device)
 
         if TURBOQUANT_ALGO == "prod":
             assert self.head_size % 8 == 0
             # rnorm always allocated; qjl_sign skipped in tight mode
             # (merged into the high bit of each idx nibble).
             self._k_rnorm = torch.zeros(
-                shape_meta, dtype=torch.float32, device=device
+                shape_meta, dtype=_NORM_DTYPE, device=device
             )
             self._v_rnorm = torch.zeros(
-                shape_meta, dtype=torch.float32, device=device
+                shape_meta, dtype=_NORM_DTYPE, device=device
             )
             if not _HOMOG_TIGHT:
                 shape_qjl = (num_blocks, block_size, self.num_kv_heads,
@@ -519,7 +527,8 @@ class TurboQuantAttentionImpl(AttentionImpl):
             return torch.zeros(shape, dtype=torch.uint8, device=device)
 
         def _fzeros(shape):
-            return torch.zeros(shape, dtype=torch.float32, device=device)
+            # norm/rnorm dtype controlled by TURBOQUANT_FP16_NORMS.
+            return torch.zeros(shape, dtype=_NORM_DTYPE, device=device)
 
         self._k_idx_out = _uzeros(shape_idx_out)
         self._k_norm_out = _fzeros(shape_meta)

@@ -193,7 +193,11 @@ def _tc_attend_kernel(
         k_idx_full = nibble_k & IDX_MASK
         k_tile = tl.load(codebook_ptr + k_idx_full)
 
-        k_norm = tl.load(cache_k_norm_ptr + meta_addrs, mask=mask_n, other=0.0)
+        # Promote to fp32 for downstream math; cache may be fp16 when
+        # FP16_NORMS is enabled.
+        k_norm = tl.load(
+            cache_k_norm_ptr + meta_addrs, mask=mask_n, other=0.0
+        ).to(tl.float32)
         # k_tile_scaled approximates ||k|| * (Pi @ k/||k||) = (Pi @ k);
         # the extra Pi^T in recovery cancels in <q_rot, k_tile_scaled>.
         k_tile_scaled = (
@@ -231,7 +235,7 @@ def _tc_attend_kernel(
 
             r_norm_k = tl.load(
                 cache_k_rnorm_ptr + meta_addrs, mask=mask_n, other=0.0
-            )
+            ).to(tl.float32)
             # Sq @ qjl_k^T via tensor core -> (BLOCK_M, BLOCK_N) fp32.
             qjl_dot_k = tl.dot(sq, tl.trans(qjl_sign_tile_k))
 
@@ -269,7 +273,9 @@ def _tc_attend_kernel(
         v_idx_full = nibble_v & IDX_MASK
         v_tile = tl.load(codebook_ptr + v_idx_full)
 
-        v_norm = tl.load(cache_v_norm_ptr + meta_addrs, mask=mask_n, other=0.0)
+        v_norm = tl.load(
+            cache_v_norm_ptr + meta_addrs, mask=mask_n, other=0.0
+        ).to(tl.float32)
         v_tile_scaled = (
             v_tile.to(tl.float32) * v_norm[:, None]
         ).to(COMPUTE_DTYPE)
@@ -296,7 +302,7 @@ def _tc_attend_kernel(
 
             r_norm_v = tl.load(
                 cache_v_rnorm_ptr + meta_addrs, mask=mask_n, other=0.0
-            )
+            ).to(tl.float32)
             v_qjl_scaled = (
                 qjl_sign_tile_v.to(tl.float32)
                 * r_norm_v[:, None]
