@@ -31,7 +31,18 @@ SUBSET="${SUBSET:-}"             # used when TASKS empty (informational)
 MAX_SAMPLES="${MAX_SAMPLES:-}"   # empty -> all
 
 # Stage list -- see vllm/turboquant/stages.py for names.
-STAGES="${STAGES:-FLASH_ATTN TURBOQUANT_b4 TURBOQUANT_split_3_5bit}"
+# Default sweep covers bit-width spectrum (b3/b4/b5) + tight pack
+# variants (b4_t / b4_tfu) + both split configs (2.25 / 3.5) with
+# the most-aggressive metadata packing (3_5bit_fu).
+STAGES="${STAGES:-FLASH_ATTN \
+TURBOQUANT_b3 \
+TURBOQUANT_b4 \
+TURBOQUANT_b4_t \
+TURBOQUANT_b4_tfu \
+TURBOQUANT_b5 \
+TURBOQUANT_split_2_25bit \
+TURBOQUANT_split_3_5bit \
+TURBOQUANT_split_3_5bit_fu}"
 
 REQUEST_TIMEOUT="${REQUEST_TIMEOUT:-1800}"
 SEED="${SEED:-42}"
