@@ -1,0 +1,22 @@
+{
+  "gsm8k": {
+    "metric": "exact_match_number",
+    "max_output": 256,
+    "prompt_template": "Question: {question}\n\nAnswer: Let's think step by step."
+  },
+  "boolq": {
+    "metric": "yes_no",
+    "max_output": 4,
+    "prompt_template": "Passage: {passage}\n\nQuestion: {question}?\n\nAnswer (yes or no):"
+  },
+  "mmlu": {
+    "metric": "multiple_choice",
+    "max_output": 8,
+    "prompt_template": "The following is a multiple choice question about {subject}.\n\n{question}\nA) {c0}\nB) {c1}\nC) {c2}\nD) {c3}\n\nAnswer:"
+  },
+  "gpqa": {
+    "metric": "multiple_choice",
+    "max_output": 8,
+    "prompt_template": "{question}\nA) {c0}\nB) {c1}\nC) {c2}\nD) {c3}\n\nAnswer:"
+  }
+}
