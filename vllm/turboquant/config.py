@@ -44,6 +44,24 @@ class TurboQuantConfig:
     use_cuda: bool = False                     # CUDA WMMA vs Triton TC
 
     # ------------------------------------------------------------------
+    # Invariants (enforced because env-var round-trip can't represent
+    # all 12 combinations of norm/rnorm dtype × split fields × ...)
+    # ------------------------------------------------------------------
+    def __post_init__(self) -> None:
+        # rnorm tracks norm unless explicitly uint8. Matches backend
+        # behavior: TURBOQUANT_FP16_NORMS=1 sets both, TURBOQUANT_UINT8_RNORM=1
+        # overrides rnorm only.
+        if self.rnorm_dtype != "uint8" and self.rnorm_dtype != self.norm_dtype:
+            object.__setattr__(self, "rnorm_dtype", self.norm_dtype)
+        # In homog mode, split bit fields are unused; pin to 0 so that
+        # to_env_dict / from_env round-trip cleanly.
+        if not self.outlier_mask_path:
+            if self.bits_outlier != 0:
+                object.__setattr__(self, "bits_outlier", 0)
+            if self.bits_regular != 0:
+                object.__setattr__(self, "bits_regular", 0)
+
+    # ------------------------------------------------------------------
     # Derived properties
     # ------------------------------------------------------------------
     @property
@@ -71,8 +89,16 @@ class TurboQuantConfig:
         algo = e.get("TURBOQUANT_ALGO", "prod").lower()
         bits = int(e.get("TURBOQUANT_BITS", "4"))
         outlier_mask = e.get("TURBOQUANT_OUTLIER_MASK", "")
-        bits_outlier = int(e.get("TURBOQUANT_BITS_OUTLIER", str(bits)))
-        bits_regular = int(e.get("TURBOQUANT_BITS_REGULAR", str(bits)))
+        # Split bit defaults: when split mode is active, fall back to
+        # bits if the user didn't specify per-slice values (legacy
+        # behavior from backend's old env handling). When not split,
+        # leave at 0 so round-trip is clean.
+        if outlier_mask:
+            bits_outlier = int(e.get("TURBOQUANT_BITS_OUTLIER", str(bits)))
+            bits_regular = int(e.get("TURBOQUANT_BITS_REGULAR", str(bits)))
+        else:
+            bits_outlier = 0
+            bits_regular = 0
         tight_pack = e.get("TURBOQUANT_TIGHT_PACK", "0") == "1"
         norm_dtype = (
             "fp16" if e.get("TURBOQUANT_FP16_NORMS", "0") == "1" else "fp32"
