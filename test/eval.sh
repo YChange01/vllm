@@ -1,16 +1,17 @@
 #!/usr/bin/env bash
 # NIAH (Needle-in-a-Haystack) eval across one or more backends.
 #
-# Available stages:
-#   FLASH_ATTN                 (fp baseline)
-#   TURBOQUANT_b4              (homog prod b=4; 5-bit actual storage)
-#   TURBOQUANT_b4_r            (homog prod b=4 tight nibble; honest
-#                               4-bit/coord, no pack waste)
-#   TURBOQUANT_b2              (homog prod b=2; 2-bit quality floor)
-#   TURBOQUANT_split_2_25bit   (paper 4.3 literal: 32@b=3 + 96@b=2;
-#                               2.25-bit effective; requires OUTLIER_MASK)
-#   TURBOQUANT_split_3_5bit    (32@b=5 + 96@b=3; clean 3.5-bit storage;
-#                               requires OUTLIER_MASK)
+# Available stages (storage flags use suffix letters: t=tight nibble
+# pack, f=fp16 norm/rnorm, u=uint8 rnorm; combine in alpha order):
+#   FLASH_ATTN                    fp baseline
+#   TURBOQUANT_b{2,3,4,5}         homog prod, integer bit budget
+#   TURBOQUANT_b4_t               b=4 + tight nibble (was b4_r); honest
+#                                 4-bit/coord, no pack waste
+#   TURBOQUANT_split_2_25bit      paper 4.3 literal: 32@b=3 + 96@b=2
+#   TURBOQUANT_split_3_5bit       32@b=5 + 96@b=3; clean 3.5-bit
+#   TURBOQUANT_split_3_5bit_f     + fp16 norms (was split_3_5bit_r)
+#   TURBOQUANT_split_3_5bit_fu    + fp16 norms + uint8 rnorm (was _rr)
+# Old names (b4_r / split_*_r / _rr) still accepted with warnings.
 #
 # Same prompt set, temperature=0, so any accuracy drop is attributable to
 # the quantization path. Each server is started via setsid in its own
@@ -161,6 +162,20 @@ echo "[eval] stages: $STAGES"
 # Uses OUTLIER_MASK from the environment when the stage needs a mask.
 stage_config() {
     local tag="$1"
+    # Backward-compat aliases: rename old _r/_rr suffixes to letter-flag
+    # form. Old names continue to work but emit a deprecation note.
+    case "$tag" in
+        TURBOQUANT_b4_r)
+            echo "[eval] DEPRECATED: TURBOQUANT_b4_r -> TURBOQUANT_b4_t" >&2
+            tag="TURBOQUANT_b4_t" ;;
+        TURBOQUANT_split_3_5bit_r)
+            echo "[eval] DEPRECATED: ${tag} -> TURBOQUANT_split_3_5bit_f" >&2
+            tag="TURBOQUANT_split_3_5bit_f" ;;
+        TURBOQUANT_split_3_5bit_rr)
+            echo "[eval] DEPRECATED: ${tag} -> TURBOQUANT_split_3_5bit_fu" >&2
+            tag="TURBOQUANT_split_3_5bit_fu" ;;
+    esac
+
     case "$tag" in
         FLASH_ATTN)
             echo "$FP_PORT FLASH_ATTN '' fp_server.log fp_eval.log"
@@ -168,10 +183,10 @@ stage_config() {
         TURBOQUANT_b4)
             echo "$TQ_PORT TURBOQUANT 'TURBOQUANT_ALGO=prod TURBOQUANT_BITS=4' tq4_server.log tq4_eval.log"
             ;;
-        TURBOQUANT_b4_r)
+        TURBOQUANT_b4_t)
             # Tight nibble pack: 3-bit Lloyd-Max idx + 1-bit QJL into
             # one 4-bit nibble (no pack waste). Honest 4 bit/coord.
-            echo "$TQ_PORT TURBOQUANT 'TURBOQUANT_ALGO=prod TURBOQUANT_BITS=4 TURBOQUANT_TIGHT_PACK=1' tq4r_server.log tq4r_eval.log"
+            echo "$TQ_PORT TURBOQUANT 'TURBOQUANT_ALGO=prod TURBOQUANT_BITS=4 TURBOQUANT_TIGHT_PACK=1' tq4t_server.log tq4t_eval.log"
             ;;
         TURBOQUANT_b2)
             echo "$TQ_PORT TURBOQUANT 'TURBOQUANT_ALGO=prod TURBOQUANT_BITS=2' tq2_server.log tq2_eval.log"
@@ -185,34 +200,9 @@ stage_config() {
             e="$e TURBOQUANT_BITS_OUTLIER=3 TURBOQUANT_BITS_REGULAR=2"
             echo "$TQ_PORT TURBOQUANT '$e' tq_split_2_25_server.log tq_split_2_25_eval.log"
             ;;
-        TURBOQUANT_split_3_5bit_r)
-            # A: fp16 norm/rnorm (saves 16 B/slot K+V vs fp32).
-            if [ -z "${OUTLIER_MASK:-}" ] || [ ! -f "${OUTLIER_MASK:-}" ]; then
-                echo "[eval] stage $tag requires OUTLIER_MASK to point at an existing .pt file" >&2
-                return 1
-            fi
-            local e="TURBOQUANT_ALGO=prod TURBOQUANT_OUTLIER_MASK=$OUTLIER_MASK"
-            e="$e TURBOQUANT_BITS_OUTLIER=5 TURBOQUANT_BITS_REGULAR=3"
-            e="$e TURBOQUANT_FP16_NORMS=1"
-            echo "$TQ_PORT TURBOQUANT '$e' tq_split_3_5r_server.log tq_split_3_5r_eval.log"
-            ;;
-        TURBOQUANT_split_3_5bit_rr)
-            # A+C: fp16 norm + uint8 rnorm. Cuts K-side metadata
-            # 16 B -> 6 B (4 fp32 -> 2 fp16 + 2 uint8). Total K+V
-            # 144 B -> 124 B, compression 3.56x -> 4.13x.
-            if [ -z "${OUTLIER_MASK:-}" ] || [ ! -f "${OUTLIER_MASK:-}" ]; then
-                echo "[eval] stage $tag requires OUTLIER_MASK to point at an existing .pt file" >&2
-                return 1
-            fi
-            local e="TURBOQUANT_ALGO=prod TURBOQUANT_OUTLIER_MASK=$OUTLIER_MASK"
-            e="$e TURBOQUANT_BITS_OUTLIER=5 TURBOQUANT_BITS_REGULAR=3"
-            e="$e TURBOQUANT_FP16_NORMS=1 TURBOQUANT_UINT8_RNORM=1"
-            echo "$TQ_PORT TURBOQUANT '$e' tq_split_3_5rr_server.log tq_split_3_5rr_eval.log"
-            ;;
         TURBOQUANT_split_3_5bit)
             # 32 outlier @ b=5 + 96 regular @ b=3 -> effective 3.5 bit/coord,
-            # storage also 3.5 bit (both b values have main_bits that are
-            # powers of two -- no pack_bits waste).
+            # clean storage (no pack_bits waste).
             if [ -z "${OUTLIER_MASK:-}" ] || [ ! -f "${OUTLIER_MASK:-}" ]; then
                 echo "[eval] stage $tag requires OUTLIER_MASK to point at an existing .pt file" >&2
                 return 1
@@ -220,6 +210,29 @@ stage_config() {
             local e="TURBOQUANT_ALGO=prod TURBOQUANT_OUTLIER_MASK=$OUTLIER_MASK"
             e="$e TURBOQUANT_BITS_OUTLIER=5 TURBOQUANT_BITS_REGULAR=3"
             echo "$TQ_PORT TURBOQUANT '$e' tq_split_3_5_server.log tq_split_3_5_eval.log"
+            ;;
+        TURBOQUANT_split_3_5bit_f)
+            # split_3_5bit + fp16 norm/rnorm (saves 16 B/slot K+V).
+            if [ -z "${OUTLIER_MASK:-}" ] || [ ! -f "${OUTLIER_MASK:-}" ]; then
+                echo "[eval] stage $tag requires OUTLIER_MASK to point at an existing .pt file" >&2
+                return 1
+            fi
+            local e="TURBOQUANT_ALGO=prod TURBOQUANT_OUTLIER_MASK=$OUTLIER_MASK"
+            e="$e TURBOQUANT_BITS_OUTLIER=5 TURBOQUANT_BITS_REGULAR=3"
+            e="$e TURBOQUANT_FP16_NORMS=1"
+            echo "$TQ_PORT TURBOQUANT '$e' tq_split_3_5f_server.log tq_split_3_5f_eval.log"
+            ;;
+        TURBOQUANT_split_3_5bit_fu)
+            # split_3_5bit + fp16 norm + uint8 rnorm. K-side metadata
+            # 16 B -> 6 B; total K+V 144 B -> 124 B (3.56x -> 4.13x).
+            if [ -z "${OUTLIER_MASK:-}" ] || [ ! -f "${OUTLIER_MASK:-}" ]; then
+                echo "[eval] stage $tag requires OUTLIER_MASK to point at an existing .pt file" >&2
+                return 1
+            fi
+            local e="TURBOQUANT_ALGO=prod TURBOQUANT_OUTLIER_MASK=$OUTLIER_MASK"
+            e="$e TURBOQUANT_BITS_OUTLIER=5 TURBOQUANT_BITS_REGULAR=3"
+            e="$e TURBOQUANT_FP16_NORMS=1 TURBOQUANT_UINT8_RNORM=1"
+            echo "$TQ_PORT TURBOQUANT '$e' tq_split_3_5fu_server.log tq_split_3_5fu_eval.log"
             ;;
         *)
             echo "[eval] unknown stage: $tag" >&2

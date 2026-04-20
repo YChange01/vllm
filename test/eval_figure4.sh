@@ -7,8 +7,12 @@
 #   - TURBOQUANT prod b=4         Algorithm 2, ~5-bit storage
 #   - TURBOQUANT split 3.5-bit    Paper 4.3 split (32@5 + 96@3)
 # Other available stages (override via STAGES=...):
-#   - TURBOQUANT_mse_b4           Algorithm 1 (no QJL), 4-bit
-#   - TURBOQUANT_split_2_25bit    Paper 4.3 literal '2.5-bit'
+#   - TURBOQUANT_mse_b4              Algorithm 1 (no QJL), 4-bit
+#   - TURBOQUANT_prod_b4_t           homog b=4 + tight nibble (4-bit clean)
+#   - TURBOQUANT_split_3_5bit_f      split + fp16 norms
+#   - TURBOQUANT_split_3_5bit_fu     split + fp16 norms + uint8 rnorm
+#   - TURBOQUANT_split_2_25bit       Paper 4.3 literal '2.5-bit'
+# Old _r / _rr suffixes accepted with deprecation warnings.
 #
 # Grid matches Figure 4:
 #   - 15 context lengths, log-spaced from 4k to 104k tokens:
@@ -149,42 +153,56 @@ run_stage() {
 }
 
 stage_args() {
-    case "$1" in
+    # Backward-compat aliases.
+    local tag="$1"
+    case "$tag" in
+        TURBOQUANT_prod_b4_r)
+            echo "[fig4] DEPRECATED: ${tag} -> TURBOQUANT_prod_b4_t" >&2
+            tag="TURBOQUANT_prod_b4_t" ;;
+        TURBOQUANT_split_3_5bit_r)
+            echo "[fig4] DEPRECATED: ${tag} -> TURBOQUANT_split_3_5bit_f" >&2
+            tag="TURBOQUANT_split_3_5bit_f" ;;
+        TURBOQUANT_split_3_5bit_rr)
+            echo "[fig4] DEPRECATED: ${tag} -> TURBOQUANT_split_3_5bit_fu" >&2
+            tag="TURBOQUANT_split_3_5bit_fu" ;;
+    esac
+
+    case "$tag" in
         FLASH_ATTN)             echo "FLASH_ATTN  " ;;
         TURBOQUANT_mse_b4)      echo "TURBOQUANT  TURBOQUANT_ALGO=mse TURBOQUANT_BITS=4" ;;
         TURBOQUANT_prod_b4)     echo "TURBOQUANT  TURBOQUANT_ALGO=prod TURBOQUANT_BITS=4" ;;
-        TURBOQUANT_prod_b4_r)   echo "TURBOQUANT  TURBOQUANT_ALGO=prod TURBOQUANT_BITS=4 TURBOQUANT_TIGHT_PACK=1" ;;
+        TURBOQUANT_prod_b4_t)   echo "TURBOQUANT  TURBOQUANT_ALGO=prod TURBOQUANT_BITS=4 TURBOQUANT_TIGHT_PACK=1" ;;
         TURBOQUANT_split_3_5bit)
             if [ ! -f "${OUTLIER_MASK:-}" ]; then
-                echo "[fig4] stage $1 needs OUTLIER_MASK at $OUTLIER_MASK" >&2
+                echo "[fig4] stage $tag needs OUTLIER_MASK at $OUTLIER_MASK" >&2
                 return 1
             fi
             echo "TURBOQUANT  TURBOQUANT_ALGO=prod TURBOQUANT_OUTLIER_MASK=$OUTLIER_MASK TURBOQUANT_BITS_OUTLIER=5 TURBOQUANT_BITS_REGULAR=3"
             ;;
-        TURBOQUANT_split_3_5bit_r)
-            # A: fp16 norm/rnorm.
+        TURBOQUANT_split_3_5bit_f)
+            # split_3_5bit + fp16 norms.
             if [ ! -f "${OUTLIER_MASK:-}" ]; then
-                echo "[fig4] stage $1 needs OUTLIER_MASK at $OUTLIER_MASK" >&2
+                echo "[fig4] stage $tag needs OUTLIER_MASK at $OUTLIER_MASK" >&2
                 return 1
             fi
             echo "TURBOQUANT  TURBOQUANT_ALGO=prod TURBOQUANT_OUTLIER_MASK=$OUTLIER_MASK TURBOQUANT_BITS_OUTLIER=5 TURBOQUANT_BITS_REGULAR=3 TURBOQUANT_FP16_NORMS=1"
             ;;
-        TURBOQUANT_split_3_5bit_rr)
-            # A+C: fp16 norm + uint8 rnorm. K+V 144 -> 124 B (4.13x).
+        TURBOQUANT_split_3_5bit_fu)
+            # split_3_5bit + fp16 norm + uint8 rnorm. K+V 144 -> 124 B (4.13x).
             if [ ! -f "${OUTLIER_MASK:-}" ]; then
-                echo "[fig4] stage $1 needs OUTLIER_MASK at $OUTLIER_MASK" >&2
+                echo "[fig4] stage $tag needs OUTLIER_MASK at $OUTLIER_MASK" >&2
                 return 1
             fi
             echo "TURBOQUANT  TURBOQUANT_ALGO=prod TURBOQUANT_OUTLIER_MASK=$OUTLIER_MASK TURBOQUANT_BITS_OUTLIER=5 TURBOQUANT_BITS_REGULAR=3 TURBOQUANT_FP16_NORMS=1 TURBOQUANT_UINT8_RNORM=1"
             ;;
         TURBOQUANT_split_2_25bit)
             if [ ! -f "${OUTLIER_MASK:-}" ]; then
-                echo "[fig4] stage $1 needs OUTLIER_MASK at $OUTLIER_MASK" >&2
+                echo "[fig4] stage $tag needs OUTLIER_MASK at $OUTLIER_MASK" >&2
                 return 1
             fi
             echo "TURBOQUANT  TURBOQUANT_ALGO=prod TURBOQUANT_OUTLIER_MASK=$OUTLIER_MASK TURBOQUANT_BITS_OUTLIER=3 TURBOQUANT_BITS_REGULAR=2"
             ;;
-        *) echo "[fig4] unknown stage tag: $1" >&2; return 1 ;;
+        *) echo "[fig4] unknown stage tag: $tag" >&2; return 1 ;;
     esac
 }
 
