@@ -144,7 +144,14 @@ def check_homogeneous(bits: int) -> None:
 
     # Reference path (full fp32 round-trip in Python).
     # Use same state (same Pi / S / codebook) so numerics are aligned.
-    kv_end = torch.full((T_q,), T_kv, dtype=torch.int64, device=DEVICE)
+    # Match the kernel's causal semantics: the kernel treats the T_q
+    # queries as the last T_q new tokens in a T_kv-long sequence, so
+    # kv_end[i] = (T_kv - T_q) + i + 1.
+    prefix_len = T_kv - T_q
+    kv_end = (
+        torch.arange(T_q, dtype=torch.int64, device=DEVICE)
+        + prefix_len + 1
+    )
     out_ref = turboquant_attend_reference(
         q.float(), k.float(), v.float(), state, kv_end,
     ).to(DTYPE)
@@ -242,7 +249,11 @@ def check_split(bits_out: int, bits_reg: int, d_out: int,
         state_k=state_k, state_v=state_v,
     )
 
-    kv_end = torch.full((T_q,), T_kv, dtype=torch.int64, device=DEVICE)
+    prefix_len = T_kv - T_q
+    kv_end = (
+        torch.arange(T_q, dtype=torch.int64, device=DEVICE)
+        + prefix_len + 1
+    )
     out_ref = turboquant_attend_split_reference(
         q.float(), k.float(), v.float(), state_k, state_v, kv_end,
     ).to(DTYPE)
