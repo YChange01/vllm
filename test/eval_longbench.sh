@@ -140,6 +140,7 @@ run_stage() {
         --request-timeout "$REQUEST_TIMEOUT" \
         --max-context "$MAX_LEN" \
         ${TASKS:+--tasks "$TASKS"} \
+        ${SUBSET:+--subset "$SUBSET"} \
         ${MAX_SAMPLES:+--max-samples "$MAX_SAMPLES"} \
         --save-details "$details" \
         2>&1 | tee "$elog"

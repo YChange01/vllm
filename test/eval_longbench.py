@@ -406,6 +406,30 @@ def _load_task_rows(data_dir: Path, task: str) -> list[dict]:
     return rows
 
 
+# Paper-like small English subset (LongBench Table 1 highlights).
+# Kept in sync with scripts/dump_longbench.py's _SUBSETS['mini'].
+_MINI_TASKS = [
+    "narrativeqa", "qasper", "hotpotqa",
+    "gov_report", "qmsum", "multi_news",
+]
+
+
+def _resolve_subset(subset: str, config: dict) -> list[str]:
+    """Map a subset name -> list of task names, derived from config.json."""
+    all_tasks = sorted(config.keys())
+    if subset == "full":
+        return all_tasks
+    if subset == "english":
+        return sorted(t for t, m in config.items() if m.get("lang") == "en")
+    if subset == "chinese":
+        return sorted(t for t, m in config.items() if m.get("lang") == "zh")
+    if subset == "mini":
+        return [t for t in _MINI_TASKS if t in config]
+    raise ValueError(
+        f"Unknown subset {subset!r}; known: full, english, chinese, mini"
+    )
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--endpoint", required=True)
@@ -414,8 +438,12 @@ def main() -> int:
     ap.add_argument("--data-dir", default="calib_data/longbench_v1")
     ap.add_argument(
         "--tasks", default=None,
-        help="Comma-separated task names. Default: all tasks present "
-             "in --data-dir.",
+        help="Comma-separated task names. Overrides --subset.",
+    )
+    ap.add_argument(
+        "--subset", default=None,
+        choices=["full", "english", "chinese", "mini"],
+        help="Curated task subset. Ignored if --tasks is set.",
     )
     ap.add_argument("--tag", default="run",
                     help="Label shown in output table / log filename.")
@@ -465,6 +493,12 @@ def main() -> int:
                 print(f"Task {t!r} not in config; available: "
                       f"{sorted(config.keys())}", file=sys.stderr)
                 return 1
+    elif args.subset:
+        tasks = _resolve_subset(args.subset, config)
+        if not tasks:
+            print(f"Subset {args.subset!r} resolved to empty list",
+                  file=sys.stderr)
+            return 1
     else:
         tasks = sorted(config.keys())
 
