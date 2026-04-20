@@ -2,17 +2,12 @@
 # Needle-In-A-Haystack eval reproducing the setup of Figure 4 in the
 # TurboQuant paper (arXiv:2504.19874).
 #
-# Default three configurations (paper-faithful comparison):
-#   - FLASH_ATTN                  bf16 full-precision reference
-#   - TURBOQUANT prod b=4         Algorithm 2, ~5-bit storage
-#   - TURBOQUANT split 3.5-bit    Paper 4.3 split (32@5 + 96@3)
-# Other available stages (override via STAGES=...):
-#   - TURBOQUANT_mse_b4              Algorithm 1 (no QJL), 4-bit
-#   - TURBOQUANT_prod_b4_t           homog b=4 + tight nibble (4-bit clean)
-#   - TURBOQUANT_split_3_5bit_f      split + fp16 norms
-#   - TURBOQUANT_split_3_5bit_fu     split + fp16 norms + uint8 rnorm
-#   - TURBOQUANT_split_2_25bit       Paper 4.3 literal '2.5-bit'
-# Old _r / _rr suffixes accepted with deprecation warnings.
+# Default 9-stage sweep (see STAGES= below):
+#   FLASH_ATTN + {b3, b4, b4_t, b4_tfu, b5}
+#              + {split_2_25bit, split_3_5bit, split_3_5bit_fu}
+# Override via STAGES="..." to pick a subset. See vllm/turboquant/stages.py
+# for every registered name; old _r / _rr suffixes still resolve with a
+# deprecation warning.
 #
 # Grid matches Figure 4:
 #   - 15 context lengths, log-spaced from 4k to 104k tokens:
@@ -54,7 +49,18 @@ MAX_TOKENS="${MAX_TOKENS:-16}"
 # 104k prefill + first-call Triton JIT can take minutes; bump generously.
 REQUEST_TIMEOUT="${REQUEST_TIMEOUT:-3600}"
 
-STAGES="${STAGES:-FLASH_ATTN TURBOQUANT_prod_b4 TURBOQUANT_split_3_5bit}"
+# Default 9-stage sweep (matches test/eval_longbench.sh):
+# bit-width spectrum (b3/b4/b5) + tight-pack variants (b4_t / b4_tfu)
+# + both split configs with fu variant.
+STAGES="${STAGES:-FLASH_ATTN \
+TURBOQUANT_b3 \
+TURBOQUANT_b4 \
+TURBOQUANT_b4_t \
+TURBOQUANT_b4_tfu \
+TURBOQUANT_b5 \
+TURBOQUANT_split_2_25bit \
+TURBOQUANT_split_3_5bit \
+TURBOQUANT_split_3_5bit_fu}"
 
 FP_PORT="${FP_PORT:-8010}"
 TQ_PORT="${TQ_PORT:-8009}"
@@ -133,6 +139,9 @@ run_stage() {
         exit 1
     fi
 
+    # Unbuffer Python stdout so per-cell progress lines stream in
+    # real time when piped to tee (non-TTY default is 4 KB block buf).
+    PYTHONUNBUFFERED=1 \
     python3 "$ROOT_DIR/test/eval_niah.py" \
         --endpoint "http://localhost:${port}" \
         --model "$MODEL" \
