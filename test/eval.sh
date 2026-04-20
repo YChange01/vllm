@@ -1,19 +1,26 @@
 #!/usr/bin/env bash
-# NIAH (Needle-in-a-Haystack) eval across two backends:
-#   - FLASH_ATTN       (fp reference)
-#   - TURBOQUANT b=4   (this branch is b=4 only)
+# NIAH (Needle-in-a-Haystack) eval across one or more backends.
 #
-# Same prompt set, temperature=0, so any accuracy drop is attributable to the
-# quantization path. Each server is started via setsid in its own process
-# group; at the end of its stage we kill -TERM -$PGID to take the whole
-# group (parent + EngineCore) down together. No other processes are touched.
+# Available stages:
+#   FLASH_ATTN                 (fp baseline)
+#   TURBOQUANT_b4              (homog prod b=4; ~5-bit actual storage)
+#   TURBOQUANT_b2              (homog prod b=2; 2-bit quality floor)
+#   TURBOQUANT_split_2_25bit   (paper 4.3: 32@b=3 + 96@b=2 split;
+#                               requires OUTLIER_MASK=<.pt path>)
 #
-# Prerequisite (user manages these): ports 8009 / 8010 free, no zombies.
+# Same prompt set, temperature=0, so any accuracy drop is attributable to
+# the quantization path. Each server is started via setsid in its own
+# process group; at the end of its stage we kill -TERM -$PGID to take
+# the whole group (parent + EngineCore) down together.
+#
+# Prerequisite: ports 8009 / 8010 free, no zombies.
 #
 # Usage:
-#   bash test/eval.sh
-#   CTX=512,2048,8192 POSITIONS=0.1,0.5,0.9 TRIALS=5 bash test/eval.sh
-#   MAX_TOKENS=24 bash test/eval.sh
+#   bash test/eval.sh                                   # baseline + b4
+#   OUTLIER_MASK=/tmp/outliers.pt bash test/eval.sh     # add split stage
+#   STAGES="TURBOQUANT_split_2_25bit" \
+#     OUTLIER_MASK=/tmp/outliers.pt bash test/eval.sh   # split only
+#   CTX=512,2048,8192 TRIALS=5 bash test/eval.sh        # custom grid
 
 set -u
 
@@ -135,35 +142,62 @@ export CUDA_VISIBLE_DEVICES="$GPU"
 echo "[eval] model=$MODEL gpu=$GPU"
 echo "[eval] ctx=$CTX positions=$POSITIONS trials=$TRIALS max_tokens=$MAX_TOKENS seed=$SEED"
 
-run_stage "FLASH_ATTN"     "$FP_PORT" "$LOG_DIR/fp_server.log"   "$LOG_DIR/fp_eval.log"   FLASH_ATTN  ""
-run_stage "TURBOQUANT_b4"  "$TQ_PORT" "$LOG_DIR/tq4_server.log"  "$LOG_DIR/tq4_eval.log"  TURBOQUANT  "TURBOQUANT_ALGO=prod TURBOQUANT_BITS=4"
-
-# Optional third stage: paper §4.3 2.25-bit split config (32@b=3 + 96@b=2).
-# Enabled when OUTLIER_MASK is set to an existing .pt from calibrate.sh.
-STAGES_RUN=("FLASH_ATTN" "TURBOQUANT_b4")
-if [ -n "${OUTLIER_MASK:-}" ]; then
-    if [ ! -f "$OUTLIER_MASK" ]; then
-        echo "[eval] OUTLIER_MASK set to $OUTLIER_MASK but file not found" >&2
-        exit 1
+# Default stage set: FLASH_ATTN + TURBOQUANT_b4, plus split if the
+# OUTLIER_MASK is provided. User can override STAGES explicitly.
+if [ -z "${STAGES:-}" ]; then
+    if [ -n "${OUTLIER_MASK:-}" ]; then
+        STAGES="FLASH_ATTN TURBOQUANT_b4 TURBOQUANT_split_2_25bit"
+    else
+        STAGES="FLASH_ATTN TURBOQUANT_b4"
     fi
-    SPLIT_ENV="TURBOQUANT_ALGO=prod TURBOQUANT_OUTLIER_MASK=$OUTLIER_MASK"
-    SPLIT_ENV="$SPLIT_ENV TURBOQUANT_BITS_OUTLIER=3 TURBOQUANT_BITS_REGULAR=2"
-    run_stage "TURBOQUANT_split_2_25bit" "$TQ_PORT" \
-        "$LOG_DIR/tq_split_server.log" "$LOG_DIR/tq_split_eval.log" \
-        TURBOQUANT "$SPLIT_ENV"
-    STAGES_RUN+=("TURBOQUANT_split_2_25bit")
 fi
+echo "[eval] stages: $STAGES"
+
+# Map a stage name to (port, backend, env-string, server-log, eval-log).
+# Uses OUTLIER_MASK from the environment when the stage needs a mask.
+stage_config() {
+    local tag="$1"
+    case "$tag" in
+        FLASH_ATTN)
+            echo "$FP_PORT FLASH_ATTN '' fp_server.log fp_eval.log"
+            ;;
+        TURBOQUANT_b4)
+            echo "$TQ_PORT TURBOQUANT 'TURBOQUANT_ALGO=prod TURBOQUANT_BITS=4' tq4_server.log tq4_eval.log"
+            ;;
+        TURBOQUANT_b2)
+            echo "$TQ_PORT TURBOQUANT 'TURBOQUANT_ALGO=prod TURBOQUANT_BITS=2' tq2_server.log tq2_eval.log"
+            ;;
+        TURBOQUANT_split_2_25bit)
+            if [ -z "${OUTLIER_MASK:-}" ] || [ ! -f "${OUTLIER_MASK:-}" ]; then
+                echo "[eval] stage $tag requires OUTLIER_MASK to point at an existing .pt file" >&2
+                return 1
+            fi
+            local e="TURBOQUANT_ALGO=prod TURBOQUANT_OUTLIER_MASK=$OUTLIER_MASK"
+            e="$e TURBOQUANT_BITS_OUTLIER=3 TURBOQUANT_BITS_REGULAR=2"
+            echo "$TQ_PORT TURBOQUANT '$e' tq_split_server.log tq_split_eval.log"
+            ;;
+        *)
+            echo "[eval] unknown stage: $tag" >&2
+            return 1
+            ;;
+    esac
+}
+
+STAGES_RUN=()
+for tag in $STAGES; do
+    cfg="$(stage_config "$tag")" || exit 1
+    eval "set -- $cfg"
+    port="$1"; backend="$2"; extra_env="$3"; slog_name="$4"; elog_name="$5"
+    run_stage "$tag" "$port" "$LOG_DIR/$slog_name" "$LOG_DIR/$elog_name" \
+        "$backend" "$extra_env"
+    STAGES_RUN+=("$tag:$LOG_DIR/$elog_name")
+done
 
 echo ""
 echo "=========================== AGGREGATE ============================"
-for tag in "${STAGES_RUN[@]}"; do
-    # Map stage name -> eval log basename.
-    case "$tag" in
-        FLASH_ATTN)                 log="$LOG_DIR/fp_eval.log" ;;
-        TURBOQUANT_b4)              log="$LOG_DIR/tq4_eval.log" ;;
-        TURBOQUANT_split_2_25bit)   log="$LOG_DIR/tq_split_eval.log" ;;
-        *) continue ;;
-    esac
+for entry in "${STAGES_RUN[@]}"; do
+    tag="${entry%%:*}"
+    log="${entry#*:}"
     if [ -f "$log" ]; then
         grep -E '=== NIAH grid|ctx|pos=|overall' "$log" | tail -n 20 || true
         echo ""
