@@ -33,8 +33,12 @@ set -u
 
 MODEL="${MODEL:-/mnt/nvme3n1/g00872988/models/Llama-3.1-8B-Instruct}"
 GPU="${GPU:-2}"
-MAX_LEN="${MAX_LEN:-131072}"
-GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.85}"
+# MAX_LEN=110000 + GPU_MEM_UTIL=0.5 are empirically known-good for
+# 104k NIAH on a 178 GB B200. Higher MAX_LEN / util combos cause
+# vLLM to pre-allocate a bf16 KV backup that crowds out the
+# TurboQuant private buffers and OOMs the engine at 104k.
+MAX_LEN="${MAX_LEN:-110000}"
+GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.5}"
 OUTLIER_MASK="${OUTLIER_MASK:-/tmp/outliers_llama-3_1-8b_32.pt}"
 
 # 15 log-spaced context lengths from 4k to 104k. Approximate integer token
