@@ -16,16 +16,25 @@
 # Prerequisite: ports 8009 / 8010 free, no zombies.
 #
 # Usage:
-#   bash test/eval.sh                                   # baseline + b4
-#   OUTLIER_MASK=/tmp/outliers.pt bash test/eval.sh     # add split stage
-#   STAGES="TURBOQUANT_split_2_25bit" \
-#     OUTLIER_MASK=/tmp/outliers.pt bash test/eval.sh   # split only
+#   bash test/eval.sh                                   # split 2.25-bit only (default)
+#   STAGES='FLASH_ATTN TURBOQUANT_b4' bash test/eval.sh # re-run baselines
+#   STAGES='TURBOQUANT_b4 TURBOQUANT_split_2_25bit' \
+#     bash test/eval.sh                                 # b4 vs split compare
 #   CTX=512,2048,8192 TRIALS=5 bash test/eval.sh        # custom grid
+#
+# Defaults assume the mask produced by scripts/calibrate.sh lives at
+# /tmp/outliers_llama-3_1-8b_32.pt; override OUTLIER_MASK if moved.
 
 set -u
 
 MODEL="${MODEL:-/mnt/nvme3n1/g00872988/models/Llama-3.1-8B-Instruct}"
-GPU="${GPU:-3}"
+GPU="${GPU:-2}"
+# Baseline stages (FLASH_ATTN, TURBOQUANT_b4) have already been validated;
+# default to running only the split 2.25-bit stage so iteration on the
+# split path is cheap. Override via STAGES=... to re-run anything else.
+STAGES="${STAGES:-TURBOQUANT_split_2_25bit}"
+# Default mask produced by scripts/calibrate.sh on this host.
+OUTLIER_MASK="${OUTLIER_MASK:-/tmp/outliers_llama-3_1-8b_32.pt}"
 # NOTE: TurboQuant currently allocates a SEPARATE uint8 _k_idx buffer per
 # attention layer on top of vLLM's native bf16 KV cache. That roughly
 # doubles KV-cache memory for this backend. Keep max_model_len and
@@ -36,7 +45,7 @@ GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.3}"
 
 CTX="${CTX:-512,2048,4096}"
 POSITIONS="${POSITIONS:-0.1,0.5,0.9}"
-TRIALS="${TRIALS:-3}"
+TRIALS="${TRIALS:-1}"
 SEED="${SEED:-42}"
 MAX_TOKENS="${MAX_TOKENS:-16}"
 REQUEST_TIMEOUT="${REQUEST_TIMEOUT:-1800}"  # seconds; first Triton JIT on a
@@ -142,15 +151,6 @@ export CUDA_VISIBLE_DEVICES="$GPU"
 echo "[eval] model=$MODEL gpu=$GPU"
 echo "[eval] ctx=$CTX positions=$POSITIONS trials=$TRIALS max_tokens=$MAX_TOKENS seed=$SEED"
 
-# Default stage set: FLASH_ATTN + TURBOQUANT_b4, plus split if the
-# OUTLIER_MASK is provided. User can override STAGES explicitly.
-if [ -z "${STAGES:-}" ]; then
-    if [ -n "${OUTLIER_MASK:-}" ]; then
-        STAGES="FLASH_ATTN TURBOQUANT_b4 TURBOQUANT_split_2_25bit"
-    else
-        STAGES="FLASH_ATTN TURBOQUANT_b4"
-    fi
-fi
 echo "[eval] stages: $STAGES"
 
 # Map a stage name to (port, backend, env-string, server-log, eval-log).
