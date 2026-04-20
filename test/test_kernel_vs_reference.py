@@ -100,12 +100,14 @@ def _cos_sim(a: torch.Tensor, b: torch.Tensor) -> float:
 
 
 def check_homogeneous(bits: int, tight_pack: bool = False,
-                      fp16_norms: bool = False) -> bool:
+                      fp16_norms: bool = False,
+                      uint8_rnorm: bool = False) -> bool:
     torch.manual_seed(0)
     T_q, T_kv, H_q, H_kv, d = 4, 32, 8, 2, 128
     block_size = 16
     assert T_kv % block_size == 0
     norm_dtype = torch.float16 if fp16_norms else torch.float32
+    rnorm_dtype = torch.uint8 if uint8_rnorm else norm_dtype
 
     state = QuantState(
         algo="prod", bits=bits, head_dim=d, seed=0,
@@ -130,9 +132,10 @@ def check_homogeneous(bits: int, tight_pack: bool = False,
     cache_v_norm = torch.zeros_like(cache_k_norm)
     cache_k_qjl = torch.zeros(num_blocks, block_size, H_kv, qjl_dim,
                               dtype=torch.uint8, device=DEVICE)
-    cache_k_rn = torch.zeros_like(cache_k_norm)
+    cache_k_rn = torch.zeros(num_blocks, block_size, H_kv,
+                             dtype=rnorm_dtype, device=DEVICE)
     cache_v_qjl = torch.zeros_like(cache_k_qjl)
-    cache_v_rn = torch.zeros_like(cache_k_norm)
+    cache_v_rn = torch.zeros_like(cache_k_rn)
 
     turboquant_store_kv(
         new_k=k, cache_k_idx=cache_k_idx, cache_k_norm=cache_k_norm,
@@ -188,6 +191,8 @@ def check_homogeneous(bits: int, tight_pack: bool = False,
         flags += " [tight]"
     if fp16_norms:
         flags += " [fp16-norms]"
+    if uint8_rnorm:
+        flags += " [uint8-rnorm]"
     label = f"homog b={bits}{flags}"
     print(
         f"  [{status}] {label}: max_abs_diff={diff:.4f}  "
@@ -198,7 +203,8 @@ def check_homogeneous(bits: int, tight_pack: bool = False,
 
 def check_split(bits_out: int, bits_reg: int, d_out: int,
                 with_outliers: bool, label: str,
-                fp16_norms: bool = False) -> bool:
+                fp16_norms: bool = False,
+                uint8_rnorm: bool = False) -> bool:
     torch.manual_seed(0)
     T_q, T_kv, H_q, H_kv, d = 4, 32, 8, 2, 128
     block_size = 16
@@ -230,6 +236,7 @@ def check_split(bits_out: int, bits_reg: int, d_out: int,
     pack_reg = state_k.state_reg.pack_bits
 
     norm_dtype = torch.float16 if fp16_norms else torch.float32
+    rnorm_dtype = torch.uint8 if uint8_rnorm else norm_dtype
 
     def _mk_bufs(d_slice: int, pack_bits: int):
         idx_d = d_slice * pack_bits // 8
@@ -242,7 +249,7 @@ def check_split(bits_out: int, bits_reg: int, d_out: int,
             torch.zeros(num_blocks, block_size, H_kv, qjl_d,
                         dtype=torch.uint8, device=DEVICE),
             torch.zeros(num_blocks, block_size, H_kv,
-                        dtype=norm_dtype, device=DEVICE),
+                        dtype=rnorm_dtype, device=DEVICE),
         )
 
     k_idx_out, k_norm_out, k_qjl_out, k_rn_out = _mk_bufs(d_out, pack_out)
@@ -320,6 +327,8 @@ def main() -> int:
         check_homogeneous(bits=4, tight_pack=True),    # b4_r tight nibble
         check_homogeneous(bits=4, tight_pack=True,     # b4_r + fp16 norms
                           fp16_norms=True),
+        check_homogeneous(bits=4, tight_pack=True,     # b4_rr full A+C
+                          fp16_norms=True, uint8_rnorm=True),
         check_homogeneous(bits=2),
         check_homogeneous(bits=5),
         check_split(bits_out=4, bits_reg=3, d_out=64, with_outliers=False,
@@ -327,6 +336,9 @@ def main() -> int:
         check_split(bits_out=4, bits_reg=3, d_out=64, with_outliers=False,
                     fp16_norms=True,
                     label="split 3.5-bit_r (64@4 + 64@3) fp16 norms"),
+        check_split(bits_out=4, bits_reg=3, d_out=64, with_outliers=False,
+                    fp16_norms=True, uint8_rnorm=True,
+                    label="split 3.5-bit_rr (64@4 + 64@3) fp16+uint8"),
         check_split(bits_out=3, bits_reg=2, d_out=32, with_outliers=True,
                     label="split 2.25-bit (32@3 + 96@2) w/ outliers"),
         check_split(bits_out=5, bits_reg=4, d_out=32, with_outliers=False,

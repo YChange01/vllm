@@ -186,9 +186,7 @@ stage_config() {
             echo "$TQ_PORT TURBOQUANT '$e' tq_split_2_25_server.log tq_split_2_25_eval.log"
             ;;
         TURBOQUANT_split_3_5bit_r)
-            # Same as split_3_5bit but stores norm/rnorm as fp16
-            # (saves 16 B/slot K+V vs fp32 norms; ~12% extra
-            # compression). Identical algorithm/precision otherwise.
+            # A: fp16 norm/rnorm (saves 16 B/slot K+V vs fp32).
             if [ -z "${OUTLIER_MASK:-}" ] || [ ! -f "${OUTLIER_MASK:-}" ]; then
                 echo "[eval] stage $tag requires OUTLIER_MASK to point at an existing .pt file" >&2
                 return 1
@@ -197,6 +195,19 @@ stage_config() {
             e="$e TURBOQUANT_BITS_OUTLIER=5 TURBOQUANT_BITS_REGULAR=3"
             e="$e TURBOQUANT_FP16_NORMS=1"
             echo "$TQ_PORT TURBOQUANT '$e' tq_split_3_5r_server.log tq_split_3_5r_eval.log"
+            ;;
+        TURBOQUANT_split_3_5bit_rr)
+            # A+C: fp16 norm + uint8 rnorm. Cuts K-side metadata
+            # 16 B -> 6 B (4 fp32 -> 2 fp16 + 2 uint8). Total K+V
+            # 144 B -> 124 B, compression 3.56x -> 4.13x.
+            if [ -z "${OUTLIER_MASK:-}" ] || [ ! -f "${OUTLIER_MASK:-}" ]; then
+                echo "[eval] stage $tag requires OUTLIER_MASK to point at an existing .pt file" >&2
+                return 1
+            fi
+            local e="TURBOQUANT_ALGO=prod TURBOQUANT_OUTLIER_MASK=$OUTLIER_MASK"
+            e="$e TURBOQUANT_BITS_OUTLIER=5 TURBOQUANT_BITS_REGULAR=3"
+            e="$e TURBOQUANT_FP16_NORMS=1 TURBOQUANT_UINT8_RNORM=1"
+            echo "$TQ_PORT TURBOQUANT '$e' tq_split_3_5rr_server.log tq_split_3_5rr_eval.log"
             ;;
         TURBOQUANT_split_3_5bit)
             # 32 outlier @ b=5 + 96 regular @ b=3 -> effective 3.5 bit/coord,

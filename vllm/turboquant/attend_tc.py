@@ -65,7 +65,7 @@ _AUTOTUNE_CONFIGS = [
 @triton.autotune(
     configs=_AUTOTUNE_CONFIGS,
     key=["head_size", "K_CB", "PACK_BITS", "USE_QJL", "USE_TIGHT",
-         "BLOCK_M", "GQA_GROUP"],
+         "USE_UINT8_RNORM", "BLOCK_M", "GQA_GROUP"],
 )
 @triton.jit
 def _tc_attend_kernel(
@@ -103,11 +103,16 @@ def _tc_attend_kernel(
     PACK_BITS: tl.constexpr,        # 1, 2, 4, or 8
     USE_QJL: tl.constexpr,
     USE_TIGHT: tl.constexpr,        # b=4 prod tight nibble (idx+qjl)
+    USE_UINT8_RNORM: tl.constexpr,  # rnorm cache stored as uint8 in [0, RNORM_MAX]
     GQA_GROUP: tl.constexpr,
 ):
     q_idx = tl.program_id(0)
     kvh_idx = tl.program_id(1)
     q_head_start = kvh_idx * GQA_GROUP
+    # Must match store-side scaling. Hardcoded to 2.0; ||r|| typically
+    # < 1 for randn data, 2x headroom for outlier-amplified.
+    RNORM_MAX: tl.constexpr = 2.0
+    RNORM_DEQUANT: tl.constexpr = 2.0 / 255.0
 
     seq_idx = tl.load(seq_id_per_query_ptr + q_idx)
     kv_end = tl.load(kv_end_per_query_ptr + q_idx)
@@ -236,6 +241,8 @@ def _tc_attend_kernel(
             r_norm_k = tl.load(
                 cache_k_rnorm_ptr + meta_addrs, mask=mask_n, other=0.0
             ).to(tl.float32)
+            if USE_UINT8_RNORM:
+                r_norm_k = r_norm_k * RNORM_DEQUANT
             # Sq @ qjl_k^T via tensor core -> (BLOCK_M, BLOCK_N) fp32.
             qjl_dot_k = tl.dot(sq, tl.trans(qjl_sign_tile_k))
 
@@ -303,6 +310,8 @@ def _tc_attend_kernel(
             r_norm_v = tl.load(
                 cache_v_rnorm_ptr + meta_addrs, mask=mask_n, other=0.0
             ).to(tl.float32)
+            if USE_UINT8_RNORM:
+                r_norm_v = r_norm_v * RNORM_DEQUANT
             v_qjl_scaled = (
                 qjl_sign_tile_v.to(tl.float32)
                 * r_norm_v[:, None]
@@ -356,6 +365,9 @@ def turboquant_paged_attention_tc(
 
     use_qjl = state.algo == "prod"
     use_tight = bool(getattr(state, "tight_pack", False))
+    use_uint8_rnorm = (
+        cache_k_rnorm is not None and cache_k_rnorm.dtype == torch.uint8
+    )
     if use_qjl and not use_tight:
         assert cache_k_qjl_sign is not None and cache_k_rnorm is not None
         assert cache_v_qjl_sign is not None and cache_v_rnorm is not None
@@ -484,6 +496,7 @@ def turboquant_paged_attention_tc(
         PACK_BITS=pack_bits,
         USE_QJL=use_qjl,
         USE_TIGHT=use_tight,
+        USE_UINT8_RNORM=use_uint8_rnorm,
         GQA_GROUP=gqa_group,
     )
 

@@ -63,7 +63,7 @@ _AUTOTUNE_CONFIGS = [
         "D_OUT", "D_REG",
         "K_CB_OUT", "K_CB_REG",
         "PACK_BITS_OUT", "PACK_BITS_REG",
-        "USE_QJL", "BLOCK_M", "GQA_GROUP",
+        "USE_QJL", "USE_UINT8_RNORM", "BLOCK_M", "GQA_GROUP",
     ],
 )
 @triton.jit
@@ -130,8 +130,11 @@ def _split_attend_kernel(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     USE_QJL: tl.constexpr,
+    USE_UINT8_RNORM: tl.constexpr,   # rnorm cache stored as uint8
     GQA_GROUP: tl.constexpr,
 ):
+    # Match store-side scaling.
+    RNORM_DEQUANT: tl.constexpr = 2.0 / 255.0
     q_idx = tl.program_id(0)
     kvh_idx = tl.program_id(1)
     q_head_start = kvh_idx * GQA_GROUP
@@ -278,6 +281,8 @@ def _split_attend_kernel(
             r_norm_k_out = tl.load(
                 cache_k_rnorm_out_ptr + meta_addrs, mask=mask_n, other=0.0
             ).to(tl.float32)
+            if USE_UINT8_RNORM:
+                r_norm_k_out = r_norm_k_out * RNORM_DEQUANT
             qjl_dot_k_out = tl.dot(sq_out, tl.trans(qjl_sign_k_out))
             qk_out = qk_out + (
                 qjl_coef_out
@@ -334,6 +339,8 @@ def _split_attend_kernel(
             r_norm_k_reg = tl.load(
                 cache_k_rnorm_reg_ptr + meta_addrs, mask=mask_n, other=0.0
             ).to(tl.float32)
+            if USE_UINT8_RNORM:
+                r_norm_k_reg = r_norm_k_reg * RNORM_DEQUANT
             qjl_dot_k_reg = tl.dot(sq_reg, tl.trans(qjl_sign_k_reg))
             qk_reg = qk_reg + (
                 qjl_coef_reg
@@ -399,6 +406,8 @@ def _split_attend_kernel(
             r_norm_v_out = tl.load(
                 cache_v_rnorm_out_ptr + meta_addrs, mask=mask_n, other=0.0
             ).to(tl.float32)
+            if USE_UINT8_RNORM:
+                r_norm_v_out = r_norm_v_out * RNORM_DEQUANT
             v_qjl_tile_out = (
                 qjl_sign_v_out.to(tl.float32)
                 * r_norm_v_out[:, None]
@@ -442,6 +451,8 @@ def _split_attend_kernel(
             r_norm_v_reg = tl.load(
                 cache_v_rnorm_reg_ptr + meta_addrs, mask=mask_n, other=0.0
             ).to(tl.float32)
+            if USE_UINT8_RNORM:
+                r_norm_v_reg = r_norm_v_reg * RNORM_DEQUANT
             v_qjl_tile_reg = (
                 qjl_sign_v_reg.to(tl.float32)
                 * r_norm_v_reg[:, None]
@@ -534,6 +545,10 @@ def turboquant_paged_attention_split_tc(
     num_seqs = int(seq_lens.shape[0])
 
     use_qjl = state_k.algo == "prod"
+    use_uint8_rnorm = (
+        cache_k_rnorm_out is not None
+        and cache_k_rnorm_out.dtype == torch.uint8
+    )
     if use_qjl:
         assert state_v.algo == "prod"
         for buf in (
@@ -677,6 +692,7 @@ def turboquant_paged_attention_split_tc(
         block_size=block_size,
         BLOCK_M=BLOCK_M,
         USE_QJL=use_qjl,
+        USE_UINT8_RNORM=use_uint8_rnorm,
         GQA_GROUP=gqa_group,
     )
 

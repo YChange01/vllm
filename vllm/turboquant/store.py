@@ -62,7 +62,12 @@ def _store_quant_kernel(
     PACK_BITS: tl.constexpr,         # 1, 2, 4, or 8
     USE_QJL: tl.constexpr,
     USE_TIGHT: tl.constexpr,         # b=4 prod only: pack qjl_bit into nibble
+    USE_UINT8_RNORM: tl.constexpr,   # store rnorm as uint8 in [0, RNORM_MAX]
 ):
+    # Hardcoded scale for uint8 rnorm. ||r|| typically in [0, 1] for
+    # randn data; RNORM_MAX=2 gives 2x headroom for outlier-amplified
+    # K/V. Per-step uint8 precision: 2/255 ≈ 0.008 absolute, ~1% rel.
+    RNORM_MAX: tl.constexpr = 2.0
     tok = tl.program_id(0)
     kvh = tl.program_id(1)
 
@@ -156,10 +161,14 @@ def _store_quant_kernel(
         r_norm_sq = tl.sum(r * r)
         r_norm = tl.sqrt(r_norm_sq)
         r_norm = tl.maximum(r_norm, 1e-6)
-        tl.store(
-            cache_rnorm_ptr + meta_out,
-            r_norm.to(cache_rnorm_ptr.dtype.element_ty),
-        )
+        if USE_UINT8_RNORM:
+            r_quant = tl.minimum(r_norm * (255.0 / RNORM_MAX), 255.0)
+            tl.store(cache_rnorm_ptr + meta_out, r_quant.to(tl.uint8))
+        else:
+            tl.store(
+                cache_rnorm_ptr + meta_out,
+                r_norm.to(cache_rnorm_ptr.dtype.element_ty),
+            )
     elif USE_QJL:
         rk = tl.load(codebook_ptr + idx).to(tl.float32)
         r = rot - rk
@@ -169,10 +178,14 @@ def _store_quant_kernel(
         r_norm = tl.maximum(r_norm, 1e-6)
         r_unit = r / r_norm
 
-        tl.store(
-            cache_rnorm_ptr + meta_out,
-            r_norm.to(cache_rnorm_ptr.dtype.element_ty),
-        )
+        if USE_UINT8_RNORM:
+            r_quant = tl.minimum(r_norm * (255.0 / RNORM_MAX), 255.0)
+            tl.store(cache_rnorm_ptr + meta_out, r_quant.to(tl.uint8))
+        else:
+            tl.store(
+                cache_rnorm_ptr + meta_out,
+                r_norm.to(cache_rnorm_ptr.dtype.element_ty),
+            )
 
         # qjl_raw = S @ r_unit (d-dim matvec, on-chip fp32).
         S_tile = tl.load(
@@ -266,6 +279,9 @@ def _rotate_and_store(
         f"(head_dim={d}, pack_bits={pack_bits})"
     )
     use_tight = bool(getattr(state, "tight_pack", False))
+    use_uint8_rnorm = (
+        cache_rnorm is not None and cache_rnorm.dtype == torch.uint8
+    )
     if use_tight:
         # Tight packs qjl_bit into the idx nibble; cache_qjl_sign is
         # not allocated by the backend in this mode. cache_rnorm is
@@ -314,6 +330,7 @@ def _rotate_and_store(
         PACK_BITS=pack_bits,
         USE_QJL=use_qjl,
         USE_TIGHT=use_tight,
+        USE_UINT8_RNORM=use_uint8_rnorm,
     )
 
 

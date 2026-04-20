@@ -111,6 +111,10 @@ TURBOQUANT_TIGHT_PACK = os.environ.get("TURBOQUANT_TIGHT_PACK", "0") == "1"
 # buffer dtype changes. Loss: ~0.1% relative error in the rescale,
 # negligible vs Lloyd-Max + QJL noise.
 TURBOQUANT_FP16_NORMS = os.environ.get("TURBOQUANT_FP16_NORMS", "0") == "1"
+# Quantize rnorm to uint8 in [0, RNORM_MAX=2.0] (1 B/slot vs 4 B fp32
+# or 2 B fp16). ~1% relative precision loss in rnorm dequant. Combined
+# with FP16_NORMS, K-side metadata drops 16 B -> 6 B in split mode.
+TURBOQUANT_UINT8_RNORM = os.environ.get("TURBOQUANT_UINT8_RNORM", "0") == "1"
 
 if TURBOQUANT_ALGO not in ("mse", "prod"):
     raise ValueError(
@@ -176,12 +180,14 @@ if TURBOQUANT_TIGHT_PACK and not _HOMOG_TIGHT:
     )
 
 _NORM_DTYPE = torch.float16 if TURBOQUANT_FP16_NORMS else torch.float32
+_RNORM_DTYPE = torch.uint8 if TURBOQUANT_UINT8_RNORM else _NORM_DTYPE
 
 logger.info(
     "TurboQuant backend (paper-repro): algo=%s bits=%d split=%s "
-    "use_cuda=%s tight_pack=%s norm_dtype=%s",
+    "use_cuda=%s tight_pack=%s norm_dtype=%s rnorm_dtype=%s",
     TURBOQUANT_ALGO, TURBOQUANT_BITS,
-    bool(_OUTLIER_MASK), TURBOQUANT_USE_CUDA, _HOMOG_TIGHT, _NORM_DTYPE,
+    bool(_OUTLIER_MASK), TURBOQUANT_USE_CUDA, _HOMOG_TIGHT,
+    _NORM_DTYPE, _RNORM_DTYPE,
 )
 
 
@@ -468,10 +474,10 @@ class TurboQuantAttentionImpl(AttentionImpl):
             # rnorm always allocated; qjl_sign skipped in tight mode
             # (merged into the high bit of each idx nibble).
             self._k_rnorm = torch.zeros(
-                shape_meta, dtype=_NORM_DTYPE, device=device
+                shape_meta, dtype=_RNORM_DTYPE, device=device
             )
             self._v_rnorm = torch.zeros(
-                shape_meta, dtype=_NORM_DTYPE, device=device
+                shape_meta, dtype=_RNORM_DTYPE, device=device
             )
             if not _HOMOG_TIGHT:
                 shape_qjl = (num_blocks, block_size, self.num_kv_heads,
@@ -527,8 +533,12 @@ class TurboQuantAttentionImpl(AttentionImpl):
             return torch.zeros(shape, dtype=torch.uint8, device=device)
 
         def _fzeros(shape):
-            # norm/rnorm dtype controlled by TURBOQUANT_FP16_NORMS.
+            # norm dtype controlled by TURBOQUANT_FP16_NORMS.
             return torch.zeros(shape, dtype=_NORM_DTYPE, device=device)
+
+        def _rzeros(shape):
+            # rnorm dtype controlled by TURBOQUANT_UINT8_RNORM (else norm).
+            return torch.zeros(shape, dtype=_RNORM_DTYPE, device=device)
 
         self._k_idx_out = _uzeros(shape_idx_out)
         self._k_norm_out = _fzeros(shape_meta)
@@ -545,13 +555,13 @@ class TurboQuantAttentionImpl(AttentionImpl):
             shape_qjl_reg = (num_blocks, block_size, self.num_kv_heads,
                              d_reg // 8)
             self._k_qjl_sign_out = _uzeros(shape_qjl_out)
-            self._k_rnorm_out = _fzeros(shape_meta)
+            self._k_rnorm_out = _rzeros(shape_meta)
             self._k_qjl_sign_reg = _uzeros(shape_qjl_reg)
-            self._k_rnorm_reg = _fzeros(shape_meta)
+            self._k_rnorm_reg = _rzeros(shape_meta)
             self._v_qjl_sign_out = _uzeros(shape_qjl_out)
-            self._v_rnorm_out = _fzeros(shape_meta)
+            self._v_rnorm_out = _rzeros(shape_meta)
             self._v_qjl_sign_reg = _uzeros(shape_qjl_reg)
-            self._v_rnorm_reg = _fzeros(shape_meta)
+            self._v_rnorm_reg = _rzeros(shape_meta)
 
     # ------------------------------------------------------------------
     # vLLM hooks

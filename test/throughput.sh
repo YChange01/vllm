@@ -161,6 +161,13 @@ stage_args() {
             fi
             echo "TURBOQUANT  TURBOQUANT_ALGO=prod TURBOQUANT_OUTLIER_MASK=$OUTLIER_MASK TURBOQUANT_BITS_OUTLIER=5 TURBOQUANT_BITS_REGULAR=3 TURBOQUANT_FP16_NORMS=1"
             ;;
+        TURBOQUANT_split_3_5bit_rr)
+            if [ ! -f "${OUTLIER_MASK:-}" ]; then
+                echo "[bench] stage $1 needs OUTLIER_MASK at $OUTLIER_MASK" >&2
+                return 1
+            fi
+            echo "TURBOQUANT  TURBOQUANT_ALGO=prod TURBOQUANT_OUTLIER_MASK=$OUTLIER_MASK TURBOQUANT_BITS_OUTLIER=5 TURBOQUANT_BITS_REGULAR=3 TURBOQUANT_FP16_NORMS=1 TURBOQUANT_UINT8_RNORM=1"
+            ;;
         TURBOQUANT_split_2_25bit)
             if [ ! -f "${OUTLIER_MASK:-}" ]; then
                 echo "[bench] stage $1 needs OUTLIER_MASK at $OUTLIER_MASK" >&2
