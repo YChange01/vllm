@@ -20,8 +20,9 @@ Tests exercised:
     homog b=2                 : prod Q2, 1-bit main + 1-bit QJL
     homog b=5                 : prod Q2, 4-bit main + 1-bit QJL
     split 3.5-bit             : 64@b=4 + 64@b=3 (no outliers)
-    split 'paper 2.5-bit'     : 32@b=3 + 96@b=2 (paper §4.3 literal,
-                                arithmetically 2.25), first 32 chans *= 10
+    split 2.25-bit            : 32@b=3 + 96@b=2 (paper §4.3 literal
+                                config; paper labels it 2.5-bit but
+                                arithmetic is 2.25), first 32 chans *= 10
     split high-precision      : 32@b=5 + 96@b=4 (no outliers)
 """
 
@@ -310,7 +311,7 @@ def main() -> int:
         check_split(bits_out=4, bits_reg=3, d_out=64, with_outliers=False,
                     label="split 3.5-bit (64@4 + 64@3) no outliers"),
         check_split(bits_out=3, bits_reg=2, d_out=32, with_outliers=True,
-                    label="split paper '2.5-bit' (32@3 + 96@2) w/ outliers"),
+                    label="split 2.25-bit (32@3 + 96@2) w/ outliers"),
         check_split(bits_out=5, bits_reg=4, d_out=32, with_outliers=False,
                     label="split high-precision (32@5 + 96@4)"),
     ]

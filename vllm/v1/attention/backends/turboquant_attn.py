@@ -89,8 +89,9 @@ TURBOQUANT_USE_CUDA = os.environ.get("TURBOQUANT_USE_CUDA", "0") == "1"
 # Outlier channel splitting (paper §4.3). When set, the mask file is
 # loaded once at module init and the backend switches from homogeneous
 # quantization to two-slice quantization. BITS_OUTLIER / BITS_REGULAR
-# control the per-slice bit budgets (e.g., 3+2 for 2.5-bit effective on
-# Llama's 128-dim heads with 32 outliers).
+# control the per-slice bit budgets (e.g., 3+2 for paper's literal
+# "2.5-bit" config -- arithmetically 2.25 -- on Llama's 128-dim heads
+# with 32 outliers).
 TURBOQUANT_OUTLIER_MASK = os.environ.get("TURBOQUANT_OUTLIER_MASK", "")
 TURBOQUANT_BITS_OUTLIER = int(
     os.environ.get("TURBOQUANT_BITS_OUTLIER", str(TURBOQUANT_BITS))

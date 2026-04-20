@@ -78,7 +78,7 @@ Expected output (bf16 noise is ~1.5e-2):
   homog b=2: max_abs_diff=0.012  cos_sim=0.99990
   homog b=5: max_abs_diff=0.004  cos_sim=0.99998
   split 3.5-bit (64@4 + 64@3) no outliers: ...
-  split 2.5-bit (32@4 + 96@2) w/ outliers: ...
+  split 2.25-bit (32@3 + 96@2) w/ outliers: ...
   split high-precision (32@5 + 96@4): ...
 
 All parity checks PASSED.
@@ -142,14 +142,17 @@ Then point the backend at the mask and pick per-slice bit budgets:
 ```bash
 export TURBOQUANT_ALGO=prod
 export TURBOQUANT_OUTLIER_MASK=/tmp/outliers_llama3_8b_32.pt
-export TURBOQUANT_BITS_OUTLIER=4    # 32 channels at 4 bits
+# Paper-faithful §4.3 config (paper labels "2.5-bit", arithmetic is 2.25):
+export TURBOQUANT_BITS_OUTLIER=3    # 32 channels at 3 bits
 export TURBOQUANT_BITS_REGULAR=2    # 96 channels at 2 bits
-# -> effective (32*4 + 96*2)/128 = 2.5 bits/coord
+# -> effective (32*3 + 96*2)/128 = 2.25 bits/coord
 ```
 
-Note: paper's §4.3 "2.5-bit example (32 outlier @ 3 + 96 regular @ 2)"
-actually computes to 2.25 bits; the arithmetic in the paper has a
-typo. True 2.5-bit is 32@4 + 96@2 or 64@3 + 64@2.
+Paper's §4.3 labels this config "2.5-bit" but the arithmetic is 2.25.
+We use the paper's literal b values (3 + 2) for Table 1 comparability
+and report results as 2.25-bit. If you want true 2.5-bit storage,
+use 32@4 + 96@2 (but b=4 wastes 1 pack bit -> actual storage 2.75)
+or 64@3 + 64@2 (clean 2.5-bit storage).
 
 ## Known limitations (paper-repro branch)
 

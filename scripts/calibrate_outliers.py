@@ -55,8 +55,37 @@ from pathlib import Path
 import torch
 
 
-def _load_calibration_texts(name: str, num_samples: int) -> list[str]:
-    """Load text samples from a small, well-known calibration set."""
+def _load_calibration_texts(
+    name: str, num_samples: int, texts_file: str | None
+) -> list[str]:
+    """Load text samples from a local JSONL file or a HF dataset.
+
+    The JSONL path is preferred on offline machines (e.g. B200 with no
+    outbound HTTPS): one JSON object per line with a ``text`` field.
+    Produce it on a connected machine via ``scripts/dump_wikitext2.py``.
+    """
+    if texts_file is not None:
+        import json
+        texts: list[str] = []
+        with open(texts_file, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                row = json.loads(line)
+                t = row.get("text", "")
+                if len(t.strip()) > 200:
+                    texts.append(t)
+                if len(texts) >= num_samples:
+                    break
+        if len(texts) < num_samples:
+            raise RuntimeError(
+                f"Only found {len(texts)} usable samples in "
+                f"{texts_file}, wanted {num_samples}. Regenerate with "
+                f"more rows or lower --num-samples."
+            )
+        return texts
+
     from datasets import load_dataset
 
     if name == "wikitext2":
@@ -134,26 +163,6 @@ def _register_kv_hooks(
     handles = []
     layers = model.model.layers
 
-    def _make_hook(layer_idx: int, which: str):
-        def hook(module, inputs, output):
-            # output shape: (..., num_kv_heads * head_dim).
-            shape = output.shape
-            assert shape[-1] == num_kv_heads * head_dim, (
-                f"Unexpected {which}_proj output dim {shape[-1]} != "
-                f"{num_kv_heads} * {head_dim}"
-            )
-            reshaped = output.reshape(
-                -1, num_kv_heads, head_dim
-            ).detach()
-            if which == "k":
-                collector.update(layer_idx, reshaped, reshaped.new_zeros(reshaped.shape))
-                # update stored v stat in separate pass -- hook for v_proj
-                # updates v_sum too. Avoid double-counting by splitting:
-                collector.v_sum[layer_idx] -= reshaped.new_zeros(reshaped.shape[1:], dtype=torch.float64)
-            return output
-        return hook
-
-    # Separate K and V hooks so we don't conflate the two tensors.
     def _k_hook(layer_idx: int):
         def fn(module, inputs, output):
             reshaped = output.reshape(-1, num_kv_heads, head_dim).detach()
@@ -190,6 +199,11 @@ def main() -> None:
     parser.add_argument("--output", required=True)
     parser.add_argument("--hf-cache", default=None,
                         help="Override HF_HOME / TRANSFORMERS_CACHE.")
+    parser.add_argument("--texts-file", default=None,
+                        help="Path to a JSONL file (one {'text': ...} "
+                             "per line) to use instead of downloading "
+                             "via HF datasets. Required on B200 (no "
+                             "outbound HTTPS).")
     args = parser.parse_args()
 
     if args.hf_cache:
@@ -230,7 +244,9 @@ def main() -> None:
     )
     handles = _register_kv_hooks(model, num_kv_heads, head_dim, collector)
     try:
-        texts = _load_calibration_texts(args.dataset, args.num_samples)
+        texts = _load_calibration_texts(
+            args.dataset, args.num_samples, args.texts_file
+        )
         print(f"Running calibration on {len(texts)} samples "
               f"(seq_len <= {args.seq_len}) ...")
         with torch.inference_mode():

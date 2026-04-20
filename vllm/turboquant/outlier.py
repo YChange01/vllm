@@ -2,11 +2,13 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Outlier channel splitting for TurboQuant (paper arXiv:2504.19874 §4.3).
 
-The paper's 2.5-bit / 3.5-bit LongBench results split each head's
-channels into an outlier set and a regular set, applying an
-independent TurboQuant instance to each. For example 2.5-bit:
+The paper's low-bit LongBench results split each head's channels into
+an outlier set and a regular set, applying an independent TurboQuant
+instance to each. For example the config the paper names "2.5-bit":
     32 outlier channels at b=3  + 96 regular channels at b=2
-    -> (32 * 3 + 96 * 2) / 128 = 2.5 bits/coord effective.
+    -> (32 * 3 + 96 * 2) / 128 = 2.25 bits/coord (paper's "2.5" label
+       is arithmetically incorrect; we keep the paper's literal config
+       to allow Table 1 comparison but call it 2.25-bit in our reports).
 
 This module provides:
 

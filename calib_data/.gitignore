@@ -1,0 +1,3 @@
+# Calibration artifacts are large and host-specific.
+*.jsonl
+*.pt
