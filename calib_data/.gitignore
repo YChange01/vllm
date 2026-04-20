@@ -1,3 +1,6 @@
-# Calibration artifacts are large and host-specific.
-*.jsonl
+# Generated per-model outlier masks are host-specific and multi-MB.
 *.pt
+
+# Committed calibration corpora (wikitext2_calib.jsonl, ~0.4 MB) are
+# tracked explicitly; only ignore user-specific or generated JSONL.
+user_*.jsonl
