@@ -24,8 +24,17 @@ MAX_LEN="${MAX_LEN:-32768}"     # LongBench max context is ~32k
 GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.5}"
 OUTLIER_MASK="${OUTLIER_MASK:-/tmp/outliers_llama-3_1-8b_32.pt}"
 
-# Data + task selection
-DATA_DIR="${DATA_DIR:-calib_data/longbench_v1}"
+# Data + task selection.
+#   VARIANT=base (default): calib_data/longbench_v1 (21 tasks, raw LongBench)
+#   VARIANT=e              : calib_data/longbench_v1_e (13 tasks, uniform-length E variant)
+#                            Matches the QJL paper (arXiv:2404.03853) setup.
+VARIANT="${VARIANT:-base}"
+case "$VARIANT" in
+    base) _default_data_dir="calib_data/longbench_v1" ;;
+    e)    _default_data_dir="calib_data/longbench_v1_e" ;;
+    *)    echo "[lb] unknown VARIANT=$VARIANT (use base|e)" >&2; exit 1 ;;
+esac
+DATA_DIR="${DATA_DIR:-$_default_data_dir}"
 TASKS="${TASKS:-}"               # empty -> all tasks in DATA_DIR
 SUBSET="${SUBSET:-}"             # used when TASKS empty (informational)
 MAX_SAMPLES="${MAX_SAMPLES:-}"   # empty -> all
@@ -47,14 +56,10 @@ TURBOQUANT_split_3_5bit_fu}"
 REQUEST_TIMEOUT="${REQUEST_TIMEOUT:-1800}"
 SEED="${SEED:-42}"
 
-# Whether to wrap prompts in a chat message. Default off because
-# LongBench's prompts are designed as raw completions (the paper's
-# reference numbers for Llama-3-8B-Instruct, e.g. lcc~60, match
-# raw-completion output). Chat mode adds a conversational preamble
-# ("Sure, here's the answer...") which tanks first-line metrics like
-# code_sim (lcc / repobench-p). Turn on explicitly only when you know
-# the task benefits (few-shot QA may help).
-CHAT="${CHAT:-0}"
+# Chat policy: "auto" honors per-task use_chat in config.json
+# (QJL convention -- raw for trec/triviaqa/samsum/lsht/lcc/repobench-p,
+# chat-wrap for QA/summarization). "on" / "off" force globally.
+CHAT="${CHAT:-auto}"
 
 FP_PORT="${FP_PORT:-8010}"
 TQ_PORT="${TQ_PORT:-8009}"
@@ -162,7 +167,7 @@ run_stage() {
         ${TASKS:+--tasks "$TASKS"} \
         ${SUBSET:+--subset "$SUBSET"} \
         ${MAX_SAMPLES:+--max-samples "$MAX_SAMPLES"} \
-        $([ "$CHAT" = "1" ] && echo --chat) \
+        --chat "$CHAT" \
         --save-details "$details" \
         2>&1 | tee "$elog"
 
@@ -175,8 +180,9 @@ run_stage() {
 
 export CUDA_VISIBLE_DEVICES="$GPU"
 echo "[lb] model=$MODEL gpu=$GPU max_len=$MAX_LEN"
-echo "[lb] data_dir=$DATA_DIR tasks='${TASKS:-all}' max_samples='${MAX_SAMPLES:-all}'"
-echo "[lb] chat=${CHAT} (1=apply chat template, 0=raw completion)"
+echo "[lb] variant=$VARIANT data_dir=$DATA_DIR"
+echo "[lb] tasks='${TASKS:-all}' max_samples='${MAX_SAMPLES:-all}'"
+echo "[lb] chat=${CHAT} (auto=per-task config.json; on/off=force)"
 echo "[lb] stages: $STAGES"
 
 if [ ! -d "$DATA_DIR" ]; then

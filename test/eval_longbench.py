@@ -492,11 +492,15 @@ def main() -> int:
         help="Disable middle truncation (send prompts as-is).",
     )
     ap.add_argument(
-        "--chat", action="store_true",
-        help="Use /v1/chat/completions (wraps prompt in single user "
-             "message so the server applies the model's chat template). "
-             "Required for Instruct-tuned models to match published "
-             "LongBench baselines.",
+        "--chat", default="auto",
+        choices=["auto", "on", "off"],
+        help=(
+            "Chat-template policy. 'auto' (default): honor per-task "
+            "use_chat in config.json (QJL convention: raw completion "
+            "for trec/triviaqa/samsum/lsht/lcc/repobench-p, chat wrap "
+            "for everything else). 'on': force chat for all tasks. "
+            "'off': force raw for all tasks."
+        ),
     )
     ap.add_argument(
         "--save-details", default=None,
@@ -561,6 +565,16 @@ def main() -> int:
             f"[{task}] {len(rows)} examples, metric={meta['metric']}"
             f"{f', prompt_budget={budget}' if budget else ''}"
         )
+        # Resolve per-task chat mode.
+        #   auto: config.json use_chat overrides the default
+        #   on / off: force global regardless of config.json
+        if args.chat == "on":
+            chat_mode = True
+        elif args.chat == "off":
+            chat_mode = False
+        else:  # auto
+            chat_mode = bool(meta.get("use_chat", False))
+        print(f"  chat={'on' if chat_mode else 'off'}")
         scores, details = _run_task(
             task, meta, rows,
             endpoint=args.endpoint,
@@ -568,7 +582,7 @@ def main() -> int:
             timeout=args.request_timeout,
             max_samples=args.max_samples,
             max_prompt_tokens=budget,
-            chat=args.chat,
+            chat=chat_mode,
         )
         avg = sum(scores) / len(scores) if scores else 0.0
         per_task[task] = avg
