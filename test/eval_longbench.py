@@ -237,22 +237,39 @@ def score_example(
 def _post_completion(
     endpoint: str, model: str, prompt: str,
     max_tokens: int, timeout: float,
+    chat: bool = False,
 ) -> str:
-    data = json.dumps({
-        "model": model,
-        "prompt": prompt,
-        "max_tokens": max_tokens,
-        "temperature": 0.0,
-        "top_p": 1.0,
-    }).encode("utf-8")
+    """Send `prompt` to vLLM. If `chat`, wraps in a single user message
+    so the server applies the model's chat template (required for
+    Instruct/Chat models to behave correctly on LongBench)."""
+    if chat:
+        data = json.dumps({
+            "model": model,
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": max_tokens,
+            "temperature": 0.0,
+            "top_p": 1.0,
+        }).encode("utf-8")
+        url = f"{endpoint}/v1/chat/completions"
+    else:
+        data = json.dumps({
+            "model": model,
+            "prompt": prompt,
+            "max_tokens": max_tokens,
+            "temperature": 0.0,
+            "top_p": 1.0,
+        }).encode("utf-8")
+        url = f"{endpoint}/v1/completions"
     req = urllib.request.Request(
-        f"{endpoint}/v1/completions",
+        url,
         data=data,
         headers={"Content-Type": "application/json"},
         method="POST",
     )
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         obj = json.loads(resp.read().decode("utf-8"))
+    if chat:
+        return obj["choices"][0]["message"]["content"]
     return obj["choices"][0]["text"]
 
 
@@ -318,6 +335,7 @@ def _run_task(
     endpoint: str, model: str, timeout: float,
     max_samples: int | None,
     max_prompt_tokens: int | None,
+    chat: bool = False,
 ) -> tuple[list[float], list[dict]]:
     """Run inference on each row; return per-row scores + detail log."""
     scores: list[float] = []
@@ -348,7 +366,8 @@ def _run_task(
                 )
         try:
             pred = _post_completion(
-                endpoint, model, prompt, max_output, timeout
+                endpoint, model, prompt, max_output, timeout,
+                chat=chat,
             )
         except urllib.error.HTTPError as e:
             detail = e.read().decode("utf-8", errors="ignore")[:300]
@@ -473,6 +492,13 @@ def main() -> int:
         help="Disable middle truncation (send prompts as-is).",
     )
     ap.add_argument(
+        "--chat", action="store_true",
+        help="Use /v1/chat/completions (wraps prompt in single user "
+             "message so the server applies the model's chat template). "
+             "Required for Instruct-tuned models to match published "
+             "LongBench baselines.",
+    )
+    ap.add_argument(
         "--save-details", default=None,
         help="Optional JSON file to dump per-example pred/gold/score.",
     )
@@ -542,6 +568,7 @@ def main() -> int:
             timeout=args.request_timeout,
             max_samples=args.max_samples,
             max_prompt_tokens=budget,
+            chat=args.chat,
         )
         avg = sum(scores) / len(scores) if scores else 0.0
         per_task[task] = avg

@@ -47,6 +47,16 @@ TURBOQUANT_split_3_5bit_fu}"
 REQUEST_TIMEOUT="${REQUEST_TIMEOUT:-1800}"
 SEED="${SEED:-42}"
 
+# Whether to wrap prompts in a chat message (so the server applies the
+# model's chat template). Default on for *-Instruct / *-Chat models so
+# we match LongBench's published baselines; flip to 0 for base models.
+if [ -z "${CHAT:-}" ]; then
+    case "$MODEL" in
+        *Instruct*|*instruct*|*Chat*|*chat*) CHAT=1 ;;
+        *)                                   CHAT=0 ;;
+    esac
+fi
+
 FP_PORT="${FP_PORT:-8010}"
 TQ_PORT="${TQ_PORT:-8009}"
 
@@ -153,6 +163,7 @@ run_stage() {
         ${TASKS:+--tasks "$TASKS"} \
         ${SUBSET:+--subset "$SUBSET"} \
         ${MAX_SAMPLES:+--max-samples "$MAX_SAMPLES"} \
+        $([ "$CHAT" = "1" ] && echo --chat) \
         --save-details "$details" \
         2>&1 | tee "$elog"
 
@@ -166,6 +177,7 @@ run_stage() {
 export CUDA_VISIBLE_DEVICES="$GPU"
 echo "[lb] model=$MODEL gpu=$GPU max_len=$MAX_LEN"
 echo "[lb] data_dir=$DATA_DIR tasks='${TASKS:-all}' max_samples='${MAX_SAMPLES:-all}'"
+echo "[lb] chat=${CHAT} (1=apply chat template, 0=raw completion)"
 echo "[lb] stages: $STAGES"
 
 if [ ! -d "$DATA_DIR" ]; then
