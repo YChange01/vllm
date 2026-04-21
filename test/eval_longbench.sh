@@ -47,15 +47,14 @@ TURBOQUANT_split_3_5bit_fu}"
 REQUEST_TIMEOUT="${REQUEST_TIMEOUT:-1800}"
 SEED="${SEED:-42}"
 
-# Whether to wrap prompts in a chat message (so the server applies the
-# model's chat template). Default on for *-Instruct / *-Chat models so
-# we match LongBench's published baselines; flip to 0 for base models.
-if [ -z "${CHAT:-}" ]; then
-    case "$MODEL" in
-        *Instruct*|*instruct*|*Chat*|*chat*) CHAT=1 ;;
-        *)                                   CHAT=0 ;;
-    esac
-fi
+# Whether to wrap prompts in a chat message. Default off because
+# LongBench's prompts are designed as raw completions (the paper's
+# reference numbers for Llama-3-8B-Instruct, e.g. lcc~60, match
+# raw-completion output). Chat mode adds a conversational preamble
+# ("Sure, here's the answer...") which tanks first-line metrics like
+# code_sim (lcc / repobench-p). Turn on explicitly only when you know
+# the task benefits (few-shot QA may help).
+CHAT="${CHAT:-0}"
 
 FP_PORT="${FP_PORT:-8010}"
 TQ_PORT="${TQ_PORT:-8009}"
